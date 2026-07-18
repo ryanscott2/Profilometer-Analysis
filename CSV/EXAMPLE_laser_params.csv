@@ -1,9 +1,0 @@
-vk4_file,cell,passes,speed,label
-# Example only -- copy rows you need into laser_params.csv and delete this file's comment line.
-# One row per (VK4 file, cell). cell = 1-based tiled-grid order (left->right, bottom->top).
-# vk4_file blank or * = default for any file; cell blank or * = every cell of that file.
-scan_A.vk4,1,20,400,bottom-left cell
-scan_A.vk4,2,20,500,bottom-right cell
-scan_A.vk4,3,40,800,top-left cell
-scan_A.vk4,4,40,1000,top-right cell
-single_cell_scan.vk4,,20,400,whole scan is one cell
