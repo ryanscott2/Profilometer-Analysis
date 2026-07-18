@@ -870,6 +870,19 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
     cells.sort(key=lambda p: (p.cell_row, p.cell_col))
     for i, p in enumerate(cells, 1):
         p.cell_id = i
+
+    # Reliability score only: re-evaluate each finalised placement's pin overlap against a
+    # depth-robust LOCAL pin map, at the SAME position (max_shift_px=0, so registration is
+    # unchanged -- still fixed by the marker anchor + global-mask logic above). The global mask
+    # scores a correctly-placed but shallow cell ~0, wrongly flagging it unreliable; the local
+    # mask sees its pins, so the score reflects true placement quality at any etch depth.
+    amask = _adaptive_pin_mask(z0, valid,
+                               float(np.mean([a.pitch_x_um for a in template.arrays])) / xppx)
+    for p in cells:
+        _, ov = _refine_origin(amask, template, (p.origin_col, p.origin_row), xppx, yppx,
+                               p.y_up, p.x_right, p.rotation_deg, search_px=6, max_shift_px=0.0)
+        if np.isfinite(ov):
+            p.score = float(ov)
     return cells
 
 
