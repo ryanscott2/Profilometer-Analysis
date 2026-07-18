@@ -129,10 +129,16 @@ class PinFinResult:
     grid_py_px: float = 0.0
     thumb: object = None
     thumb_down: int = 1
+    # mean-pin radial-average profile, kept for overlay figures (not written to CSV):
+    # rc = radius-bin centres (µm); prof = mean-pin height at each radius (µm, leveled-floor
+    # units, i.e. same reference as floor_um so prof-floor_um is height above the clean floor)
+    rc: object = None
+    prof: object = None
 
     def as_row(self) -> dict:
         d = self.__dict__.copy()
-        for k in ("grid_phase", "thumb", "thumb_down", "grid_px_px", "grid_py_px"):
+        for k in ("grid_phase", "thumb", "thumb_down", "grid_px_px", "grid_py_px",
+                  "rc", "prof"):
             d.pop(k, None)
         return d
 
@@ -454,7 +460,7 @@ def extract_array(scan, placement, array, sample, *,
         pin_sat_frac=pin_sat_frac,
         grid_phase=(lattice["phase"][0], lattice["phase"][1]),
         grid_px_px=float(known_px), grid_py_px=float(known_py),
-        thumb=thumb, thumb_down=down, **base,
+        thumb=thumb, thumb_down=down, rc=rc, prof=prof, **base,
     )
     if make_qc:
         _qc(crop, z0, valid, cell_c, rc, prof, lattice, known_px, known_py,
