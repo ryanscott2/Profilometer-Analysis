@@ -423,9 +423,12 @@ def make_grid_overlays(results, out_dir):
 
 def print_diameter_calibration(df, out_dir):
     d = _fit_subset(df)
+    dfd = df[df.drawn_diameter_um.notna()] if len(df) else df
     lines = ["Diameter calibration  (measured = a*drawn + b; to hit target, draw (target-b)/a)",
-             "Primary = TOP diameter; MID also shown.", ""]
-    if not len(d):
+             "Primary = TOP diameter; MID also shown.",
+             "Per-diameter lines give the measured Ø for each nominal geometry in the DXF and "
+             "the drawn Ø that would hit it.", ""]
+    if not len(d) or not len(dfd):
         lines.append("(no reliable pins with plausible diameters yet)")
         (out_dir / "diameter_calibration.txt").write_text("\n".join(lines), encoding="utf-8")
         print("\n" + "\n".join(lines))
@@ -437,11 +440,17 @@ def print_diameter_calibration(df, out_dir):
         a, b = np.polyfit(g.drawn_diameter_um, g[col], 1)
         return float(a), float(b)
 
-    for band in sorted(d.band.unique()):
-        g = d[d.band == band]
-        tgt = g.target_diameter_um.iloc[0]
-        seg = [f"band {band} (pitch {g.nominal_pitch_um.iloc[0]:g}, "
-               f"target Ø {tgt:g} µm, n={len(g)}):"]
+    def _first(series, default=float("nan")):
+        s = series.dropna()
+        return s.iloc[0] if len(s) else default
+
+    for band in sorted(dfd.band.dropna().unique()):
+        gband = dfd[dfd.band == band]                    # every nominal Ø drawn in this band
+        g = d[d.band == band]                            # reliable+plausible subset for the fit
+        tgt = _first(gband.target_diameter_um)
+        pitch = _first(gband.nominal_pitch_um)
+        seg = [f"band {band} (pitch {pitch:g}, target Ø {tgt:g} µm, n={len(g)}):"]
+        nominal_ds = sorted(gband.drawn_diameter_um.unique())
         for col, nm in [("top_diameter_um", "TOP"), ("diameter_um", "MID")]:
             fb = fit(g, col)
             if fb:
@@ -449,6 +458,15 @@ def print_diameter_calibration(df, out_dir):
                 draw = (tgt - b) / a if a else float("nan")
                 seg.append(f"    {nm}: measured = {a:.3f}*drawn {b:+.1f}  "
                            f"->  draw {draw:6.1f} µm to get {tgt:g} µm {nm.lower()}-Ø")
+            else:
+                seg.append(f"    {nm}: (need >=2 reliable drawn diameters to fit a line)")
+            for D in nominal_ds:                         # one result per nominal diameter
+                gd = g[np.isclose(g.drawn_diameter_um, D)]
+                meas = (f"measured {gd[col].mean():6.1f} µm (n={len(gd)})" if len(gd)
+                        else "no reliable measurement")
+                inv = (f"  ->  draw {(D - fb[1]) / fb[0]:6.1f} µm to get {D:g} µm {nm.lower()}-Ø"
+                       if fb and fb[0] else "")
+                seg.append(f"        drawn {D:6.1f} µm: {meas}{inv}")
         lines.append("\n".join(seg))
     if d.drawn_diameter_um.nunique() >= 2:
         ga, gb = np.polyfit(d.drawn_diameter_um, d.top_diameter_um, 1)
