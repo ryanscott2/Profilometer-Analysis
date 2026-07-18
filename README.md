@@ -22,12 +22,34 @@ Pipeline:
    artifacts), at three heights (base / mid / top) to capture taper.
 4. **Report** (`run_analysis.py`) — `Results/measurements.csv` plus the same plot set as v1.
 
-## Quick start
+## Two workflows
+
+**A. Full tiled sample (`run_sample.py`) — the main workflow for this data.** The whole chip
+is scanned as a continuous `..._Y{n}_X{m}.vk4` tile raster spanning many unit cells. The
+driver stitches the tiles into one scan (`assemble.py`), finds every unit cell by its 200 µm
+alignment marker, and measures all of them. Cell layout notes for this dataset:
+
+- The Keyence images **X-mirrored** vs the DXF (the design's bottom-left marker appears at each
+  cell's bottom-**right**). This is handled as a per-cell coordinate transform — the array is
+  never flipped; the presentation figures are flipped back to design orientation.
+- Registration anchors on the **unique marker** plus one global rotation (not the periodic pin
+  lattice, whose overlap aliases a pitch away), and uses a pin/floor **height-contrast gate**
+  to reject flat un-ablated wafer.
+- Cells are indexed by **design (row, col) with (1,1) = DXF top-left**. Laser parameters are
+  supplied per cell in `CSV/cell_params.csv` (`row,col,passes,speed,label`) — a
+  `cell_params_TEMPLATE.csv` of the detected cells is written each run for you to fill in.
 
 ```bash
-# 1. put the design in  DXF/*.dxf   (already present: 071626_UVLaserPFLM_4x4_singlecell.dxf)
-# 2. put profilometer scans in  VK4/*.vk4
-# 3. describe each scan's cells in  CSV/laser_params.csv   (see below)
+# 1. DXF/*.dxf present; drop the tile raster in VK4/ (…_Y1_X1.vk4 …)
+python run_sample.py                    # -> Results/measurements.csv, cell_overview.png, plots
+# then fill CSV/cell_params.csv (row,col,passes,speed) from the template and re-run for the
+# laser-parameter plots; or: python run_sample.py <vk4_dir> <out_dir> [<dxf>] [<cell_csv>]
+```
+
+**B. Individual scans (`run_analysis.py`).** One VK4 per capture (one or a few unit cells),
+laser params by file in `CSV/laser_params.csv`.
+
+```bash
 python run_analysis.py
 # or:  python run_analysis.py <vk4_dir> <out_dir> [<dxf_path>] [<csv_path>]
 ```
@@ -103,11 +125,14 @@ centres (red `+`) so you can confirm it. If a cell mis-registers, pass a manual 
 
 - `dxf_geometry.py` — DXF → unit cells → pin arrays.
 - `vk4.py` — Keyence VK4 reader (unchanged from v1).
-- `register.py` — marker detection + DXF↔scan transform (`CellPlacement`).
+- `assemble.py` — stitch a `_Y{n}_X{m}` tile raster into one scan.
+- `register.py` — marker detection, DXF↔scan transform (`CellPlacement`, incl. X-mirror +
+  rotation), `register_scan` (per-file) and `register_sample` (full tiled sample grid).
 - `extract.py` — per-array measurement (classification-based heights, pin-stacked diameter).
-- `laser_params.py` — the CSV reader / template writer.
-- `run_analysis.py` — batch driver + plots.
-- `synth.py`, `selftest.py` — synthetic scan generator and end-to-end validation.
+- `laser_params.py` — CSV readers/template writers (by file, and by cell (row,col)).
+- `run_sample.py` — full-sample driver (assemble → register grid → measure → plots).
+- `run_analysis.py` — per-file batch driver + the shared plot set.
+- `synth.py`, `selftest.py` — synthetic scan generator and end-to-end validation (35 checks).
 
 ## Notes / assumptions
 
