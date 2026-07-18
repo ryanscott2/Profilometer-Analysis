@@ -29,6 +29,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Rectangle
 from matplotlib.gridspec import GridSpec
+from matplotlib.lines import Line2D
 
 sys.path.insert(0, str(Path(__file__).parent))
 from dxf_geometry import read_design
@@ -134,6 +135,7 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
     save_sample_overview(scan, template, placements, out_dir / "figures" / "cell_overview.png")
     save_sample_heightmap(scan, out_dir / "figures" / "sample_heightmap.png")
     make_param_summary(df, out_dir)
+    make_param_depth_scatter(df, out_dir)
     ra.make_plots(df, results, out_dir)
     ra.print_diameter_calibration(df, out_dir)
     return df, results, placements
@@ -286,6 +288,86 @@ def make_param_summary(df, out_dir):
                       "(each point = one unit cell, labelled P{passes}_S{speed})")
     fig.tight_layout()
     p = Path(out_dir) / "figures" / "param_summary.png"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(p, dpi=200, bbox_inches="tight"); plt.close(fig)
+    print(f"Wrote {p}")
+
+
+def make_param_depth_scatter(df, out_dir):
+    """Companion to the depth panel of make_param_summary: instead of a single median per unit
+    cell, scatter EVERY pin array's etch depth around that cell's median. Same axes (depth vs
+    scan speed, one colour/line per passes value). Marker shape encodes the pin family --
+    squares = D100 arrays (drawn Ø >= 75 um), triangles = D50 arrays (drawn Ø < 75 um)."""
+    d = df[(df["passes"] > 0) & (df["speed"] > 0) & df["depth_um"].notna()].copy()
+    if not len(d):
+        print("No cells with laser params -> skipping depth scatter.")
+        return
+    d["family"] = np.where(d["drawn_diameter_um"] >= 75, "D100", "D50")
+
+    # per-cell median depth == the 'average' the individual points scatter around (identical to
+    # the value make_param_summary plots for the depth panel)
+    med = d.groupby(["cell_row", "cell_col"]).agg(
+        passes=("passes", "first"), speed=("speed", "first"),
+        label=("cell_label", "first"), depth=("depth_um", "median")).reset_index()
+
+    passes_vals = sorted(d["passes"].unique())
+    cmap = plt.get_cmap("viridis")
+    colors = {p: cmap(i / max(1, len(passes_vals) - 1)) for i, p in enumerate(passes_vals)}
+    speeds = sorted(d["speed"].unique())
+
+    # squares = D100 family, triangles = D50 family. Each family is sub-dodged and every point
+    # jittered in log10(speed) space so the cloud reads symmetrically on the log x-axis (seeded
+    # so the figure is reproducible run-to-run).
+    fam_style = {"D100": ("s", +0.022), "D50": ("^", -0.022)}
+    rng = np.random.default_rng(0)
+    jit = 0.014
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    for fam, (marker, dodge) in fam_style.items():
+        for pas in passes_vals:
+            sub = d[(d["family"] == fam) & (d["passes"] == pas)]
+            if not len(sub):
+                continue
+            x = sub["speed"].to_numpy() * 10.0 ** (dodge + rng.uniform(-jit, jit, len(sub)))
+            ax.plot(x, sub["depth_um"], marker=marker, ls="none", ms=5.5, mew=0.4,
+                    mfc=colors[pas], mec="white", alpha=0.55, zorder=2)
+
+    # per-passes line through the cell medians, drawn on top of its scatter
+    for pas in passes_vals:
+        gg = med[med["passes"] == pas].sort_values("speed")
+        ax.plot(gg["speed"], gg["depth"], "o-", color=colors[pas], ms=10, mew=1.2,
+                mec="0.15", label=f"{pas} passes", zorder=3)
+        for _, r in gg.iterrows():
+            ax.annotate(r["label"], (r["speed"], r["depth"]), fontsize=7, ha="center",
+                        textcoords="offset points", xytext=(0, 10), color="0.25", zorder=4)
+
+    ax.axhline(55, color="grey", ls="--", lw=1)
+    ax.text(0.01, 55, " design target 55 µm", transform=ax.get_yaxis_transform(),
+            va="bottom", color="grey", fontsize=8)
+    ax.set_xscale("log")
+    ax.set_xticks(speeds); ax.set_xticklabels([f"{s:g}" for s in speeds])
+    ax.set_xlabel("scan speed (mm/s, log axis)")
+    ax.set_ylabel("etch depth (µm)")
+    ax.grid(alpha=0.3)
+    ax.set_title("Etch depth of every pin array vs laser parameters\n"
+                 "(o-line = per-cell median; small markers = individual arrays, "
+                 "□ D100  △ D50)")
+
+    passes_leg = ax.legend(title="passes", fontsize=9, loc="upper right")
+    ax.add_artist(passes_leg)
+    shape_handles = []
+    for fam, (marker, _) in fam_style.items():
+        if not (d["family"] == fam).any():
+            continue
+        lo, hi = d.loc[d["family"] == fam, "drawn_diameter_um"].agg(["min", "max"])
+        shape_handles.append(Line2D([], [], marker=marker, ls="none", mfc="0.4", mec="white",
+                                    ms=8, label=f"{fam} array (drawn Ø {lo:g}–{hi:g} µm)"))
+    shape_handles.append(Line2D([], [], marker="o", ls="-", color="0.4", ms=9,
+                                label="cell median"))
+    ax.legend(handles=shape_handles, fontsize=8, loc="lower left", framealpha=0.9)
+
+    fig.tight_layout()
+    p = Path(out_dir) / "figures" / "param_depth_scatter.png"
     p.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(p, dpi=200, bbox_inches="tight"); plt.close(fig)
     print(f"Wrote {p}")
