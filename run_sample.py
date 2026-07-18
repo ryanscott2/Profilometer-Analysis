@@ -45,6 +45,14 @@ DEF_VK4_DIR = HERE / "VK4"
 DEF_CSV_DIR = HERE / "CSV"
 DEF_OUT_DIR = HERE / "Results"
 
+# Radial-average overlay figures: one figure per nominal geometry, overlaying the mean-pin
+# radial profile of each laser-parameter combo in a set. Cells are matched by their
+# P{passes}_S{speed} label. Edit these lists to change which combos are overlaid.
+RADIAL_PARAM_SETS = {
+    "set1": ["P10_S100", "P80_S200", "P80_S400", "P80_S800"],
+    "set2": ["P10_S100", "P10_S200", "P40_S400", "P80_S800"],
+}
+
 
 def _band_targets(template):
     out = {}
@@ -136,6 +144,7 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
     save_sample_heightmap(scan, out_dir / "figures" / "sample_heightmap.png")
     make_param_summary(df, out_dir)
     make_param_depth_scatter(df, out_dir)
+    make_radial_overlays(template, placements, params, res_by_cell, out_dir)
     ra.make_plots(df, results, out_dir)
     ra.print_diameter_calibration(df, out_dir)
     return df, results, placements
@@ -371,6 +380,76 @@ def make_param_depth_scatter(df, out_dir):
     p.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(p, dpi=200, bbox_inches="tight"); plt.close(fig)
     print(f"Wrote {p}")
+
+
+# --------------------------------------------- radial-average overlay figures #
+def make_radial_overlays(template, placements, params, res_by_cell, out_dir,
+                         param_sets=RADIAL_PARAM_SETS):
+    """One figure per nominal geometry (per array in the unit cell), overlaying the mean-pin
+    radial-average profile of several laser-parameter combos. Repeated for every set of combos
+    in ``param_sets`` -> len(arrays) * len(param_sets) figures. Cells are matched to the
+    requested P{passes}_S{speed} labels; the profiles are the (rc, prof) that extract_array
+    already computed per array, referenced to each cell's clean floor so the curves share z=0."""
+    # label -> cell_id, keyed by both the canonical P{passes}_S{speed} and any CSV label
+    label_to_cell = {}
+    for pl in placements:
+        pr = params.get((pl.cell_row, pl.cell_col))
+        if not (pr and pr.valid):
+            continue
+        label_to_cell[f"P{pr.passes}_S{pr.speed:g}"] = pl.cell_id
+        if pr.label:
+            label_to_cell[pr.label] = pl.cell_id
+    if not label_to_cell:
+        print("No labelled cells with laser params -> skipping radial overlays.")
+        return
+
+    palette = plt.get_cmap("tab10")
+    root = Path(out_dir) / "figures" / "radial_overlays"
+    n_fig = 0
+    for set_name, combos in param_sets.items():
+        sdir = root / set_name
+        sdir.mkdir(parents=True, exist_ok=True)
+        missing = [c for c in combos if c not in label_to_cell]
+        if missing:
+            print(f"  [{set_name}] no registered cell for: {', '.join(missing)} "
+                  f"(available: {', '.join(sorted(label_to_cell))})")
+        for a in sorted(template.arrays, key=lambda a: a.array_id):
+            fig, ax = plt.subplots(figsize=(9, 6))
+            n_lines = 0
+            for i, combo in enumerate(combos):
+                cid = label_to_cell.get(combo)
+                if cid is None:
+                    continue
+                res = res_by_cell.get(cid, {}).get(a.array_id)
+                if res is None or res.rc is None or res.prof is None:
+                    continue
+                rc = np.asarray(res.rc, float)
+                prof = np.asarray(res.prof, float)
+                if not np.isfinite(prof).any():
+                    continue
+                floor = res.floor_um if np.isfinite(res.floor_um) else np.nanmin(prof)
+                z = prof - floor
+                depth = res.depth_um if np.isfinite(res.depth_um) else np.nanmax(z)
+                ax.plot(rc, z, "-", lw=1.9, color=palette(i % 10),
+                        label=f"{combo}   (depth {depth:.0f} µm)")
+                n_lines += 1
+            if not n_lines:
+                plt.close(fig)
+                continue
+            ax.axhline(0, color="grey", lw=0.8, ls="-")
+            ax.axvline(a.diameter_um / 2, color="green", ls=":", lw=1.2,
+                       label=f"drawn radius {a.diameter_um/2:g} µm")
+            ax.set_xlabel("radius from pin centre (µm)")
+            ax.set_ylabel("mean height above clean floor (µm)")
+            ax.set_title(f"Radial-average pin profile — drawn Ø {a.diameter_um:g} µm, "
+                         f"pitch {a.pitch_um:g} µm\nband {a.band} col {a.col}  ·  {set_name}")
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=8)
+            fig.tight_layout()
+            fname = f"a{a.array_id:02d}_D{a.diameter_um:g}_P{a.pitch_um:g}.png"
+            fig.savefig(sdir / fname, dpi=170); plt.close(fig)
+            n_fig += 1
+    print(f"Wrote {n_fig} radial-overlay figures -> {root}")
 
 
 # ------------------------------------------------------------- presentation #
