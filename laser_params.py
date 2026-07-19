@@ -165,11 +165,11 @@ def prompt_for_params(vk4_file: str, cell: int, n_cells: int) -> CellParams:
 
 
 # --------------------------------------------------------------------------- #
-# Per-unit-cell parameters for the tiled full-sample workflow (run_sample.py):
-# indexed by design-frame (row, col) with (1,1) = DXF top-left, NOT by VK4 file.
+# Per-unit-cell laser parameters for the tiled full-sample workflow (run_sample.py).
+# The CSV is a plain GRID whose sheet position maps 1:1 to the sample: each line is one sample
+# ROW (top = row 1), each column one sample COLUMN (left = col 1), and every entry is a
+# 'P{passes}_S{speed}' label. No header, no index columns, no other layout.
 CELL_CSV_NAME = "cell_params.csv"
-CELL_TEMPLATE_NAME = "cell_params_TEMPLATE.csv"
-CELL_FIELDS = ["row", "col", "passes", "speed", "label"]
 
 
 _PXSY_RE = re.compile(r"P\s*([\d.]+)\s*_?\s*S\s*([\d.]+)", re.IGNORECASE)
@@ -184,86 +184,23 @@ def parse_pxsy(text):
 
 
 def load_cell_params(csv_path) -> dict:
-    """Load a (row,col)->CellParams map from the cell-indexed CSV.
+    """Load a (row, col) -> CellParams map from the cell-parameter GRID.
 
-    Two layouts are accepted:
-      * long   : ``row,col,passes,speed,label`` (one cell per line);
-      * matrix : a grid whose header's 3rd+ columns are the design COLUMN indices (1,2,3,…),
-                 the 2nd column of each data line is the design ROW index, and each body cell
-                 is a ``P{passes}_S{speed}`` label. Blank cells / leftover rows are ignored.
-    """
+    Sheet position IS the sample position: line ``r`` (1-based, top first) is unit-cell row r and
+    column ``c`` (1-based, left first) is unit-cell column c, so the entry at (r, c) holds that
+    cell's ``P{passes}_S{speed}`` laser parameters. There is no header, no index columns and no
+    other accepted layout. Blank cells are skipped; a blank line still advances the row index so
+    an intentional gap keeps later cells on their true row numbers."""
     out = {}
     p = Path(csv_path)
     if not p.exists():
         return out
     with p.open(newline="", encoding="utf-8-sig") as fh:
-        table = [r for r in csv.reader(fh) if r]
-    if not table:
-        return out
-
-    header = table[0]
-    col_for_pos = {}                                     # body-column position -> design col
-    for pos in range(2, len(header)):
-        try:
-            col_for_pos[pos] = int(float(header[pos]))
-        except (ValueError, TypeError):
-            pass
-
-    if len(col_for_pos) >= 2:                             # --- matrix layout ---
-        for r in table[1:]:
-            if len(r) < 3 or str(r[0]).strip().startswith("#"):
-                continue
-            try:
-                design_row = int(float(r[1]))            # 2nd column = design row
-            except (ValueError, TypeError):
-                continue
-            for pos, dcol in col_for_pos.items():
-                if pos < len(r) and r[pos].strip():
-                    parsed = parse_pxsy(r[pos])
-                    if parsed:
-                        out[(design_row, dcol)] = CellParams(parsed[0], parsed[1], parsed[2])
-        return out
-
-    # --- long layout ---
-    lower = {(k or "").strip().lower(): i for i, k in enumerate(header)}
-    for r in table[1:]:
-        if not r or str(r[0]).strip().startswith("#"):
-            continue
-        g = lambda key: r[lower[key]] if key in lower and lower[key] < len(r) else ""
-        try:
-            row, col = int(float(g("row"))), int(float(g("col")))
-        except (ValueError, TypeError):
-            continue
-        lbl = str(g("label")).strip()
-        pxsy = parse_pxsy(lbl) if lbl else None
-        if pxsy:
-            out[(row, col)] = CellParams(pxsy[0], pxsy[1], pxsy[2])
-            continue
-        try:
-            passes = int(float(str(g("passes")).strip()))
-        except (ValueError, TypeError):
-            passes = 0
-        try:
-            speed = float(str(g("speed")).strip())
-        except (ValueError, TypeError):
-            speed = float("nan")
-        out[(row, col)] = CellParams(passes, speed, lbl or f"P{passes}_S{speed:g}")
-    return out
-
-
-def write_cell_template(csv_dir, cells_rc, overwrite: bool = False) -> Path:
-    """Write a cell-indexed template CSV listing every detected (row,col) for the user to fill.
-    cells_rc : iterable of (row, col)."""
-    csv_dir = Path(csv_dir)
-    csv_dir.mkdir(parents=True, exist_ok=True)
-    out = csv_dir / CELL_TEMPLATE_NAME
-    if out.exists() and not overwrite:
-        out = csv_dir / CELL_TEMPLATE_NAME.replace(".csv", "_new.csv")
-    with out.open("w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(CELL_FIELDS)
-        for (r, c) in sorted(set(cells_rc)):
-            w.writerow([r, c, "", "", ""])
+        for r_idx, row in enumerate(csv.reader(fh), start=1):
+            for c_idx, val in enumerate(row, start=1):
+                parsed = parse_pxsy(val) if str(val).strip() else None
+                if parsed:
+                    out[(r_idx, c_idx)] = CellParams(parsed[0], parsed[1], parsed[2])
     return out
 
 

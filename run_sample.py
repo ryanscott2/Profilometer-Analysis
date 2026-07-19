@@ -36,7 +36,7 @@ from dxf_geometry import read_design
 from assemble import assemble_tiles
 from register import register_sample
 from extract import ArraySample, extract_array
-from laser_params import load_cell_params, write_cell_template, CELL_CSV_NAME
+from laser_params import load_cell_params, CELL_CSV_NAME
 import run_analysis as ra
 
 HERE = Path(__file__).parent
@@ -126,11 +126,10 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
 
     missing = [(p.cell_row, p.cell_col) for p in placements
                if (p.cell_row, p.cell_col) not in params]
-    if missing:                                          # only when the CSV doesn't cover them
-        tmpl_csv = write_cell_template(Path(cell_csv).parent,
-                                       [(p.cell_row, p.cell_col) for p in placements],
-                                       overwrite=True)
-        print(f"Wrote cell-params template ({len(missing)} cells need params) -> {tmpl_csv}")
+    if missing:                                          # only warn; the CSV is user-authored
+        print(f"WARNING: {len(missing)} registered cell(s) have no entry in {cell_csv} "
+              f"(row,col): {sorted(missing)}. Geometry is still measured; add their "
+              f"P{{passes}}_S{{speed}} to the grid at that row/column to tag them.")
 
     # per-unit-cell report figures
     cells_dir = out_dir / "cells"; cells_dir.mkdir(parents=True, exist_ok=True)
