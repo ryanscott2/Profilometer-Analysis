@@ -25,7 +25,7 @@ from synth import synth_scan
 import run_analysis as ra
 
 HERE = Path(__file__).parent
-OUT = HERE / "Results" / "selftest"
+OUT = HERE / "Results" / "legacy" / "selftest"
 
 
 class Checker:
