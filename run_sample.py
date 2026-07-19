@@ -84,11 +84,12 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
     if params:
         print(f"\nLoaded laser params for {len(params)} cells from {cell_csv}")
     else:
-        print(f"\nNo cell params at {cell_csv} (geometry still measured; fill the template).")
+        print(f"\nNo cell params at {cell_csv} (geometry still measured; fill the P_S grid).")
 
     out_dir = Path(out_dir)
-    qc_dir = out_dir / "qc"; qc_dir.mkdir(parents=True, exist_ok=True)
+    qc_dir = out_dir / "legacy" / "qc"       # created on demand by extract only when make_qc=True
     (out_dir / "figures").mkdir(parents=True, exist_ok=True)
+    (out_dir / "legacy").mkdir(parents=True, exist_ok=True)
 
     rows, results = [], []
     res_by_cell = {}
@@ -121,8 +122,9 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
 
     df = pd.DataFrame(rows).sort_values(["cell_row", "cell_col", "band", "col"])
     out_dir.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_dir / "measurements.csv", index=False)
-    print(f"\nWrote {out_dir/'measurements.csv'} ({len(df)} rows)")
+    meas_csv = out_dir / "legacy" / "measurements.csv"
+    df.to_csv(meas_csv, index=False)
+    print(f"\nWrote {meas_csv} ({len(df)} rows)")
 
     missing = [(p.cell_row, p.cell_col) for p in placements
                if (p.cell_row, p.cell_col) not in params]
@@ -132,20 +134,23 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
               f"P{{passes}}_S{{speed}} to the grid at that row/column to tag them.")
 
     # per-unit-cell report figures
-    cells_dir = out_dir / "cells"; cells_dir.mkdir(parents=True, exist_ok=True)
+    cells_dir = out_dir / "figures" / "cells"; cells_dir.mkdir(parents=True, exist_ok=True)
     for pl in placements:
+        # x = design column (left->right), y = design row (top->bottom)
         render_cell_report(scan, pl, template, res_by_cell[pl.cell_id],
                            params.get((pl.cell_row, pl.cell_col)),
-                           cells_dir / f"cell_r{pl.cell_row}_c{pl.cell_col}.png")
+                           cells_dir / f"cell_x{pl.cell_col}_y{pl.cell_row}.png")
     print(f"Wrote {len(placements)} per-cell reports -> {cells_dir}")
 
+    # Clean outputs live in figures/ (cell_overview, sample_heightmap, param_depth_scatter,
+    # radial_overlays/, cells/, diameter_calibration.txt). Legacy outputs (v1 figure set,
+    # measurements.csv, qc/) are regenerated under legacy/ ahead of the planned refactor.
     save_sample_overview(scan, template, placements, out_dir / "figures" / "cell_overview.png")
     save_sample_heightmap(scan, out_dir / "figures" / "sample_heightmap.png")
-    make_param_summary(df, out_dir)
     make_param_depth_scatter(df, out_dir)
     make_radial_overlays(template, placements, params, res_by_cell, out_dir)
-    ra.make_plots(df, results, out_dir)
-    ra.print_diameter_calibration(df, out_dir)
+    ra.print_diameter_calibration(df, out_dir / "figures")
+    ra.make_plots(df, results, out_dir / "legacy")
     return df, results, placements
 
 

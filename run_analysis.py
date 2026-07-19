@@ -510,6 +510,8 @@ def main():
     csv_path = Path(sys.argv[4]) if len(sys.argv) > 4 else DEF_CSV_DIR / CSV_NAME
     interactive = sys.stdin is not None and sys.stdin.isatty()
 
+    # v1 is deprecated; route all of its output under Results/legacy/.
+    out_dir = out_dir / "legacy"
     df, results, template = build_table(vk4_dir, out_dir, dxf_path, csv_path,
                                         interactive=interactive)
     make_plots(df, results, out_dir)
