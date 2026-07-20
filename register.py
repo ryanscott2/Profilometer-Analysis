@@ -494,51 +494,6 @@ def _assign_grid_indices(cells, Pxpx, Pypx):
         c.cell_col, c.cell_row = col_rank[idx], row_rank[idx]
 
 
-def _fit_grid(cells):
-    """Least-squares fit origin_scan(row,col) = O + (row-1)*rowvec + (col-1)*colvec from
-    cells carrying (cell_row, cell_col). Returns (O, rowvec, colvec) in scan px, or None."""
-    if len({(c.cell_row, c.cell_col) for c in cells}) < 3:
-        return None
-    A = np.array([[1.0, c.cell_row - 1, c.cell_col - 1] for c in cells])
-    bx = np.linalg.lstsq(A, np.array([c.origin_col for c in cells]), rcond=None)[0]
-    by = np.linalg.lstsq(A, np.array([c.origin_row for c in cells]), rcond=None)[0]
-    return ((bx[0], by[0]), (bx[1], by[1]), (bx[2], by[2]))
-
-
-def _estimate_basis(cells, Ppx_x, Ppx_y):
-    """Estimate the two cell-step vectors (col-ish ``a``, row-ish ``b``) in scan px from the
-    pairwise origin deltas of confident cells. These capture the true pitch AND any small
-    sample rotation, so tiling from an anchor lands on every cell. Falls back to axis-aligned
-    pitch vectors if too few confident cells."""
-    pts = np.array([[c.origin_col, c.origin_row] for c in cells], float)
-    a_c, b_c = [], []
-    for i in range(len(pts)):
-        for k in range(len(pts)):
-            if i == k:
-                continue
-            d = pts[k] - pts[i]
-            if 0.75 * Ppx_x <= abs(d[0]) <= 1.25 * Ppx_x and abs(d[1]) <= 0.3 * Ppx_x:
-                a_c.append(d if d[0] > 0 else -d)        # normalise to +col direction
-            if 0.75 * Ppx_y <= abs(d[1]) <= 1.25 * Ppx_y and abs(d[0]) <= 0.3 * Ppx_y:
-                b_c.append(d if d[1] > 0 else -d)        # normalise to +row direction
-    a = np.median(a_c, axis=0) if a_c else np.array([Ppx_x, 0.0])
-    b = np.median(b_c, axis=0) if b_c else np.array([0.0, Ppx_y])
-    return a, b
-
-
-def _marker_grid_rotation(peaks, Ppx):
-    """Global sample rotation (deg) from the angle of marker-center pairs one cell apart."""
-    mc = np.array([[p["col"], p["row"]] for p in peaks], float)
-    angs = []
-    for i in range(len(mc)):
-        for k in range(len(mc)):
-            d = mc[k] - mc[i]
-            if 0.8 * Ppx <= abs(d[0]) <= 1.2 * Ppx and abs(d[1]) < 0.25 * Ppx:
-                v = d if d[0] > 0 else -d
-                angs.append(np.arctan2(v[1], v[0]))
-    return float(np.degrees(np.median(angs))) if angs else 0.0
-
-
 # ------------------------------------------- marker-free DXF-pattern fallback #
 def _cell_pin_pattern(template, xppx, yppx, x_right, y_up, rot_deg, ds, margin_px=6):
     """Compact binary image of the WHOLE cell's pin disks at downsample ``ds`` for the given
@@ -616,6 +571,39 @@ def _pattern_ncc(img, tpl):
     denom = np.sqrt(np.maximum(s2 - s1 * s1 / n, 0.0)) * tnorm
     with np.errstate(divide="ignore", invalid="ignore"):
         return np.where(denom > 1e-9, num / denom, 0.0)
+
+
+def _dealias_origin(pin_mask, template, origin, xppx, yppx, y_up, x_right, rot_deg, margin=0.02):
+    """Belt-and-suspenders against off-by-one-PIN aliasing. On a (near-)periodic array -- e.g.
+    large pins on a tight pitch, where a full-pitch shift still overlaps neighbours heavily -- a
+    whole-cell placement can lock one pin pitch off and still score high overlap, which would
+    crop every array one row/column off. Evaluate the DXF-pin overlap at ``origin`` and at +-one
+    pitch (each distinct array pitch, both scan axes AND their diagonals) and snap to the highest.
+    On a finite/aperiodic cell the true origin wins (its outermost pins fall inside the real
+    array while a shifted copy loses an edge row/column), so this corrects an aliased lock and is
+    a no-op when the placement is already right. Returns ((col, row), overlap)."""
+    def _ov(oc, orow):
+        _, ov = _refine_origin(pin_mask, template, (oc, orow), xppx, yppx, y_up, x_right,
+                               rot_deg, search_px=4, max_shift_px=0.0)
+        return float(ov) if np.isfinite(ov) else -1.0
+
+    th = np.deg2rad(rot_deg); c, s = np.cos(th), np.sin(th)
+    offs = {(0.0, 0.0)}
+    for a in template.arrays:                              # one-pitch scan-space steps per array
+        vx = np.array([c * x_right * a.pitch_x_um / xppx, s * x_right * a.pitch_x_um / xppx])
+        vy = np.array([-s * y_up * a.pitch_y_um / yppx, c * y_up * a.pitch_y_um / yppx])
+        for i in (-1, 0, 1):
+            for j in (-1, 0, 1):
+                if i or j:
+                    off = i * vx + j * vy
+                    offs.add((round(float(off[0]), 1), round(float(off[1]), 1)))
+    oc0, or0 = float(origin[0]), float(origin[1])
+    best = (oc0, or0, _ov(oc0, or0))
+    for (dc, dr) in offs:
+        ov = _ov(oc0 + dc, or0 + dr)
+        if ov > best[2] + margin:                          # only move for a clear improvement
+            best = (oc0 + dc, or0 + dr, ov)
+    return (best[0], best[1]), best[2]
 
 
 def _register_by_pattern(scan, template, z0, valid, *, cell_pitch_um=None,
@@ -720,10 +708,14 @@ def _register_by_pattern(scan, template, z0, valid, *, cell_pitch_um=None,
         ang = best_a
         placed = _place_all(ang)
 
-    # --- keep placements clearing the marker path's overlap / in-bounds / contrast gates ---
+    # --- de-alias each placement (snap off-by-one-pin locks to the true origin), then keep
+    # those clearing the overlap / in-bounds / contrast gates ---
     cells = []
     for (o, ov) in placed:
-        if ov < min_overlap:
+        o, _ = _dealias_origin(pin_mask, template, o, xppx, yppx, yu, xr, ang)
+        o, ov = _refine_origin(pin_mask, template, o, xppx, yppx, yu, xr, ang,
+                               search_px=int(refine_clamp) + 6, max_shift_px=refine_clamp)
+        if not np.isfinite(ov) or ov < min_overlap:
             continue
         p = CellPlacement(0, float(o[0]), float(o[1]), xppx, yppx, y_up=yu, x_right=xr,
                           rotation_deg=ang, score=float(ov), method="pattern")
@@ -748,25 +740,77 @@ def _register_by_pattern(scan, template, z0, valid, *, cell_pitch_um=None,
     return kept
 
 
+def _solid_square_ncc_markers(feat, marker_px, min_sep, max_n=40, thresh=0.30):
+    """Locate solid-square alignment markers by |NCC| of a FILLED-square template against the
+    feature map. Markers are solid squares (not outlines) and large relative to the pins, so a
+    filled-square matched filter is far more discriminative than the old outline-on-edges match.
+    |NCC| is polarity-agnostic (marker milled proud OR recessed). Over-detection is harmless --
+    the per-cell two-point solve + overlap gate downstream reject false markers -- so this is
+    deliberately permissive. Returns [(col, row, score)], strongest first."""
+    sq = max(5, int(round(marker_px)))
+    marg = max(2, int(round(0.35 * sq)))
+    T = np.zeros((sq + 2 * marg, sq + 2 * marg))
+    T[marg:marg + sq, marg:marg + sq] = 1.0
+    Ht, Wt = T.shape
+    t0 = marg + sq / 2.0
+    corr = np.abs(_pattern_ncc(feat, T))
+    sep = max(2, int(round(min_sep)))
+    out = []
+    for _ in range(max_n):
+        idx = int(np.argmax(corr)); k, l = np.unravel_index(idx, corr.shape)
+        v = corr[k, l]
+        if not np.isfinite(v) or v < thresh:
+            break
+        out.append((float(l - Wt + 1 + t0), float(k - Ht + 1 + t0), float(v)))
+        r0, r1 = max(0, k - sep), min(corr.shape[0], k + sep + 1)
+        c0, c1 = max(0, l - sep), min(corr.shape[1], l + sep + 1)
+        corr[r0:r1, c0:c1] = -np.inf
+    return out
+
+
+def _localize_pin(feat, col, row, dia_px, search_px):
+    """Refine the centre of a solid-circle pin near (col, row) by |NCC| of a filled-disk template
+    in a local window. Returns (col, row) or None if no pin sits within ``search_px``. The window
+    is kept below a pin pitch so it locks onto the intended pin, not a neighbour."""
+    r = max(2, int(round(0.5 * dia_px)))
+    pad = int(round(search_px)) + r + 3
+    H, W = feat.shape
+    c0, r0 = int(max(0, round(col) - pad)), int(max(0, round(row) - pad))
+    c1, r1 = int(min(W, round(col) + pad + 1)), int(min(H, round(row) + pad + 1))
+    sub = feat[r0:r1, c0:c1]
+    if min(sub.shape) < 2 * r + 5:
+        return None
+    marg = 3
+    yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
+    T = np.zeros((2 * r + 1 + 2 * marg, 2 * r + 1 + 2 * marg))
+    T[marg:marg + 2 * r + 1, marg:marg + 2 * r + 1] = ((xx * xx + yy * yy) <= r * r)
+    Ht, Wt = T.shape
+    t0 = marg + r
+    corr = np.abs(_pattern_ncc(sub, T))
+    k, l = np.unravel_index(int(np.argmax(corr)), corr.shape)
+    pc = c0 + (l - Wt + 1 + t0); pr = r0 + (k - Ht + 1 + t0)
+    if (pc - col) ** 2 + (pr - row) ** 2 > search_px ** 2:
+        return None
+    return (float(pc), float(pr))
+
+
 def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
                     min_inbounds=0.8, min_contrast_um=4.0, expect_max=80,
                     mirror_x=True, y_up=1):
-    """Detect and register EVERY unit cell tiled across an assembled sample.
+    """Detect and register EVERY unit cell tiled across an assembled sample (Tier 1).
 
-    Placement is anchored to the UNIQUE alignment marker (never the periodic pin lattice,
-    whose overlap peaks alias a pitch away and give plausible-but-wrong positions). Each
-    marker centre gives that cell's translation; one global rotation is taken from the marker
-    grid; the DXF is mapped mirrored (``mirror_x=True`` -> x_right=-1) so the array is never
-    flipped (present figures flipped instead). A small alias-safe refine polishes translation,
-    and false markers are rejected by pin overlap AT the marker-anchored position. Cells whose
-    marker was missed are filled from the fitted cell lattice. Survivors are indexed in the
-    DESIGN frame with (cell_row=1, cell_col=1) = the DXF top-left. Returns a list of
-    :class:`CellPlacement` (``cell_row``/``cell_col`` set), sorted by (row, col).
+    Each cell is solved INDEPENDENTLY from two correspondences: its solid-square alignment
+    marker (one corner, found by filled-square |NCC|) and the pin farthest from it (the opposite
+    corner, found by filled-disk |NCC|). Two point pairs fix that cell's rotation + translation
+    directly, with the marker->pin distance ratio as a scale sanity-check -- so NO marker-to-
+    marker grid or assumed tile pitch is needed (both fail for a single-cell DXF, where the tile
+    pitch is unknown). The DXF is mapped mirrored (``mirror_x=True`` -> x_right=-1) so the array
+    is never flipped. Each candidate is verified by DXF-pin overlap (depth-robust local mask) and
+    ablation contrast, so over-detected/false markers are dropped. Survivors are indexed in the
+    DESIGN frame with (cell_row=1, cell_col=1) = the DXF top-left, sorted by (row, col).
 
-    When no alignment marker can be used (none detected, or detections yield no valid cell),
-    this transparently falls back to :func:`_register_by_pattern`, a marker-free coarse-to-fine
-    phase correlation of the DXF pin pattern. The marker path itself is unchanged; the fallback
-    is only reached when it would otherwise return nothing.
+    If no marker yields a verified cell, this falls back to :func:`_register_by_pattern` (Tier 2),
+    a marker-free coarse-to-fine phase correlation of the DXF pin pattern.
     """
     x_right = -1 if mirror_x else 1
     xppx, yppx = scan.x_um_per_px, scan.y_um_per_px
@@ -792,98 +836,73 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
     min_pin_pitch = min(a.pitch_x_um for a in template.arrays) / xppx
     max_shift = 0.3 * min_pin_pitch                      # keep the polish below half a pin pitch
 
-    peaks = detect_markers(edge, mx, my, expect_n=expect_max,
-                           min_sep_px=min_sep, rel_snr=0.12)
-    if not peaks:
+    # --- solid-square marker detection (permissive; false markers are verified out below) ---
+    marker_px = 0.5 * (mx + my)
+    markers = _solid_square_ncc_markers(feat, marker_px, max(0.6 * marker_px, 20),
+                                        max_n=max(8, 2 * expect_max))
+    if not markers:
         return _fallback("no alignment marker detected")
-    rot_deg = _marker_grid_rotation(peaks, Pxpx)         # one global rotation for all cells
-    th = np.deg2rad(rot_deg); cth, sth = np.cos(th), np.sin(th)
-    rel = np.array([x_right * (marker_um / 2) / xppx, y_up * (marker_um / 2) / yppx])
-    Rrel = np.array([cth * rel[0] - sth * rel[1], sth * rel[0] + cth * rel[1]])
 
-    def _place(oc, orow, floor=0.0, method="marker"):
-        """Alias-safe refine of a marker/lattice-anchored origin; None if off-scan/below floor."""
-        o, ov = _refine_origin(pin_mask, template, (oc, orow), xppx, yppx, y_up, x_right,
-                               rot_deg, search_px=int(max_shift) + 6, max_shift_px=max_shift)
-        if not np.isfinite(ov):
-            return None
-        p = CellPlacement(0, float(o[0]), float(o[1]), xppx, yppx, y_up=y_up, x_right=x_right,
-                          rotation_deg=rot_deg, score=float(ov), method=method)
-        if _inbounds_frac(p, template, W, H) < min_inbounds or ov < floor:
-            return None
-        if _cell_contrast(z0, valid, template, p, W, H) < min_contrast_um:
-            return None                                  # flat / un-ablated region, not a cell
-        return p
+    # --- design reference points: the marker centre and the pin FARTHEST from it (opposite
+    # corner). A long marker->pin baseline makes the two-point rotation solve accurate. ---
+    mcx, mcy = marker_um / 2.0, marker_um / 2.0          # marker centre (CAD um)
+    centers = template.all_centers_um()
+    far = centers[int(np.argmax((centers[:, 0] - mcx) ** 2 + (centers[:, 1] - mcy) ** 2))]
+    far_dia = next((a.diameter_um for a in template.arrays
+                    if np.any(np.all(np.isclose(a.centers_um, far), axis=1))), 50.0)
 
-    def _dedupe(cands):
-        out = []
-        for c in sorted(cands, key=lambda p: -p.score):
-            if not any((c.origin_col - k.origin_col) ** 2 +
-                       (c.origin_row - k.origin_row) ** 2 < min_sep ** 2 for k in out):
-                out.append(c)
-        return out
+    def _v(x, y):                                        # CAD um -> reflected/scaled scan vector
+        return np.array([x_right * x / xppx, y_up * y / yppx])
+    v_m, v_p = _v(mcx, mcy), _v(far[0], far[1])
+    dv = v_p - v_m
+    dv_ang, dv_len = float(np.arctan2(dv[1], dv[0])), float(np.hypot(*dv))
+    amask = _adaptive_pin_mask(z0, valid, float(np.mean(
+        [a.pitch_x_um for a in template.arrays])) / xppx)
 
-    # --- CONFIDENT marker cells only (high overlap + real ablation contrast) define the grid
-    # skeleton; low-overlap detections are ignored here so they can't seed a wrong lattice. ---
-    good = []
-    for pk in peaks:
-        oc, orow = pk["col"] - Rrel[0], pk["row"] - Rrel[1]
-        p = _place(oc, orow, floor=min_overlap)
-        if p is not None:
-            good.append(p)
-    good = _dedupe(good)
-    if not good:
-        return _fallback("marker detections yielded no confident cell")
-
-    # --- fit ONE global lattice (least squares) through all confident cells, then enumerate
-    # every node. A global fit (vs a single anchor + median step) averages out per-pair noise,
-    # so far-corner cells are predicted accurately enough for the small alias-safe refine to
-    # lock on. Each node is kept only if it clears the ablation-contrast gate (real cell). ---
-    _assign_grid_indices(good, Pxpx, Pypx)
-    grid = _fit_grid(good)
-    if grid is None:                                     # too few confident cells: anchor+basis
-        anchor = max(good, key=lambda p: p.score)
-        a_vec, b_vec = _estimate_basis(good, Pxpx, Pypx)   # a=col step, b=row step
-        (Ox, Oy) = (anchor.origin_col, anchor.origin_row)
-        (Rx, Ry), (Cx, Cy) = (b_vec[0], b_vec[1]), (a_vec[0], a_vec[1])
-    else:
-        (Ox, Oy), (Rx, Ry), (Cx, Cy) = grid             # O=(row1,col1), rowvec, colvec
-    N = int(np.ceil(max(W / Pxpx, H / Pypx))) + 2
+    # --- per-cell two-point registration: for each marker candidate, find the opposite-corner
+    # pin, solve rotation+translation from the two correspondences (scale as a sanity-check),
+    # polish translation on the depth-robust mask, and keep it only if it verifies. ---
     cells = []
-    for i in range(-N, N + 1):
-        for j in range(-N, N + 1):
-            ocp = Ox + i * Rx + j * Cx
-            orowp = Oy + i * Ry + j * Cy
-            if not (-Pxpx <= ocp <= W + Pxpx and -Pypx <= orowp <= H + Pypx):
-                continue
-            if any((ocp - c.origin_col) ** 2 + (orowp - c.origin_row) ** 2 < min_sep ** 2
-                   for c in cells):
-                continue
-            p = _place(ocp, orowp, floor=0.0, method="lattice")   # contrast gate = existence
-            if p is not None:
-                cells.append(p)
-    cells = _dedupe(cells)
-    if not cells:
-        return _fallback("marker grid produced no valid cells")
+    for (mc, mr, _sc) in markers:
+        S1 = np.array([mc, mr])
+        pin = _localize_pin(feat, S1[0] + dv[0], S1[1] + dv[1], far_dia / xppx,
+                            max(20.0, 0.6 * min_pin_pitch))    # coarse S2 assumes rot 0
+        if pin is None:
+            continue
+        dS = np.array(pin) - S1
+        if not (0.85 * dv_len < float(np.hypot(*dS)) < 1.18 * dv_len):   # scale sanity
+            continue
+        theta = float(np.arctan2(dS[1], dS[0]) - dv_ang)      # rotate dv onto dS
+        c_, s_ = np.cos(theta), np.sin(theta)
+        O = S1 - np.array([c_ * v_m[0] - s_ * v_m[1], s_ * v_m[0] + c_ * v_m[1]])
+        rot = float(np.degrees(theta))
+        o, ov = _refine_origin(amask, template, (float(O[0]), float(O[1])), xppx, yppx,
+                               y_up, x_right, rot, search_px=int(max_shift) + 6,
+                               max_shift_px=max_shift)
+        if not np.isfinite(ov) or ov < min_overlap:
+            continue
+        p = CellPlacement(0, float(o[0]), float(o[1]), xppx, yppx, y_up=y_up, x_right=x_right,
+                          rotation_deg=rot, score=float(ov), method="marker+pin")
+        if _inbounds_frac(p, template, W, H) < min_inbounds:
+            continue
+        if _cell_contrast(z0, valid, template, p, W, H) < min_contrast_um:
+            continue                                     # flat / un-ablated region, not a cell
+        cells.append(p)
 
-    _assign_grid_indices(cells, Pxpx, Pypx)              # final clean design-frame numbering
-    cells.sort(key=lambda p: (p.cell_row, p.cell_col))
-    for i, p in enumerate(cells, 1):
+    cells.sort(key=lambda p: -p.score)                   # one physical cell may raise several
+    kept = []                                            # marker candidates -> dedupe by cell size
+    for c in cells:
+        if not any((c.origin_col - k.origin_col) ** 2 + (c.origin_row - k.origin_row) ** 2
+                   < min_sep ** 2 for k in kept):
+            kept.append(c)
+    if not kept:
+        return _fallback("marker+pin registration produced no verified cell")
+
+    _assign_grid_indices(kept, Pxpx, Pypx)               # design-frame (row,col) numbering
+    kept.sort(key=lambda p: (p.cell_row, p.cell_col))
+    for i, p in enumerate(kept, 1):
         p.cell_id = i
-
-    # Reliability score only: re-evaluate each finalised placement's pin overlap against a
-    # depth-robust LOCAL pin map, at the SAME position (max_shift_px=0, so registration is
-    # unchanged -- still fixed by the marker anchor + global-mask logic above). The global mask
-    # scores a correctly-placed but shallow cell ~0, wrongly flagging it unreliable; the local
-    # mask sees its pins, so the score reflects true placement quality at any etch depth.
-    amask = _adaptive_pin_mask(z0, valid,
-                               float(np.mean([a.pitch_x_um for a in template.arrays])) / xppx)
-    for p in cells:
-        _, ov = _refine_origin(amask, template, (p.origin_col, p.origin_row), xppx, yppx,
-                               p.y_up, p.x_right, p.rotation_deg, search_px=6, max_shift_px=0.0)
-        if np.isfinite(ov):
-            p.score = float(ov)
-    return cells
+    return kept
 
 
 # --------------------------------------------------------------------------- #
