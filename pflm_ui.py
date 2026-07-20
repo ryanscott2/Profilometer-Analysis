@@ -47,12 +47,16 @@ except Exception:                                        # pragma: no cover - op
     _PIL = False
 
 
-_INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_SLASH = re.compile(r"[/\\]")
+_INVALID_NAME = re.compile(r'[<>:"|?*\x00-\x1f]')
 
 
 def _safe_name(name):
-    """Turn a UI dataset/sample name into a filesystem-safe folder name (Windows-safe)."""
-    name = _INVALID_NAME.sub("_", str(name)).strip().rstrip(" .")
+    """Turn a UI sample name into a filesystem-safe folder name (Windows-safe): slashes become
+    spaces; any other character illegal in a Windows path becomes an underscore."""
+    name = _SLASH.sub(" ", str(name))
+    name = _INVALID_NAME.sub("_", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
     return name or "unnamed"
 
 
