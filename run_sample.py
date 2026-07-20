@@ -82,6 +82,31 @@ def save_source_docs(dxf_path, vk4_dir, figures_dir):
     print(f"Zipped {len(vk4s)} VK4 files -> {zpath} ({zpath.stat().st_size / 1e6:.0f} MB)")
 
 
+def clear_output_dir(out_dir):
+    """Delete everything under ``out_dir`` so each run starts from a clean Results folder.
+
+    Without this, stale artifacts from a previous run linger next to the new ones — e.g. per-cell
+    reports (``figures/cells/cell_x*_y*.png``) or radial-overlay sets from a different sample or
+    parameter grid, which are keyed by cell position / set name and are NOT overwritten when the
+    new run has a different layout. Called only after registration succeeds, so a run that fails
+    before producing anything never wipes the prior good results.
+
+    Side effect: this also removes ``figures/vk4_source.zip``, so ``save_source_docs`` rebuilds
+    the source archive every run instead of reusing a current one."""
+    out_dir = Path(out_dir)
+    if not out_dir.exists():
+        return
+    for child in out_dir.iterdir():
+        try:
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        except OSError as e:                             # e.g. a figure open in a viewer on Windows
+            print(f"WARNING: could not remove {child}: {e}")
+    print(f"Cleared previous outputs in {out_dir}")
+
+
 def _band_targets(template):
     out = {}
     for b in sorted(set(a.band for a in template.arrays)):
@@ -124,6 +149,7 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
               f"{p.rotation_deg:>+8.2f} {p.score:>5.2f}{note}")
 
     out_dir = Path(out_dir)
+    clear_output_dir(out_dir)                # wipe prior outputs before writing this run's results
     qc_dir = out_dir / "legacy" / "qc"       # created on demand by extract only when make_qc=True
     (out_dir / "figures").mkdir(parents=True, exist_ok=True)
     (out_dir / "legacy").mkdir(parents=True, exist_ok=True)
