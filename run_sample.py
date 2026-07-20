@@ -19,8 +19,10 @@ Usage:
 from __future__ import annotations
 
 import csv
+import shutil
 import sys
 import warnings
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +53,33 @@ DEF_OUT_DIR = HERE / "Results"
 # overlaid (one figure per nominal geometry). If that file is absent or empty, every laser
 # parameter present in the sample is overlaid instead (a single "all" set per geometry).
 RADIAL_CSV_NAME = "radial_sets.csv"
+
+
+def save_source_docs(dxf_path, vk4_dir, figures_dir):
+    """Copy the design DXF and archive the source VK4 tiles into figures/ for provenance.
+
+    The VK4 archive is rebuilt only when missing or older than the newest VK4 file, so repeated
+    runs on the same scan don't re-zip a large dataset."""
+    figures_dir = Path(figures_dir); figures_dir.mkdir(parents=True, exist_ok=True)
+    dxf_path = Path(dxf_path)
+    if dxf_path.exists():
+        shutil.copy2(dxf_path, figures_dir / dxf_path.name)
+        print(f"Copied DXF -> {figures_dir / dxf_path.name}")
+    vk4_dir = Path(vk4_dir)
+    vk4s = (sorted(p for p in vk4_dir.iterdir() if p.suffix.lower() == ".vk4")
+            if vk4_dir.is_dir() else [])
+    if not vk4s:
+        print(f"No .vk4 files in {vk4_dir} -> no source archive.")
+        return
+    zpath = figures_dir / "vk4_source.zip"
+    newest = max(p.stat().st_mtime for p in vk4s)
+    if zpath.exists() and zpath.stat().st_mtime >= newest:
+        print(f"VK4 source archive already current -> {zpath}")
+        return
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in vk4s:
+            zf.write(p, arcname=p.name)
+    print(f"Zipped {len(vk4s)} VK4 files -> {zpath} ({zpath.stat().st_size / 1e6:.0f} MB)")
 
 
 def _band_targets(template):
@@ -89,6 +118,7 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
     qc_dir = out_dir / "legacy" / "qc"       # created on demand by extract only when make_qc=True
     (out_dir / "figures").mkdir(parents=True, exist_ok=True)
     (out_dir / "legacy").mkdir(parents=True, exist_ok=True)
+    save_source_docs(dxf_path, vk4_dir, out_dir / "figures")   # DXF copy + VK4 archive (provenance)
 
     rows, results = [], []
     res_by_cell = {}
