@@ -14,7 +14,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-# flags that mean the row's geometry should not be trusted
+# flags that mean the READ is untrustworthy (bad data, not merely a non-ideal result). Debris
+# ("wide-D") is deliberately NOT here: a debris-widened pin is reliable data that happens to show
+# debris -- it is excluded from the diameter-calibration FIT (see _fit_subset), not marked bad.
 CRITICAL_FLAGS = ("no relief", "weak lattice", "off-scan", "floor uncertain")
 
 
@@ -205,9 +207,17 @@ def make_per_row(df, out_dir, colors):
 
 def _fit_subset(df):
     d = df[df.reliable].copy()
+    # Debris-widened pins are reliable READS but not representative of the clean drawn->measured
+    # geometry, so drop them from the CALIBRATION fit ONLY (they remain reliable data everywhere
+    # else). This is the debris guard -- it does not touch the reliability flag.
+    if "flags" in d.columns:
+        d = d[~d["flags"].astype(str).str.contains("wide-D", na=False)]
     d = d[d.drawn_diameter_um.notna() & d.top_diameter_um.notna() & d.diameter_um.notna()]
-    ok = (d.top_diameter_um.between(0.5 * d.drawn_diameter_um, 1.7 * d.drawn_diameter_um) &
-          d.diameter_um.between(0.5 * d.drawn_diameter_um, 1.9 * d.drawn_diameter_um))
+    # Symmetric [0.7x, 1.4x]-drawn window for BOTH top and mid (the mid measure is the more
+    # debris-prone, so it must not get the looser bound). Keeps ~2x-drawn debris outliers out of
+    # the small-n per-band OLS fit.
+    ok = (d.top_diameter_um.between(0.7 * d.drawn_diameter_um, 1.4 * d.drawn_diameter_um) &
+          d.diameter_um.between(0.7 * d.drawn_diameter_um, 1.4 * d.drawn_diameter_um))
     return d[ok]
 
 
@@ -327,7 +337,7 @@ def print_diameter_calibration(df, out_dir):
                 seg.append(f"    {nm}: (need >=2 reliable drawn diameters to fit a line)")
             for D in nominal_ds:                         # one result per nominal diameter
                 gd = g[np.isclose(g.drawn_diameter_um, D)]
-                meas = (f"measured {gd[col].mean():6.1f} µm (n={len(gd)})" if len(gd)
+                meas = (f"measured {gd[col].median():6.1f} µm (n={len(gd)})" if len(gd)
                         else "no reliable measurement")
                 inv = (f"  ->  draw {(D - fb[1]) / fb[0]:6.1f} µm to get {D:g} µm {nm.lower()}-Ø"
                        if fb and fb[0] else "")

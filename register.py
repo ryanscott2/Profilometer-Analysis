@@ -28,6 +28,7 @@ means increasing CAD-y maps to increasing row index (matplotlib ``origin="lower"
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -841,24 +842,41 @@ def _grid_nodes(O0, col_vec, row_vec, W, H, cell_w, cell_h):
     return nodes
 
 
+def _pitch_reps(template):
+    """A reduced template carrying ONE array per distinct (pitch_x, pitch_y). De-aliasing against
+    this tests off-by-one on every lattice period the cell contains while rasterizing only a
+    representative array per pitch -- not all of them, which is the cost driver on many-array cells
+    (a 14-array cell took ~40 min otherwise). Off-by-one still shows up because each representative
+    array is finite: a one-pitch shift drops an edge row/column and lowers the overlap."""
+    seen, reps = set(), []
+    for a in template.arrays:
+        key = (round(a.pitch_x_um, 1), round(a.pitch_y_um, 1))
+        if key not in seen:
+            seen.add(key)
+            reps.append(a)
+    return SimpleNamespace(arrays=reps)
+
+
 def _probe_lattice(nodes, template, amask, z0, valid, xppx, yppx, y_up, x_right, rot,
-                   max_shift, W, H, min_overlap, min_inbounds, min_contrast):
+                   max_shift, W, H, min_overlap, min_inbounds, min_contrast, dealias_tpl=None):
     """Register every predicted lattice node: a phase-clamped refine, then -- only where a cell is
-    actually present (the refine clears the overlap gate) -- an off-by-one-pin de-alias to lock the
-    true origin. Nodes far from any real cell (empty gaps, off-scan) fail the gate and are dropped
-    without a wasted de-alias. A clamped refine (< half a pin pitch) on an accurate lattice node
-    cannot alias, so this stays off-by-one-safe on a dense periodic array. Returns placements."""
+    actually present (the refine clears the overlap gate) AND ``dealias_tpl`` is given -- an
+    off-by-one-pin de-alias to lock the true origin. ``dealias_tpl`` is a reduced template (one
+    array per distinct pitch, from :func:`_pitch_reps`), evaluated at its FULL window, so the
+    de-alias tests every lattice period without rasterizing all arrays; pass None for the cheap
+    combo-selection probes. Nodes far from any real cell fail the gate and are dropped."""
     out = []
     for (oc, orow) in nodes:
         o, ov = _refine_origin(amask, template, (oc, orow), xppx, yppx, y_up, x_right, rot,
                                search_px=int(max_shift) + 6, max_shift_px=max_shift)
         if not np.isfinite(ov) or ov < min_overlap:
             continue                                    # no cell at this node -> skip (no de-alias)
-        od, _ = _dealias_origin(amask, template, o, xppx, yppx, y_up, x_right, rot)
-        od, ovd = _refine_origin(amask, template, od, xppx, yppx, y_up, x_right, rot,
-                                 search_px=int(max_shift) + 6, max_shift_px=max_shift)
-        if np.isfinite(ovd) and ovd >= ov:              # keep the de-aliased lock only if not worse
-            o, ov = od, ovd
+        if dealias_tpl is not None:
+            od, _ = _dealias_origin(amask, dealias_tpl, o, xppx, yppx, y_up, x_right, rot)
+            od, ovd = _refine_origin(amask, template, od, xppx, yppx, y_up, x_right, rot,
+                                     search_px=int(max_shift) + 6, max_shift_px=max_shift)
+            if np.isfinite(ovd) and ovd >= ov:          # keep the de-aliased lock only if not worse
+                o, ov = od, ovd
         p = CellPlacement(0, float(o[0]), float(o[1]), xppx, yppx, y_up=y_up, x_right=x_right,
                           rotation_deg=rot, score=float(ov), method="lattice")
         if _inbounds_frac(p, template, W, H) < min_inbounds:
@@ -994,8 +1012,11 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
     if not kept:
         return _fallback("lattice probe verified no cell")
 
-    # --- 4. re-fit the lattice from the survivors and re-probe the full row/col span (tightens far
-    #        nodes and fills any interior cell the first pass missed) ---
+    # --- 4. re-fit the lattice from the survivors and re-probe the full row/col span WITH the
+    #        off-by-one de-alias (one representative array per pitch, full window) -- the ONLY pass
+    #        that de-aliases, so every final cell is off-by-one-locked at bounded cost, and any
+    #        interior cell the first pass missed is filled. ---
+    reps = _pitch_reps(template)
     if len(kept) >= 4:
         _assign_grid_indices(kept, cell_w, cell_h)
         A = np.array([[p.cell_col, p.cell_row, 1.0] for p in kept])
@@ -1004,12 +1025,15 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
         rs = [p.cell_row for p in kept]; cs = [p.cell_col for p in kept]
         nodes = [(float(np.array([c, r, 1.0]) @ kx), float(np.array([c, r, 1.0]) @ ky))
                  for r in range(min(rs), max(rs) + 1) for c in range(min(cs), max(cs) + 1)]
-        refit = _dedup_cells(
-            _probe_lattice(nodes, template, amask, z0, valid, xppx, yppx, y_up, x_right, rot,
-                           max_shift, W, H, min_overlap, min_inbounds, min_contrast_um),
-            min_sep)
-        if len(refit) >= len(kept):
-            kept = refit
+    else:
+        nodes = [(p.origin_col, p.origin_row) for p in kept]   # too few cells for an affine fit
+    locked = _dedup_cells(
+        _probe_lattice(nodes, template, amask, z0, valid, xppx, yppx, y_up, x_right, rot,
+                       max_shift, W, H, min_overlap, min_inbounds, min_contrast_um,
+                       dealias_tpl=reps),
+        min_sep)
+    if len(locked) >= len(kept):
+        kept = locked
 
     _assign_grid_indices(kept, cell_w, cell_h)           # design-frame (row,col) numbering
     kept.sort(key=lambda p: (p.cell_row, p.cell_col))
