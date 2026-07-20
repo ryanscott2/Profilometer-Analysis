@@ -275,6 +275,10 @@ def _diameters_from_profile(rc, prof, floor, depth):
     d_base = 2.0 * first_cross(floor + 0.15 * depth)
     d_mid = 2.0 * first_cross(floor + 0.50 * depth)
     d_top = 2.0 * first_cross(floor + 0.85 * depth)
+    if not np.isfinite(d_base) and np.isfinite(d_mid) and np.isfinite(d_top):
+        # debris buries the base crossing; base/mid/top sit at equal level spacing
+        # (0.15/0.50/0.85 of depth), so linearly extrapolate the top->mid trend one step
+        d_base = 2.0 * d_mid - d_top
     return d_base, d_mid, d_top
 
 
@@ -304,7 +308,8 @@ def _classify_floor_depth(z0, valid, centers_local, pxu, pyu, d_nom_um, pitch_um
 
     out = dict(pin_mask=pin_mask, floor_region=floor_region, rr=rr, r_pin_um=r_pin_um,
                pin_top=np.nan, clean_floor=np.nan, depth=np.nan,
-               flatness=np.nan, debris_frac=np.nan, debris_thresh=np.nan)
+               flatness=np.nan, debris_frac=np.nan, debris_thresh=np.nan,
+               floor_n=int(floor_region.sum()), floor_reliable=False)
     if pin_core.sum() < 20 or floor_region.sum() < 50:
         return out
 
@@ -319,9 +324,13 @@ def _classify_floor_depth(z0, valid, centers_local, pxu, pyu, d_nom_um, pitch_um
     depth = pin_top - clean_floor
     debris_thresh = clean_floor + max(5.0, 6.0 * flatness)
     debris_frac = float(np.mean(fv > debris_thresh))
+    # floor quality: enough clean floor samples and not overwhelmingly buried by debris
+    floor_n = int(floor_region.sum())
+    floor_reliable = bool(floor_n >= 150 and debris_frac <= 0.80)
 
     out.update(pin_top=pin_top, clean_floor=clean_floor, depth=depth,
-               flatness=flatness, debris_frac=debris_frac, debris_thresh=debris_thresh)
+               flatness=flatness, debris_frac=debris_frac, debris_thresh=debris_thresh,
+               floor_n=floor_n, floor_reliable=floor_reliable)
     return out
 
 
@@ -419,8 +428,13 @@ def extract_array(scan, placement, array, sample, *,
                                 d_nom, pitch_um)
     depth, floor, top = cls["depth"], cls["clean_floor"], cls["pin_top"]
     floor_flatness, debris_fraction = cls["flatness"], cls["debris_frac"]
-    if not np.isfinite(depth):                      # fallback: derive heights from the profile
+    floor_reliable = cls.get("floor_reliable", True)
+    if not np.isfinite(depth):                      # classify failed -> derive from the profile
         floor, top, depth = _profile_floor_top(prof)
+    elif not floor_reliable:                        # thin / debris-buried floor -> the mean-pin
+        pf, pt, pd = _profile_floor_top(prof)       # radial profile's outer plateau is a better
+        if np.isfinite(pd) and pd > 0:              # floor reference at tight pitch
+            floor, top, depth = pf, pt, pd
 
     # diameters = radial-profile edge, crossings anchored to the classified floor+depth
     d_base, d_mid, d_top = _diameters_from_profile(rc, prof, floor, depth)
@@ -441,6 +455,9 @@ def extract_array(scan, placement, array, sample, *,
             flags.append("no relief (<1.5um)")
     elif depth < 3.0:
         flags.append(f"shallow ({depth:.1f}um)")
+    if not floor_reliable and np.isfinite(depth):
+        flags.append(f"floor uncertain (debris {100*debris_fraction:.0f}%, "
+                     f"n={cls.get('floor_n', 0)})")
     if np.isfinite(periodicity) and periodicity < 0.12:
         flags.append(f"weak lattice ({periodicity:.2f})")
     if np.isfinite(d_mid) and d_mid > 1.4 * d_nom:
