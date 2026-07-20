@@ -4,8 +4,8 @@ PFLM sample-tester UI — a simple Tkinter front-end for ``run_sample.py``.
 Keep a library of samples (each = a DXF + a VK4 tile folder + a cell_params grid), switch
 between them, edit the laser-parameter grid, run/stop the tiled analysis while watching the
 console live, browse the Results folder + preview figures, and export a zip of ``figures/``.
-Each run writes under ``Results/<dataset name>/`` (the sample name, else the VK4 folder name), so
-different datasets never overwrite one another.
+Each run writes under ``Results/<sample name>/`` (a sample must be selected to run), so different
+datasets never overwrite one another.
 
 Drag-and-drop uses ``tkinterdnd2`` if installed (``pip install tkinterdnd2``); otherwise use the
 Browse buttons. Image preview uses Pillow if installed, else Tk's built-in PNG support.
@@ -353,13 +353,10 @@ class App:
 
     # -------------------------------------------------------------------- run #
     def _dataset_name(self):
-        """Folder-safe name for this run's Results subfolder: the selected sample name, or the
-        VK4 folder's basename when no sample is named."""
-        name = self.sample_var.get().strip()
-        if not name:
-            vk4 = self.cur.get("vk4_dir", "")
-            name = Path(vk4).name if vk4 else ""
-        return _safe_name(name)
+        """Folder-safe name for this run's Results subfolder — the sample selected in the UI
+        (the Samples dropdown), sanitized for the filesystem. A run requires a selected sample
+        (see _toggle_run), so this is never empty at run time."""
+        return _safe_name(self.sample_var.get())
 
     def _dataset_out_dir(self):
         """Per-dataset output root — Results/<dataset name>/ — holding this run's figures/ + legacy/."""
@@ -369,6 +366,10 @@ class App:
         if self.proc and self.proc.poll() is None:
             self._stop()
             return
+        if not self.sample_var.get().strip():
+            return messagebox.showerror(
+                "Run", "Select a sample in the Samples dropdown first — its name is used for the "
+                "Results subfolder.  Use “Save as…” to name the current setup as a sample.")
         dxf, vk4 = self.cur["dxf"], self.cur["vk4_dir"]
         if not (dxf and Path(dxf).exists()):
             return messagebox.showerror("Run", "Select a DXF file first.")

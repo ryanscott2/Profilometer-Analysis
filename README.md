@@ -69,7 +69,7 @@ python synth.py                        # writes Results/synth_preview.png
 | `DXF/` | the fabrication DXF (one unit cell, or a larger tiled design) |
 | `VK4/` | Keyence profilometer scans (`*.vk4`) |
 | `CSV/` | `cell_params.csv` (per-cell laser settings) + `radial_sets.csv` (radial overlays) |
-| `Results/` | analysis outputs. The UI writes each run under `Results/<dataset name>/` (the selected sample name, else the VK4 folder name); a direct `run_sample.py` writes to whatever `out_dir` you pass |
+| `Results/` | analysis outputs. The UI writes each run under `Results/<sample name>/` (the sample selected in the UI; a sample must be selected to run); a direct `run_sample.py` writes to whatever `out_dir` you pass |
 
 ## Laser parameters CSV (`cell_params.csv`)
 
@@ -102,8 +102,8 @@ table printed each run (a `rot` near ±180° flags a re-oriented wafer) and the 
 
 ## Outputs (`Results/<dataset name>/`)
 
-The UI writes each run under `Results/<dataset name>/` — the sample name selected in the UI, or
-the VK4 folder's name if none — so different datasets keep separate result sets. (A direct
+The UI writes each run under `Results/<sample name>/` — named after the sample selected in the UI
+(a sample must be selected to run) — so different datasets keep separate result sets. (A direct
 `python run_sample.py <vk4_dir> <out_dir> …` writes to `out_dir` as given.) The paths below are
 relative to that per-run output root.
 
