@@ -46,7 +46,7 @@ DEF_CSV_DIR = HERE / "CSV"
 DEF_OUT_DIR = HERE / "Results"
 
 # flags that mean the row's geometry should not be trusted
-CRITICAL_FLAGS = ("no relief", "weak lattice", "off-scan")
+CRITICAL_FLAGS = ("no relief", "weak lattice", "off-scan", "floor uncertain")
 
 
 # --------------------------------------------------------------------------- #
