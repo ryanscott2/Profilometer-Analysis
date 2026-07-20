@@ -28,7 +28,6 @@ means increasing CAD-y maps to increasing row index (matplotlib ``origin="lower"
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 
@@ -768,49 +767,130 @@ def _solid_square_ncc_markers(feat, marker_px, min_sep, max_n=40, thresh=0.30):
     return out
 
 
-def _localize_pin(feat, col, row, dia_px, search_px):
-    """Refine the centre of a solid-circle pin near (col, row) by |NCC| of a filled-disk template
-    in a local window. Returns (col, row) or None if no pin sits within ``search_px``. The window
-    is kept below a pin pitch so it locks onto the intended pin, not a neighbour."""
-    r = max(2, int(round(0.5 * dia_px)))
-    pad = int(round(search_px)) + r + 3
-    H, W = feat.shape
-    c0, r0 = int(max(0, round(col) - pad)), int(max(0, round(row) - pad))
-    c1, r1 = int(min(W, round(col) + pad + 1)), int(min(H, round(row) + pad + 1))
-    sub = feat[r0:r1, c0:c1]
-    if min(sub.shape) < 2 * r + 5:
-        return None
-    marg = 3
-    yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
-    T = np.zeros((2 * r + 1 + 2 * marg, 2 * r + 1 + 2 * marg))
-    T[marg:marg + 2 * r + 1, marg:marg + 2 * r + 1] = ((xx * xx + yy * yy) <= r * r)
-    Ht, Wt = T.shape
-    t0 = marg + r
-    corr = np.abs(_pattern_ncc(sub, T))
-    k, l = np.unravel_index(int(np.argmax(corr)), corr.shape)
-    pc = c0 + (l - Wt + 1 + t0); pr = r0 + (k - Ht + 1 + t0)
-    if (pc - col) ** 2 + (pr - row) ** 2 > search_px ** 2:
-        return None
-    return (float(pc), float(pr))
+def _lattice_step_candidates(cells, cell_w, cell_h, ntop=3):
+    """Candidate primitive tile-step vectors (dcol, drow) along each axis, smallest magnitude
+    first. ``cells`` = list of (origin_col, origin_row, overlap). A horizontal-ish offset between
+    two cells (small |drow|, |dcol| > ~half a cell) is a column step; vertical-ish is a row step.
+    Smallest first so the primitive (adjacent-cell) step is tried before its multiples; the caller
+    scores each candidate lattice by how many nodes actually verify, so a wrong step self-rejects.
+    Returns (col_vecs, row_vecs)."""
+    col, row = [], []
+    for i in range(len(cells)):
+        for j in range(len(cells)):
+            if i == j:
+                continue
+            dc = cells[j][0] - cells[i][0]
+            dr = cells[j][1] - cells[i][1]
+            if dc > 0.4 * cell_w and abs(dr) < 0.3 * cell_h:
+                col.append((dc, dr))
+            if dr > 0.4 * cell_h and abs(dc) < 0.3 * cell_w:
+                row.append((dc, dr))
+
+    def _uniq_small(offs, key):
+        out = []
+        for d in sorted(offs, key=key):
+            if not any(abs(key(d) - key(u)) < 0.15 * (cell_w + cell_h) for u in out):
+                out.append(d)
+            if len(out) >= ntop:
+                break
+        return out
+
+    return _uniq_small(col, lambda d: d[0]), _uniq_small(row, lambda d: d[1])
+
+
+def _global_rotation(amask, template, origin, xppx, yppx, y_up, x_right, max_shift,
+                     span=1.2, step=0.1):
+    """Best single stage-rotation (deg) for the whole sample, from an overlap sweep on one
+    well-registered anchor cell. Stage rotation is global, so one value serves every cell."""
+    best_a, best_ov = 0.0, -1.0
+    n = int(round(2 * span / step))
+    for k in range(n + 1):
+        a = -span + k * step
+        _, ov = _refine_origin(amask, template, origin, xppx, yppx, y_up, x_right, float(a),
+                               search_px=int(max_shift) + 6, max_shift_px=max_shift)
+        if np.isfinite(ov) and ov > best_ov:
+            best_ov, best_a = ov, float(a)
+    return best_a
+
+
+def _grid_nodes(O0, col_vec, row_vec, W, H, cell_w, cell_h):
+    """All lattice-node origins ``O0 + i*col_vec + j*row_vec`` whose cell plausibly lies in-scan."""
+    span = max(W, H)
+    ni = int(np.ceil(span / max(1.0, float(np.hypot(*col_vec))))) + 2
+    nj = int(np.ceil(span / max(1.0, float(np.hypot(*row_vec))))) + 2
+    nodes = []
+    for i in range(-ni, ni + 1):
+        for j in range(-nj, nj + 1):
+            oc = O0[0] + i * col_vec[0] + j * row_vec[0]
+            orow = O0[1] + i * col_vec[1] + j * row_vec[1]
+            if -0.5 * cell_w <= oc <= W + 0.5 * cell_w and -0.5 * cell_h <= orow <= H + 0.5 * cell_h:
+                nodes.append((oc, orow))
+    return nodes
+
+
+def _probe_lattice(nodes, template, amask, z0, valid, xppx, yppx, y_up, x_right, rot,
+                   max_shift, W, H, min_overlap, min_inbounds, min_contrast):
+    """Register every predicted lattice node: a phase-clamped refine, then -- only where a cell is
+    actually present (the refine clears the overlap gate) -- an off-by-one-pin de-alias to lock the
+    true origin. Nodes far from any real cell (empty gaps, off-scan) fail the gate and are dropped
+    without a wasted de-alias. A clamped refine (< half a pin pitch) on an accurate lattice node
+    cannot alias, so this stays off-by-one-safe on a dense periodic array. Returns placements."""
+    out = []
+    for (oc, orow) in nodes:
+        o, ov = _refine_origin(amask, template, (oc, orow), xppx, yppx, y_up, x_right, rot,
+                               search_px=int(max_shift) + 6, max_shift_px=max_shift)
+        if not np.isfinite(ov) or ov < min_overlap:
+            continue                                    # no cell at this node -> skip (no de-alias)
+        od, _ = _dealias_origin(amask, template, o, xppx, yppx, y_up, x_right, rot)
+        od, ovd = _refine_origin(amask, template, od, xppx, yppx, y_up, x_right, rot,
+                                 search_px=int(max_shift) + 6, max_shift_px=max_shift)
+        if np.isfinite(ovd) and ovd >= ov:              # keep the de-aliased lock only if not worse
+            o, ov = od, ovd
+        p = CellPlacement(0, float(o[0]), float(o[1]), xppx, yppx, y_up=y_up, x_right=x_right,
+                          rotation_deg=rot, score=float(ov), method="lattice")
+        if _inbounds_frac(p, template, W, H) < min_inbounds:
+            continue
+        if _cell_contrast(z0, valid, template, p, W, H) < min_contrast:
+            continue
+        out.append(p)
+    return out
+
+
+def _dedup_cells(cells, min_sep):
+    """Keep the highest-overlap of any cluster of placements within ``min_sep`` px."""
+    out = []
+    for p in sorted(cells, key=lambda q: -q.score):
+        if not any((p.origin_col - k.origin_col) ** 2 + (p.origin_row - k.origin_row) ** 2
+                   < min_sep ** 2 for k in out):
+            out.append(p)
+    return out
 
 
 def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
                     min_inbounds=0.8, min_contrast_um=4.0, expect_max=80,
-                    mirror_x=True, y_up=1):
+                    mirror_x=True, y_up=1, anchor_frac=0.85):
     """Detect and register EVERY unit cell tiled across an assembled sample (Tier 1).
 
-    Each cell is solved INDEPENDENTLY from two correspondences: its solid-square alignment
-    marker (one corner, found by filled-square |NCC|) and the pin farthest from it (the opposite
-    corner, found by filled-disk |NCC|). Two point pairs fix that cell's rotation + translation
-    directly, with the marker->pin distance ratio as a scale sanity-check -- so NO marker-to-
-    marker grid or assumed tile pitch is needed (both fail for a single-cell DXF, where the tile
-    pitch is unknown). The DXF is mapped mirrored (``mirror_x=True`` -> x_right=-1) so the array
-    is never flipped. Each candidate is verified by DXF-pin overlap (depth-robust local mask) and
-    ablation contrast, so over-detected/false markers are dropped. Survivors are indexed in the
-    DESIGN frame with (cell_row=1, cell_col=1) = the DXF top-left, sorted by (row, col).
+    Marker-anchored **lattice** registration (quality over runtime):
 
-    If no marker yields a verified cell, this falls back to :func:`_register_by_pattern` (Tier 2),
-    a marker-free coarse-to-fine phase correlation of the DXF pin pattern.
+    1. Detect solid alignment-marker candidates (permissive |NCC|). The marker sits in an empty
+       corner, OFF the pin lattice, so it is an *absolute* origin reference: a phase-clamped refine
+       plus off-by-one-pin de-alias locks each detection to the true cell origin. This is what makes
+       a dense, uniform, periodic array (large pins on a tight pitch) resolvable -- an overlap gate
+       alone cannot tell a real placement from a one-pin-pitch-shifted one, but the marker can.
+    2. Take the highest-overlap detections as anchors, estimate the tile step vectors from their
+       geometry (the tile pitch is NOT in the single-cell DXF, so it is measured here), and fix the
+       one global stage rotation.
+    3. Probe EVERY predicted lattice node and keep those clearing the overlap / in-bounds /
+       ablation-contrast gates, then re-fit the lattice from the survivors and re-probe so a large
+       grid never drifts a pin off at the far corners. Off-lattice spurious detections (e.g. a pin
+       mistaken for the marker) are never on a node, so they are rejected by construction.
+
+    The DXF is mapped mirrored (``mirror_x=True`` -> x_right=-1) so the array is never flipped;
+    survivors are indexed in the DESIGN frame ((1,1) = DXF top-left) by ``_assign_grid_indices``.
+    Falls back to :func:`_register_by_pattern` (marker-free pin-pattern correlation) when no marker
+    anchors a cell -- note a marker-less single uniform periodic array is genuinely off-by-one
+    ambiguous, so a corner marker (ideally an asymmetric fiducial) is required for that geometry.
     """
     x_right = -1 if mirror_x else 1
     xppx, yppx = scan.x_um_per_px, scan.y_um_per_px
@@ -830,75 +910,95 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
         marker_um = 200.0
     mx, my = marker_um / xppx, marker_um / yppx
     w_um, h_um = template.size_um
-    Pxpx = (cell_pitch_um[0] if cell_pitch_um else w_um) / xppx
-    Pypx = (cell_pitch_um[1] if cell_pitch_um else h_um) / yppx
-    min_sep = 0.5 * min(Pxpx, Pypx)
+    cell_w = (cell_pitch_um[0] if cell_pitch_um else w_um) / xppx
+    cell_h = (cell_pitch_um[1] if cell_pitch_um else h_um) / yppx
+    min_sep = 0.5 * min(cell_w, cell_h)                  # cells cannot sit closer than ~a cell
     min_pin_pitch = min(a.pitch_x_um for a in template.arrays) / xppx
-    max_shift = 0.3 * min_pin_pitch                      # keep the polish below half a pin pitch
+    max_shift = 0.3 * min_pin_pitch                      # keep every polish below half a pin pitch
+    amask = _adaptive_pin_mask(z0, valid,
+                               float(np.mean([a.pitch_x_um for a in template.arrays])) / xppx)
 
-    # --- solid-square marker detection (permissive; false markers are verified out below) ---
+    # --- 1. marker candidates -> absolute, off-by-one-safe anchor origins ---
     marker_px = 0.5 * (mx + my)
     markers = _solid_square_ncc_markers(feat, marker_px, max(0.6 * marker_px, 20),
                                         max_n=max(8, 2 * expect_max))
     if not markers:
         return _fallback("no alignment marker detected")
 
-    # --- design reference points: the marker centre and the pin FARTHEST from it (opposite
-    # corner). A long marker->pin baseline makes the two-point rotation solve accurate. ---
-    mcx, mcy = marker_um / 2.0, marker_um / 2.0          # marker centre (CAD um)
-    centers = template.all_centers_um()
-    far = centers[int(np.argmax((centers[:, 0] - mcx) ** 2 + (centers[:, 1] - mcy) ** 2))]
-    far_dia = next((a.diameter_um for a in template.arrays
-                    if np.any(np.all(np.isclose(a.centers_um, far), axis=1))), 50.0)
-
-    def _v(x, y):                                        # CAD um -> reflected/scaled scan vector
-        return np.array([x_right * x / xppx, y_up * y / yppx])
-    v_m, v_p = _v(mcx, mcy), _v(far[0], far[1])
-    dv = v_p - v_m
-    dv_ang, dv_len = float(np.arctan2(dv[1], dv[0])), float(np.hypot(*dv))
-    amask = _adaptive_pin_mask(z0, valid, float(np.mean(
-        [a.pitch_x_um for a in template.arrays])) / xppx)
-
-    # --- per-cell two-point registration: for each marker candidate, find the opposite-corner
-    # pin, solve rotation+translation from the two correspondences (scale as a sanity-check),
-    # polish translation on the depth-robust mask, and keep it only if it verifies. ---
-    cells = []
+    cand = []
     for (mc, mr, _sc) in markers:
-        S1 = np.array([mc, mr])
-        pin = _localize_pin(feat, S1[0] + dv[0], S1[1] + dv[1], far_dia / xppx,
-                            max(20.0, 0.6 * min_pin_pitch))    # coarse S2 assumes rot 0
-        if pin is None:
-            continue
-        dS = np.array(pin) - S1
-        if not (0.85 * dv_len < float(np.hypot(*dS)) < 1.18 * dv_len):   # scale sanity
-            continue
-        theta = float(np.arctan2(dS[1], dS[0]) - dv_ang)      # rotate dv onto dS
-        c_, s_ = np.cos(theta), np.sin(theta)
-        O = S1 - np.array([c_ * v_m[0] - s_ * v_m[1], s_ * v_m[0] + c_ * v_m[1]])
-        rot = float(np.degrees(theta))
-        o, ov = _refine_origin(amask, template, (float(O[0]), float(O[1])), xppx, yppx,
-                               y_up, x_right, rot, search_px=int(max_shift) + 6,
-                               max_shift_px=max_shift)
-        if not np.isfinite(ov) or ov < min_overlap:
-            continue
-        p = CellPlacement(0, float(o[0]), float(o[1]), xppx, yppx, y_up=y_up, x_right=x_right,
-                          rotation_deg=rot, score=float(ov), method="marker+pin")
-        if _inbounds_frac(p, template, W, H) < min_inbounds:
-            continue
-        if _cell_contrast(z0, valid, template, p, W, H) < min_contrast_um:
-            continue                                     # flat / un-ablated region, not a cell
-        cells.append(p)
+        o0 = (mc - x_right * 0.5 * mx, mr - y_up * 0.5 * my)   # marker centre -> CAD origin (rot~0)
+        # First pass: a phase-clamped refine only, NO de-alias. The marker is an absolute,
+        # off-pin-lattice anchor, so a <half-pitch refine already locks the true origin without
+        # aliasing. De-aliasing raw candidates is pointless work (most are spurious peaks far from
+        # any cell) and can only mis-snap them -- off-by-one is resolved later, per lattice node,
+        # where "the expected location" is actually defined.
+        o, ov = _refine_origin(amask, template, o0, xppx, yppx, y_up, x_right, 0.0,
+                               search_px=int(max_shift) + 6, max_shift_px=max_shift)
+        if np.isfinite(ov) and ov >= min_overlap:
+            cand.append((float(o[0]), float(o[1]), float(ov)))
+    cand.sort(key=lambda t: -t[2])
+    dedup = []
+    for c in cand:
+        if not any((c[0] - k[0]) ** 2 + (c[1] - k[1]) ** 2 < min_sep ** 2 for k in dedup):
+            dedup.append(c)
+    if not dedup:
+        return _fallback("no marker-anchored cell cleared the overlap gate")
 
-    cells.sort(key=lambda p: -p.score)                   # one physical cell may raise several
-    kept = []                                            # marker candidates -> dedupe by cell size
-    for c in cells:
-        if not any((c.origin_col - k.origin_col) ** 2 + (c.origin_row - k.origin_row) ** 2
-                   < min_sep ** 2 for k in kept):
-            kept.append(c)
+    O0 = dedup[0]                                        # highest overlap = surest phase anchor
+    rot = _global_rotation(amask, template, (O0[0], O0[1]), xppx, yppx, y_up, x_right, max_shift)
+
+    # --- 2. tile step vectors: prefer high-overlap anchors, fall back to all cells per axis ---
+    top = O0[2]
+    anchors = [c for c in dedup if c[2] >= max(min_overlap, anchor_frac * top)]
+    col_vecs, row_vecs = _lattice_step_candidates(anchors, cell_w, cell_h)
+    col_all, row_all = _lattice_step_candidates(dedup, cell_w, cell_h)
+    col_vecs = col_vecs or col_all
+    row_vecs = row_vecs or row_all
+
+    if not col_vecs or not row_vecs:                     # no 2-D lattice (single cell/row/col)
+        kept = [CellPlacement(0, c[0], c[1], xppx, yppx, y_up=y_up, x_right=x_right,
+                              rotation_deg=rot, score=c[2], method="marker") for c in dedup]
+        _assign_grid_indices(kept, cell_w, cell_h)
+        kept.sort(key=lambda p: (p.cell_row, p.cell_col))
+        for i, p in enumerate(kept, 1):
+            p.cell_id = i
+        return kept
+
+    # --- 3. probe each candidate lattice; keep the one that verifies the most nodes ---
+    best = None
+    for cv in col_vecs:
+        for rv in row_vecs:
+            nodes = _grid_nodes((O0[0], O0[1]), cv, rv, W, H, cell_w, cell_h)
+            placed = _dedup_cells(
+                _probe_lattice(nodes, template, amask, z0, valid, xppx, yppx, y_up, x_right, rot,
+                               max_shift, W, H, min_overlap, min_inbounds, min_contrast_um),
+                min_sep)
+            score = (len(placed), -len(nodes))           # most cells, then coarsest (fewest probes)
+            if best is None or score > best[0]:
+                best = (score, placed)
+    kept = best[1]
     if not kept:
-        return _fallback("marker+pin registration produced no verified cell")
+        return _fallback("lattice probe verified no cell")
 
-    _assign_grid_indices(kept, Pxpx, Pypx)               # design-frame (row,col) numbering
+    # --- 4. re-fit the lattice from the survivors and re-probe the full row/col span (tightens far
+    #        nodes and fills any interior cell the first pass missed) ---
+    if len(kept) >= 4:
+        _assign_grid_indices(kept, cell_w, cell_h)
+        A = np.array([[p.cell_col, p.cell_row, 1.0] for p in kept])
+        kx, *_ = np.linalg.lstsq(A, np.array([p.origin_col for p in kept]), rcond=None)
+        ky, *_ = np.linalg.lstsq(A, np.array([p.origin_row for p in kept]), rcond=None)
+        rs = [p.cell_row for p in kept]; cs = [p.cell_col for p in kept]
+        nodes = [(float(np.array([c, r, 1.0]) @ kx), float(np.array([c, r, 1.0]) @ ky))
+                 for r in range(min(rs), max(rs) + 1) for c in range(min(cs), max(cs) + 1)]
+        refit = _dedup_cells(
+            _probe_lattice(nodes, template, amask, z0, valid, xppx, yppx, y_up, x_right, rot,
+                           max_shift, W, H, min_overlap, min_inbounds, min_contrast_um),
+            min_sep)
+        if len(refit) >= len(kept):
+            kept = refit
+
+    _assign_grid_indices(kept, cell_w, cell_h)           # design-frame (row,col) numbering
     kept.sort(key=lambda p: (p.cell_row, p.cell_col))
     for i, p in enumerate(kept, 1):
         p.cell_id = i

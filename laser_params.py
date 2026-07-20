@@ -166,9 +166,12 @@ def prompt_for_params(vk4_file: str, cell: int, n_cells: int) -> CellParams:
 
 # --------------------------------------------------------------------------- #
 # Per-unit-cell laser parameters for the tiled full-sample workflow (run_sample.py).
-# The CSV is a plain GRID whose sheet position maps 1:1 to the sample: each line is one sample
-# ROW (top = row 1), each column one sample COLUMN (left = col 1), and every entry is a
-# 'P{passes}_S{speed}' label. No header, no index columns, no other layout.
+# The CSV is a plain GRID in DESIGN/DXF orientation: line r = design row r (top = row 1), column
+# c = design col c (left = col 1), every entry a 'P{passes}_S{speed}' label. This is the frame
+# registration numbers cells in ((1,1) = the DXF top-left, anchored on the alignment marker).
+# NOTE the Keyence scan is X-mirrored vs the design, so this grid is authored as the DXF is
+# DRAWN, not as the raw profilometer image looks (there design col 1 appears on the right).
+# No header, no index columns, no other layout.
 CELL_CSV_NAME = "cell_params.csv"
 
 
@@ -186,10 +189,12 @@ def parse_pxsy(text):
 def load_cell_params(csv_path) -> dict:
     """Load a (row, col) -> CellParams map from the cell-parameter GRID.
 
-    Sheet position IS the sample position: line ``r`` (1-based, top first) is unit-cell row r and
-    column ``c`` (1-based, left first) is unit-cell column c, so the entry at (r, c) holds that
-    cell's ``P{passes}_S{speed}`` laser parameters. There is no header, no index columns and no
-    other accepted layout. Blank cells are skipped; a blank line still advances the row index so
+    Grid position is the DESIGN/DXF cell position: line ``r`` (1-based, top first) is design row r
+    and column ``c`` (1-based, left first) is design col c, so entry (r, c) holds that cell's
+    ``P{passes}_S{speed}`` laser parameters. This matches how registration numbers cells
+    ((1,1) = the DXF top-left). The raw Keyence image is X-mirrored vs the design, so the grid is
+    authored as the DXF is drawn, NOT as the scan looks. There is no header, no index columns and
+    no other accepted layout. Blank cells are skipped; a blank line still advances the row index so
     an intentional gap keeps later cells on their true row numbers."""
     out = {}
     p = Path(csv_path)

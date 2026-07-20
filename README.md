@@ -35,14 +35,18 @@ alignment marker, and measures all of them. Cell layout notes for this dataset:
 - Registration anchors on the **unique marker** plus one global rotation (not the periodic pin
   lattice, whose overlap aliases a pitch away), and uses a pin/floor **height-contrast gate**
   to reject flat un-ablated wafer.
-- Cells are indexed by **design (row, col) with (1,1) = DXF top-left**. Laser parameters are
-  supplied per cell in `CSV/cell_params.csv` (`row,col,passes,speed,label`) — a
-  `cell_params_TEMPLATE.csv` of the detected cells is written each run for you to fill in.
+- Cells are indexed by **design (row, col) with (1,1) = DXF top-left** (marker-anchored). Laser
+  parameters are supplied per cell in `CSV/cell_params.csv` as a plain **grid in that design
+  orientation**: line `r` = design row `r` (top first), column `c` = design col `c` (left first),
+  each entry a `P{passes}_S{speed}` label (no header, no index columns, no template file). The
+  Keyence scan is X-mirrored vs the design, so author the grid **as the DXF is drawn, not as the
+  raw scan looks**. `run_sample.py` prints a `design(r,c) → marker x/y, rot, reg` table each run so
+  you can confirm the mapping (a `rot` near ±180° flags a re-oriented wafer).
 
 ```bash
 # 1. DXF/*.dxf present; drop the tile raster in VK4/ (…_Y1_X1.vk4 …)
 python run_sample.py                    # -> Results/measurements.csv, cell_overview.png, plots
-# then fill CSV/cell_params.csv (row,col,passes,speed) from the template and re-run for the
+# then fill CSV/cell_params.csv (a P{passes}_S{speed} grid, DXF orientation) and re-run for the
 # laser-parameter plots; or: python run_sample.py <vk4_dir> <out_dir> [<dxf>] [<cell_csv>]
 ```
 

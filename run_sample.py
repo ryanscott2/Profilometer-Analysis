@@ -99,20 +99,29 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
     placements = register_sample(scan, template)
     if not placements:
         raise SystemExit("No unit cells could be registered in the assembled sample.")
+    params = load_cell_params(cell_csv)
     nrow = max(p.cell_row for p in placements)
     ncol = max(p.cell_col for p in placements)
-    print(f"\nRegistered {len(placements)} unit cells in a {nrow}x{ncol} grid "
-          f"(design frame, (1,1)=top-left):")
-    for p in placements:
-        print(f"  cell ({p.cell_row},{p.cell_col}): origin=({p.origin_col:.0f},"
-              f"{p.origin_row:.0f}) rot={p.rotation_deg:+.2f}deg reg={p.score:.2f}"
-              + ("  <-- low reg, check QC" if p.score < 0.5 else ""))
-
-    params = load_cell_params(cell_csv)
+    print(f"\nRegistered {len(placements)} unit cells in a {nrow}x{ncol} grid.")
     if params:
-        print(f"\nLoaded laser params for {len(params)} cells from {cell_csv}")
+        print(f"Loaded laser params for {len(params)} grid cells from {cell_csv}.")
     else:
-        print(f"\nNo cell params at {cell_csv} (geometry still measured; fill the P_S grid).")
+        print(f"No cell params at {cell_csv} (geometry still measured; fill the P_S grid).")
+    # cell_params.csv is read in DESIGN/DXF orientation: line r -> design row r (1 = top), column
+    # c -> design col c (1 = left). The Keyence scan is X-mirrored vs the design, so design col 1
+    # sits at the RIGHT edge of the raw scan (largest marker x). This table lets you confirm each
+    # CSV grid cell maps to the physical cell you intend; a rot near +-180 would flag a wafer
+    # placed/scanned re-oriented (the grid frame would then need flipping), vs rot~0 = as-designed.
+    print("\nCSV grid (design orientation) -> physical cell — verify this maps as you intend:")
+    print(f"  {'design(r,c)':>11} {'CSV label':>10} {'mark x_mm':>10} {'y_mm':>7} {'rot deg':>8} {'reg':>5}")
+    for p in sorted(placements, key=lambda q: (q.cell_row, q.cell_col)):
+        pr = params.get((p.cell_row, p.cell_col))
+        note = ("  <-- low reg" if p.score < 0.5 else
+                "  (grid-infill)" if p.method == "grid-infill" else "")
+        print(f"  {f'({p.cell_row},{p.cell_col})':>11} {(pr.label if pr else '-'):>10} "
+              f"{p.origin_col * scan.x_um_per_px / 1000:>10.2f} "
+              f"{p.origin_row * scan.y_um_per_px / 1000:>7.2f} "
+              f"{p.rotation_deg:>+8.2f} {p.score:>5.2f}{note}")
 
     out_dir = Path(out_dir)
     qc_dir = out_dir / "legacy" / "qc"       # created on demand by extract only when make_qc=True
@@ -176,7 +185,8 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
     # measurements.csv, qc/) are regenerated under legacy/ ahead of the planned refactor.
     save_sample_overview(scan, template, placements, out_dir / "figures" / "cell_overview.png")
     save_sample_heightmap(scan, out_dir / "figures" / "sample_heightmap.png")
-    make_param_depth_scatter(df, out_dir)
+    make_param_summary(df, out_dir)          # per-cell median depth & Ø-oversizing vs params
+    make_param_depth_scatter(df, out_dir)    # same, with every array scattered around the median
     make_radial_overlays(template, placements, params, res_by_cell, out_dir,
                          sets_csv=Path(cell_csv).parent / RADIAL_CSV_NAME)
     ra.print_diameter_calibration(df, out_dir / "figures")
@@ -185,12 +195,31 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
 
 
 # ---------------------------------------------------- per-unit-cell report #
-def _resample_cell(field, placement, template, valid, res_um=2.0):
+def _cell_content_box(template, margin_um=40.0):
+    """Marker-relative design bounds (x0, x1, y0, y1) covering the alignment marker AND every pin
+    disk, plus a margin. ``template.size_um`` is only the pin-cluster SIZE and implicitly assumes
+    the pins start at the marker origin; when the marker is offset from the pin block (e.g. the
+    D50/D100 cell, whose arrays sit ~325 um above an isolated bottom-left marker) that assumption
+    crops the render. Deriving the true content extent here keeps every cell fully in frame."""
+    m = template.marker_size_um if np.isfinite(template.marker_size_um) else 0.0
+    xs, ys = [0.0, m], [0.0, m]
+    for a in template.arrays:
+        r = a.diameter_um / 2.0
+        xs += [a.centers_um[:, 0].min() - r, a.centers_um[:, 0].max() + r]
+        ys += [a.centers_um[:, 1].min() - r, a.centers_um[:, 1].max() + r]
+    return (min(xs) - margin_um, max(xs) + margin_um,
+            min(ys) - margin_um, max(ys) + margin_um)
+
+
+def _resample_cell(field, placement, template, valid, res_um=2.0, box=None):
     """Resample a cell into DESIGN orientation (un-mirrored, y up), sampling ``field`` at each
-    design pixel via the registration transform. Returns (image, extent_um)."""
-    cw, ch = template.size_um
-    nx, ny = int(round(cw / res_um)), int(round(ch / res_um))
-    gx, gy = np.meshgrid((np.arange(nx) + 0.5) * res_um, (np.arange(ny) + 0.5) * res_um)
+    design pixel via the registration transform. ``box`` = (x0, x1, y0, y1) marker-relative design
+    bounds to render (defaults to the full cell content box). Returns (image, extent_um)."""
+    x0, x1, y0, y1 = box if box is not None else _cell_content_box(template)
+    cw, ch = x1 - x0, y1 - y0
+    nx, ny = max(1, int(round(cw / res_um))), max(1, int(round(ch / res_um)))
+    gx, gy = np.meshgrid(x0 + (np.arange(nx) + 0.5) * res_um,
+                         y0 + (np.arange(ny) + 0.5) * res_um)
     cols, rows = placement.dxf_to_px(gx.ravel(), gy.ravel())
     ci = np.round(cols).astype(int); ri = np.round(rows).astype(int)
     H, W = field.shape
@@ -199,10 +228,10 @@ def _resample_cell(field, placement, template, valid, res_um=2.0):
     idx = np.nonzero(m)[0]
     vv = valid[ri[m], ci[m]]
     out[idx[vv]] = field[ri[m][vv], ci[m][vv]]
-    return out.reshape(ny, nx), (0.0, cw, 0.0, ch)
+    return out.reshape(ny, nx), (x0, x1, y0, y1)
 
 
-def _overlay_design(ax, template, res_by_array):
+def _overlay_design(ax, template, res_by_array, box=None):
     """Red pin + alignment-marker outlines, dashed array dividers, per-array D/P + discrepancy."""
     ax.add_patch(Rectangle((0, 0), template.marker_size_um, template.marker_size_um,
                            ec="red", fill=False, lw=1.6))                # alignment marker
@@ -217,8 +246,8 @@ def _overlay_design(ax, template, res_by_array):
             txt += f" {100*(r.diameter_um-a.diameter_um)/a.diameter_um:+.0f}%"
         ax.text(a.x0_um - 10, a.y1_um + 26, txt, color="red", fontsize=6.5,
                 va="bottom", ha="left")
-    ax.set_xlim(-120, template.size_um[0] + 20)
-    ax.set_ylim(-120, template.size_um[1] + 60)
+    x0, x1, y0, y1 = box if box is not None else _cell_content_box(template)
+    ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
     ax.set_xlabel("x (µm, design)"); ax.set_ylabel("y (µm, design)")
 
 
@@ -226,10 +255,11 @@ def render_cell_report(scan, placement, template, res_by_array, params, path):
     """One report per unit cell: height (floor=0) + intensity with pin/marker/array overlays,
     a title with laser params + cell position, and a measured-vs-expected table per array."""
     valid = scan.height_raw != 0
-    z_cell, ext = _resample_cell(scan.height_um, placement, template, valid)
+    box = _cell_content_box(template)
+    z_cell, ext = _resample_cell(scan.height_um, placement, template, valid, box=box)
     floor = np.nanpercentile(z_cell, 20) if np.isfinite(z_cell).any() else 0.0
     zdisp = z_cell - floor                                # local zero = trench floor
-    inten = (_resample_cell(scan.intensity.astype(float), placement, template, valid)[0]
+    inten = (_resample_cell(scan.intensity.astype(float), placement, template, valid, box=box)[0]
              if scan.intensity is not None else None)
 
     fig = plt.figure(figsize=(21, 12))
@@ -240,14 +270,14 @@ def render_cell_report(scan, placement, template, res_by_array, params, path):
     vmax = np.nanpercentile(zdisp, 98) if np.isfinite(zdisp).any() else 1.0
     im = ax0.imshow(zdisp, origin="lower", extent=ext, cmap="viridis", vmin=0, vmax=vmax,
                     aspect="equal")
-    _overlay_design(ax0, template, res_by_array)
+    _overlay_design(ax0, template, res_by_array, box=box)
     plt.colorbar(im, ax=ax0, shrink=0.85, label="height above floor (µm)")
     ax0.set_title("height (floor = local zero)")
     if inten is not None:
         im1 = ax1.imshow(inten, origin="lower", extent=ext, cmap="gray", aspect="equal",
                          vmin=np.nanpercentile(inten, 2), vmax=np.nanpercentile(inten, 98))
         plt.colorbar(im1, ax=ax1, shrink=0.85, label="intensity")   # keeps x-axes aligned
-    _overlay_design(ax1, template, res_by_array)
+    _overlay_design(ax1, template, res_by_array, box=box)
     ax1.set_title("intensity — alignment marker (red square, bottom-left)")
 
     axr = fig.add_subplot(gs[:, 1]); axr.axis("off")
@@ -555,6 +585,8 @@ def save_sample_overview(scan, template, placements, path, ds=6):
     base = _flip_lr(base)
     Wd = base.shape[1]
     allc = template.all_centers_um()
+    bx0, bx1, by0, by1 = _cell_content_box(template)
+    ccx, ccy = 0.5 * (bx0 + bx1), 0.5 * (by0 + by1)     # true cell centre (marker + pins)
     fig, ax = plt.subplots(figsize=(12, 13))
     ax.imshow(base, origin="lower", cmap="gray",
               vmin=np.nanpercentile(base, 2), vmax=np.nanpercentile(base, 98))
@@ -563,7 +595,7 @@ def save_sample_overview(scan, template, placements, path, ds=6):
         fx = (W - 1 - cols) / ds                          # apply the same L-R flip
         fy = rows / ds
         ax.plot(fx, fy, "c.", ms=0.5)
-        cx, cy = p.dxf_to_px(template.size_um[0] / 2, template.size_um[1] / 2)
+        cx, cy = p.dxf_to_px(ccx, ccy)
         ax.text((W - 1 - cx) / ds, cy / ds, f"({p.cell_row},{p.cell_col})",
                 color="yellow", ha="center", va="center", fontsize=11, weight="bold")
     ax.set_title(f"{len(placements)} unit cells — design (row,col), design orientation")
