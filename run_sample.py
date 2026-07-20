@@ -18,6 +18,7 @@ Usage:
 
 from __future__ import annotations
 
+import csv
 import sys
 import warnings
 from pathlib import Path
@@ -45,13 +46,11 @@ DEF_VK4_DIR = HERE / "VK4"
 DEF_CSV_DIR = HERE / "CSV"
 DEF_OUT_DIR = HERE / "Results"
 
-# Radial-average overlay figures: one figure per nominal geometry, overlaying the mean-pin
-# radial profile of each laser-parameter combo in a set. Cells are matched by their
-# P{passes}_S{speed} label. Edit these lists to change which combos are overlaid.
-RADIAL_PARAM_SETS = {
-    "set1": ["P10_S100", "P80_S200", "P80_S400", "P80_S800"],
-    "set2": ["P10_S100", "P10_S200", "P40_S400", "P80_S800"],
-}
+# Radial-average overlay figures are configured by CSV/radial_sets.csv: each row is one
+# comparison set -- a list of P{passes}_S{speed} labels whose mean-pin radial profiles are
+# overlaid (one figure per nominal geometry). If that file is absent or empty, every laser
+# parameter present in the sample is overlaid instead (a single "all" set per geometry).
+RADIAL_CSV_NAME = "radial_sets.csv"
 
 
 def _band_targets(template):
@@ -148,7 +147,8 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
     save_sample_overview(scan, template, placements, out_dir / "figures" / "cell_overview.png")
     save_sample_heightmap(scan, out_dir / "figures" / "sample_heightmap.png")
     make_param_depth_scatter(df, out_dir)
-    make_radial_overlays(template, placements, params, res_by_cell, out_dir)
+    make_radial_overlays(template, placements, params, res_by_cell, out_dir,
+                         sets_csv=Path(cell_csv).parent / RADIAL_CSV_NAME)
     ra.print_diameter_calibration(df, out_dir / "figures")
     ra.make_plots(df, results, out_dir / "legacy")
     return df, results, placements
@@ -387,13 +387,41 @@ def make_param_depth_scatter(df, out_dir):
 
 
 # --------------------------------------------- radial-average overlay figures #
-def make_radial_overlays(template, placements, params, res_by_cell, out_dir,
-                         param_sets=RADIAL_PARAM_SETS):
+def _combo_color(i, n):
+    """Distinct colour for combo ``i`` of ``n`` overlaid profiles: tab10 for small sets, a
+    continuous map (turbo) once there are more combos than tab10 has distinct colours."""
+    if n <= 10:
+        return plt.get_cmap("tab10")(i % 10)
+    return plt.get_cmap("turbo")(i / max(1, n - 1))
+
+
+def load_radial_sets(csv_path):
+    """Read the radial-overlay comparison CSV -> list of sets, each a list of P{passes}_S{speed}
+    labels (one row = one set; blank cells and ``#`` comment rows ignored). Returns None if the
+    file is absent or has no entries, which signals 'compare every laser parameter present'."""
+    p = Path(csv_path)
+    if not p.exists():
+        return None
+    sets = []
+    with p.open(newline="", encoding="utf-8-sig") as fh:
+        for row in csv.reader(fh):
+            if row and str(row[0]).strip().startswith("#"):
+                continue
+            labels = [c.strip() for c in row if c.strip()]
+            if labels:
+                sets.append(labels)
+    return sets or None
+
+
+def make_radial_overlays(template, placements, params, res_by_cell, out_dir, sets_csv=None):
     """One figure per nominal geometry (per array in the unit cell), overlaying the mean-pin
-    radial-average profile of several laser-parameter combos. Repeated for every set of combos
-    in ``param_sets`` -> len(arrays) * len(param_sets) figures. Cells are matched to the
-    requested P{passes}_S{speed} labels; the profiles are the (rc, prof) that extract_array
-    already computed per array, referenced to each cell's clean floor so the curves share z=0."""
+    radial-average profile of several laser-parameter combos.
+
+    The combos come from ``sets_csv`` (CSV/radial_sets.csv): each row is one comparison set of
+    P{passes}_S{speed} labels -> len(arrays) figures per set, under radial_overlays/set{N}/. If
+    that CSV is absent or empty, every laser parameter present in the sample is overlaid instead
+    (a single 'all' set). Profiles are the (rc, prof) extract_array already computed per array,
+    referenced to each cell's clean floor so the curves share z=0."""
     # label -> cell_id, keyed by both the canonical P{passes}_S{speed} and any CSV label
     label_to_cell = {}
     for pl in placements:
@@ -407,10 +435,22 @@ def make_radial_overlays(template, placements, params, res_by_cell, out_dir,
         print("No labelled cells with laser params -> skipping radial overlays.")
         return
 
-    palette = plt.get_cmap("tab10")
+    sets = load_radial_sets(sets_csv) if sets_csv else None
+    if sets is None:                          # absent/empty CSV -> compare every laser parameter
+        seen = {}                             # (passes, speed) -> canonical label, ordered
+        for pl in placements:
+            pr = params.get((pl.cell_row, pl.cell_col))
+            if pr and pr.valid:
+                seen[(pr.passes, pr.speed)] = f"P{pr.passes}_S{pr.speed:g}"
+        named_sets = {"all": [seen[k] for k in sorted(seen)]}
+        print(f"radial overlays: no radial_sets.csv (or empty) -> comparing all "
+              f"{len(named_sets['all'])} laser params per geometry")
+    else:
+        named_sets = {f"set{i + 1}": s for i, s in enumerate(sets)}
+
     root = Path(out_dir) / "figures" / "radial_overlays"
     n_fig = 0
-    for set_name, combos in param_sets.items():
+    for set_name, combos in named_sets.items():
         sdir = root / set_name
         sdir.mkdir(parents=True, exist_ok=True)
         missing = [c for c in combos if c not in label_to_cell]
@@ -434,7 +474,7 @@ def make_radial_overlays(template, placements, params, res_by_cell, out_dir,
                 floor = res.floor_um if np.isfinite(res.floor_um) else np.nanmin(prof)
                 z = prof - floor
                 depth = res.depth_um if np.isfinite(res.depth_um) else np.nanmax(z)
-                ax.plot(rc, z, "-", lw=1.9, color=palette(i % 10),
+                ax.plot(rc, z, "-", lw=1.9, color=_combo_color(i, len(combos)),
                         label=f"{combo}   (depth {depth:.0f} µm)")
                 n_lines += 1
             if not n_lines:
@@ -448,7 +488,7 @@ def make_radial_overlays(template, placements, params, res_by_cell, out_dir,
             ax.set_title(f"Radial-average pin profile — drawn Ø {a.diameter_um:g} µm, "
                          f"pitch {a.pitch_um:g} µm\nband {a.band} col {a.col}  ·  {set_name}")
             ax.grid(alpha=0.3)
-            ax.legend(fontsize=8)
+            ax.legend(fontsize=7, ncol=2 if n_lines > 8 else 1)
             fig.tight_layout()
             fname = f"a{a.array_id:02d}_D{a.diameter_um:g}_P{a.pitch_um:g}.png"
             fig.savefig(sdir / fname, dpi=170); plt.close(fig)
