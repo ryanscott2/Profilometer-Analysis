@@ -1,49 +1,18 @@
 """
-DXF-driven batch pin-fin analysis for the UV-laser test wafer (v2).
+Shared measurement-row builder + the legacy (v1) plot suite.
 
-Pipeline
---------
-1. Read the design geometry from the DXF (``DXF/*.dxf``): a unit-cell template of pin-fin
-   arrays with their drawn diameter / pitch / pin coordinates (see ``dxf_geometry.py``).
-2. For every scan in ``VK4/``:
-     * read the VK4 height + intensity (``vk4.py``);
-     * work out how many unit cells it holds (from the user CSV) and register the template
-       onto each cell by finding its 200 µm alignment marker (``register.py``);
-     * for every array in every cell, measure pitch / diameter / depth from the known pin
-       lattice (``extract.py``), tagging it with that cell's laser parameters (``CSV/``).
-3. Write ``Results/measurements.csv`` and the same plot set as v1's ``pinfin_analysis``.
-
-Usage
------
-    python run_analysis.py                     # uses ./DXF ./VK4 ./CSV ./Results
-    python run_analysis.py <vk4_dir> <out_dir> [<dxf_path>] [<csv_path>]
+Both drivers reuse this: ``run_sample.py`` (the tiled full-sample workflow) imports
+``result_to_row``, ``CRITICAL_FLAGS``, ``print_diameter_calibration`` and ``make_plots``;
+``selftest.py`` additionally uses ``_band_targets``. The figures produced here are the v1
+overview/dose/per-band/diameter-fit/grid set, written under ``<out_dir>/figures``.
 """
-
 from __future__ import annotations
 
-import sys
-import warnings
-from pathlib import Path
-
 import numpy as np
-import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-
-sys.path.insert(0, str(Path(__file__).parent))
-from dxf_geometry import read_design
-from vk4 import read_vk4
-from register import register_scan
-from extract import ArraySample, extract_array, save_height_map
-from laser_params import LaserParamTable, write_template, prompt_for_params, CSV_NAME
-
-HERE = Path(__file__).parent
-DEF_DXF_DIR = HERE / "DXF"
-DEF_VK4_DIR = HERE / "VK4"
-DEF_CSV_DIR = HERE / "CSV"
-DEF_OUT_DIR = HERE / "Results"
 
 # flags that mean the row's geometry should not be trusted
 CRITICAL_FLAGS = ("no relief", "weak lattice", "off-scan", "floor uncertain")
@@ -70,110 +39,6 @@ def _band_targets(template):
         ds = [a.diameter_um for a in template.arrays if a.band == b]
         out[b] = float(np.median(ds))
     return out
-
-
-def _resolve_n_cells(table, vk4_name, interactive):
-    n = table.n_cells_for(vk4_name, default=0)
-    if n >= 1:
-        return n
-    if interactive:
-        try:
-            raw = input(f"\n[{vk4_name}] how many unit cells in this scan? [1]: ").strip()
-            return max(1, int(raw)) if raw else 1
-        except (EOFError, ValueError, KeyboardInterrupt):
-            return 1
-    # No explicit per-cell rows for this file (e.g. only wildcard params). We cannot know the
-    # cell count, so default to 1 -- but warn loudly, because a genuinely tiled scan would
-    # silently lose cells 2..N. Add explicit `<file>,1..N` rows to the CSV to fix.
-    print(f"  [WARN] {vk4_name}: no explicit per-cell rows in the CSV; treating as 1 cell. "
-          f"If this scan is tiled, add rows '{vk4_name},1..N,...' so cells 2..N are measured.",
-          file=sys.stderr)
-    return 1
-
-
-def build_table(vk4_dir, out_dir, dxf_path, csv_path, *, interactive=False):
-    design = read_design(dxf_path)
-    template = design.cells[0]
-    band_target = _band_targets(template)
-    print(design.summary())
-    print(f"\nTemplate: {template.n_arrays} arrays, {template.n_bands} bands, "
-          f"{template.n_pins} pins; marker {template.marker_size_um:.0f} µm; "
-          f"cell {template.size_um[0]:.0f}x{template.size_um[1]:.0f} µm")
-
-    table = LaserParamTable.load(csv_path)
-    print(f"Loaded {len(table)} laser-param row(s) from {csv_path}"
-          if Path(csv_path).exists() else f"No CSV at {csv_path} (will prompt/flag).")
-
-    qc_dir = out_dir / "qc"; qc_dir.mkdir(parents=True, exist_ok=True)
-    hm_dir = out_dir / "heightmaps"; hm_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "figures").mkdir(parents=True, exist_ok=True)
-
-    files = sorted(Path(vk4_dir).glob("*.vk4"))
-    if not files:
-        # still emit a template so the user knows the expected CSV shape
-        write_template(Path(csv_path).parent, {}, overwrite=False)
-        raise SystemExit(
-            f"No .vk4 files in {vk4_dir}. Drop scans there, fill in "
-            f"{Path(csv_path).parent / 'laser_params.csv'}, and re-run.")
-
-    detected = {}
-    rows, results = [], []
-    for f in files:
-        vk = read_vk4(f)
-        n_cells = _resolve_n_cells(table, f.name, interactive)
-        detected[f.name] = n_cells
-        placements = register_scan(vk, template, n_cells=n_cells,
-                                   cell_pitch_mm=design.cell_pitch_mm)
-        print(f"\n{f.name}: {vk.width}x{vk.height}px @ {vk.x_um_per_px:.4f} µm/px "
-              f"({vk.width*vk.x_um_per_px/1000:.2f}x{vk.height*vk.y_um_per_px/1000:.2f} mm), "
-              f"{n_cells} cell(s)")
-
-        # full-scan height map with registration overlay
-        save_height_map(vk, hm_dir / (f.stem + ".png"),
-                        title=f"{f.stem}  ({n_cells} cell(s))",
-                        placements=placements,
-                        design=type("D", (), {"cells": [template] * n_cells})())
-
-        for pl in placements:
-            params = table.lookup(f.name, pl.cell_id)
-            if params is None and interactive:
-                params = prompt_for_params(f.name, pl.cell_id, n_cells)
-            passes = params.passes if params else 0
-            speed = params.speed if params else float("nan")
-            label = params.label if params else ""
-            reg_ok = np.isfinite(pl.origin_col)
-            print(f"  cell {pl.cell_id}: reg={pl.method} score={pl.score:.2f} "
-                  f"origin=({pl.origin_col:.0f},{pl.origin_row:.0f}) yflip={pl.y_up:+d} "
-                  f"| P{passes} S{speed:g}" + ("" if reg_ok else "  <-- REG FAILED"))
-
-            for a in template.arrays:
-                sample = ArraySample(
-                    filename=f"{f.stem}_c{pl.cell_id}_b{a.band}c{a.col}_D{a.diameter_um:g}",
-                    vk4_stem=f.stem, cell_id=pl.cell_id, array_id=a.array_id,
-                    band=a.band, col=a.col, passes=passes, speed=speed,
-                    nominal_diameter_um=a.diameter_um,
-                    target_diameter_um=band_target[a.band],
-                    nominal_pitch_um=a.pitch_um,
-                    nominal_pitch_x_um=a.pitch_x_um, nominal_pitch_y_um=a.pitch_y_um,
-                    nx=a.nx, ny=a.ny, cx_um=a.cx_um, cy_um=a.cy_um, cell_label=label)
-                res = extract_array(vk, pl, a, sample, make_qc=True,
-                                    qc_path=qc_dir / (sample.filename + ".png"))
-                reliable = (reg_ok and (passes > 0)
-                            and not any(k in res.flags for k in CRITICAL_FLAGS))
-                row = result_to_row(res, reliable)
-                row["cell_label"] = label
-                rows.append(row)
-                results.append((sample, res, reliable))
-
-    df = pd.DataFrame(rows)
-    if len(df):
-        df = df.sort_values(["vk4_stem", "cell_id", "band", "col"]).reset_index(drop=True)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_dir / "measurements.csv", index=False)
-    tmpl = write_template(Path(csv_path).parent, detected, overwrite=False)
-    print(f"\nWrote {out_dir/'measurements.csv'} ({len(df)} rows)")
-    print(f"Wrote CSV template of detected cells -> {tmpl}")
-    return df, results, template
 
 
 # ============================================================ plot helpers == #
@@ -492,38 +357,3 @@ def make_plots(df, results, out_dir):
     make_depth_dose(df, out_dir, colors)
     make_grid_overlays(results, out_dir)
     print(f"Wrote figures to {out_dir/'figures'}")
-
-
-# --------------------------------------------------------------------------- #
-def _first_dxf(dxf_dir):
-    dxfs = sorted(Path(dxf_dir).glob("*.dxf"))
-    if not dxfs:
-        raise SystemExit(f"No .dxf file found in {dxf_dir}")
-    return dxfs[0]
-
-
-def main():
-    warnings.filterwarnings("ignore")
-    vk4_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else DEF_VK4_DIR
-    out_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else DEF_OUT_DIR
-    dxf_path = Path(sys.argv[3]) if len(sys.argv) > 3 else _first_dxf(DEF_DXF_DIR)
-    csv_path = Path(sys.argv[4]) if len(sys.argv) > 4 else DEF_CSV_DIR / CSV_NAME
-    interactive = sys.stdin is not None and sys.stdin.isatty()
-
-    # v1 is deprecated; route all of its output under Results/legacy/.
-    out_dir = out_dir / "legacy"
-    df, results, template = build_table(vk4_dir, out_dir, dxf_path, csv_path,
-                                        interactive=interactive)
-    make_plots(df, results, out_dir)
-    print_diameter_calibration(df, out_dir)
-
-    rel = df[df["reliable"]] if len(df) else df
-    print(f"\n{len(rel)}/{len(df)} array measurements passed reliability checks.")
-    if len(rel):
-        pr = (rel["pitch_um"] / rel["nominal_pitch_um"]).replace([np.inf, -np.inf], np.nan)
-        print(f"Pitch accuracy (reliable): measured/design = "
-              f"{pr.mean():.3f} ± {pr.std():.3f}")
-
-
-if __name__ == "__main__":
-    main()
