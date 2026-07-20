@@ -102,6 +102,13 @@ table printed each run (a `rot` near ±180° flags a re-oriented wafer) and the 
 
 ## Outputs (`Results/`)
 
+> **Each run first clears `Results/`.** Every file and folder under it is deleted before the new
+> figures are written, so stale artifacts from a prior sample or parameter grid (per-cell reports,
+> radial-overlay sets keyed by cell position / set name) never linger. The wipe happens only
+> *after* registration succeeds — a run that fails before producing anything leaves the previous
+> results intact — and it also drops `figures/vk4_source.zip`, so the source archive is rebuilt
+> each run.
+
 | file | contents |
 |------|----------|
 | `measurements.csv` | one row per array per cell: measured pitch / base·mid·top Ø / depth, drawn Ø, laser params, registration quality, reliability flags |

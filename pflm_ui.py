@@ -118,8 +118,11 @@ class App:
     # ------------------------------------------------------------------ layout #
     def _build(self):
         root = self.root
+        # Keep the two control columns compact and give all surplus width to
+        # the preview.  Widgets inside the side columns also use bounded
+        # requested widths below so long paths/text cannot squeeze this column.
         root.columnconfigure(0, weight=0, minsize=350)
-        root.columnconfigure(1, weight=1)
+        root.columnconfigure(1, weight=1, minsize=480)
         root.columnconfigure(2, weight=0, minsize=300)
         root.rowconfigure(0, weight=1)
 
@@ -142,7 +145,8 @@ class App:
 
         dxff = ttk.LabelFrame(left, text="DXF file (drag/drop)", padding=6)
         dxff.grid(row=1, column=0, sticky="ew", pady=(0, 6)); dxff.columnconfigure(0, weight=1)
-        self.dxf_lbl = ttk.Label(dxff, text="(none)", relief="sunken", anchor="w", padding=4)
+        self.dxf_lbl = ttk.Label(dxff, text="(none)", relief="sunken", anchor="w",
+                                 padding=4, width=1)
         self.dxf_lbl.grid(row=0, column=0, sticky="ew")
         ttk.Button(dxff, text="Browse…", command=self._browse_dxf).grid(row=1, column=0, sticky="ew", pady=(4, 0))
         self._make_drop(self.dxf_lbl, self._on_drop_dxf)
@@ -150,7 +154,8 @@ class App:
         vk4f = ttk.LabelFrame(left, text="VK4 files (drag/drop folder or files)", padding=6)
         vk4f.grid(row=2, column=0, sticky="nsew", pady=(0, 6)); left.rowconfigure(2, weight=1)
         vk4f.columnconfigure(0, weight=1); vk4f.rowconfigure(1, weight=1)
-        self.vk4_dir_lbl = ttk.Label(vk4f, text="(no folder)", relief="sunken", anchor="w", padding=4)
+        self.vk4_dir_lbl = ttk.Label(vk4f, text="(no folder)", relief="sunken", anchor="w",
+                                     padding=4, width=1)
         self.vk4_dir_lbl.grid(row=0, column=0, sticky="ew")
         lbf = ttk.Frame(vk4f); lbf.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
         lbf.columnconfigure(0, weight=1); lbf.rowconfigure(0, weight=1)
@@ -198,7 +203,7 @@ class App:
         consf.grid(row=1, column=0, sticky="nsew")
         consf.columnconfigure(0, weight=1); consf.rowconfigure(0, weight=1)
         self.console = tk.Text(consf, wrap="none", background="#111", foreground="#ddd",
-                               font=("Consolas", 9))
+                               font=("Consolas", 9), height=8)
         self.console.grid(row=0, column=0, sticky="nsew")
         kv = ttk.Scrollbar(consf, orient="vertical", command=self.console.yview)
         kv.grid(row=0, column=1, sticky="ns")
@@ -224,7 +229,8 @@ class App:
         radf = ttk.LabelFrame(right, text="Radial-average sets  (one set per line)", padding=4)
         radf.grid(row=1, column=0, sticky="nsew", pady=(0, 6))
         radf.columnconfigure(0, weight=1); radf.rowconfigure(0, weight=1)
-        self.radial_text = tk.Text(radf, height=5, wrap="none", font=("Consolas", 9), undo=True)
+        self.radial_text = tk.Text(radf, height=5, width=32, wrap="none",
+                                   font=("Consolas", 9), undo=True)
         self.radial_text.grid(row=0, column=0, sticky="nsew")
         rvs = ttk.Scrollbar(radf, orient="vertical", command=self.radial_text.yview)
         rvs.grid(row=0, column=1, sticky="ns"); self.radial_text.config(yscrollcommand=rvs.set)
@@ -420,15 +426,18 @@ class App:
             self._preview_file(path)
 
     def _fit_preview_169(self, e):
-        """Size the preview to a fixed 16:9 box 2/3 of the UI width, centred (capped so it never
-        overflows the preview frame)."""
-        aw, ah = max(e.width - 10, 40), max(e.height - 10, 40)      # available inside the frame
-        w = max(40, min(int(self.root.winfo_width() * 2 / 3), aw))  # target = 2/3 of the UI width
-        h = int(w * 9 / 16)
-        if h > ah:                                                  # height-limited -> shrink to fit
-            h, w = ah, int(ah * 16 / 9)
+        """Fill the available preview frame with a centered 16:9 host."""
+        aw = max(e.width - 10, 40)
+        ah = max(e.height - 10, 40)
+
+        # Start width-limited, then switch to height-limited when necessary.
+        w = aw
+        h = round(w * 9 / 16)
+        if h > ah:
+            h = ah
+            w = round(h * 16 / 9)
+
         self.prev_host.place_configure(width=w, height=h)
-        self._reshow_image()
 
     def _show_canvas(self):
         self.text_frame.pack_forget()
