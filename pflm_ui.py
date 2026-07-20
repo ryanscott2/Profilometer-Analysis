@@ -4,6 +4,8 @@ PFLM sample-tester UI — a simple Tkinter front-end for ``run_sample.py``.
 Keep a library of samples (each = a DXF + a VK4 tile folder + a cell_params grid), switch
 between them, edit the laser-parameter grid, run/stop the tiled analysis while watching the
 console live, browse the Results folder + preview figures, and export a zip of ``figures/``.
+Each run writes under ``Results/<dataset name>/`` (the sample name, else the VK4 folder name), so
+different datasets never overwrite one another.
 
 Drag-and-drop uses ``tkinterdnd2`` if installed (``pip install tkinterdnd2``); otherwise use the
 Browse buttons. Image preview uses Pillow if installed, else Tk's built-in PNG support.
@@ -15,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -42,6 +45,15 @@ try:
     _PIL = True
 except Exception:                                        # pragma: no cover - optional dep
     _PIL = False
+
+
+_INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _safe_name(name):
+    """Turn a UI dataset/sample name into a filesystem-safe folder name (Windows-safe)."""
+    name = _INVALID_NAME.sub("_", str(name)).strip().rstrip(" .")
+    return name or "unnamed"
 
 
 def _parse_drop(data: str):
@@ -340,6 +352,19 @@ class App:
             self.status.config(text=f"deleted '{name}'")
 
     # -------------------------------------------------------------------- run #
+    def _dataset_name(self):
+        """Folder-safe name for this run's Results subfolder: the selected sample name, or the
+        VK4 folder's basename when no sample is named."""
+        name = self.sample_var.get().strip()
+        if not name:
+            vk4 = self.cur.get("vk4_dir", "")
+            name = Path(vk4).name if vk4 else ""
+        return _safe_name(name)
+
+    def _dataset_out_dir(self):
+        """Per-dataset output root — Results/<dataset name>/ — holding this run's figures/ + legacy/."""
+        return DEF_OUT / self._dataset_name()
+
     def _toggle_run(self):
         if self.proc and self.proc.poll() is None:
             self._stop()
@@ -354,8 +379,11 @@ class App:
         csv_path.write_text(self._csv(), encoding="utf-8")
         # radial_sets.csv must sit next to cell_params.csv (run_sample reads it from there)
         (WORKSPACE / "radial_sets.csv").write_text(self._radial(), encoding="utf-8")
+        # each run writes under Results/<dataset name>/ so datasets don't overwrite each other
+        # (run_sample clears only this subfolder, leaving other datasets' results intact)
+        out_dir = self._dataset_out_dir()
         cmd = [sys.executable, "-u", str(HERE / "run_sample.py"),
-               str(vk4), str(DEF_OUT), str(dxf), str(csv_path)]
+               str(vk4), str(out_dir), str(dxf), str(csv_path)]
         self.console.delete("1.0", "end")
         self._log("$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd) + "\n")
         try:
@@ -491,11 +519,12 @@ class App:
 
     # ----------------------------------------------------------------- export #
     def _export_zip(self):
-        figs = DEF_OUT / "figures"
+        name = self._dataset_name()
+        figs = self._dataset_out_dir() / "figures"
         if not figs.is_dir():
-            return messagebox.showerror("Export", "No Results/figures folder to export.")
+            return messagebox.showerror("Export", f"No figures to export for '{name}'. Run it first.")
         out = filedialog.asksaveasfilename(title="Save figures zip", defaultextension=".zip",
-                                           initialfile="figures.zip",
+                                           initialfile=f"{name}_figures.zip",
                                            filetypes=[("Zip archive", "*.zip")])
         if not out:
             return

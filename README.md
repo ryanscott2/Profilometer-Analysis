@@ -69,7 +69,7 @@ python synth.py                        # writes Results/synth_preview.png
 | `DXF/` | the fabrication DXF (one unit cell, or a larger tiled design) |
 | `VK4/` | Keyence profilometer scans (`*.vk4`) |
 | `CSV/` | `cell_params.csv` (per-cell laser settings) + `radial_sets.csv` (radial overlays) |
-| `Results/` | `measurements.csv`, figures, per-cell reports, per-array QC |
+| `Results/` | analysis outputs. The UI writes each run under `Results/<dataset name>/` (the selected sample name, else the VK4 folder name); a direct `run_sample.py` writes to whatever `out_dir` you pass |
 
 ## Laser parameters CSV (`cell_params.csv`)
 
@@ -100,11 +100,17 @@ table printed each run (a `rot` near ±180° flags a re-oriented wafer) and the 
 `Results/figures/cells/`. (`register_scan` remains the low-level single-cell primitive used by
 `selftest.py`.)
 
-## Outputs (`Results/`)
+## Outputs (`Results/<dataset name>/`)
 
-> **Each run first clears `Results/`.** Every file and folder under it is deleted before the new
-> figures are written, so stale artifacts from a prior sample or parameter grid (per-cell reports,
-> radial-overlay sets keyed by cell position / set name) never linger. The wipe happens only
+The UI writes each run under `Results/<dataset name>/` — the sample name selected in the UI, or
+the VK4 folder's name if none — so different datasets keep separate result sets. (A direct
+`python run_sample.py <vk4_dir> <out_dir> …` writes to `out_dir` as given.) The paths below are
+relative to that per-run output root.
+
+> **Each run first clears its output folder.** Every file and folder under the run's output root
+> is deleted before the new figures are written, so stale artifacts from a prior run of the *same*
+> dataset (per-cell reports, radial-overlay sets keyed by cell position / set name) never linger.
+> Only that dataset's folder is touched — other datasets are left intact. The wipe happens only
 > *after* registration succeeds — a run that fails before producing anything leaves the previous
 > results intact — and it also drops `figures/vk4_source.zip`, so the source archive is rebuilt
 > each run.
