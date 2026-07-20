@@ -37,7 +37,7 @@ inter-array gap happens to equal the intra-array pitch (which it does in this de
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
