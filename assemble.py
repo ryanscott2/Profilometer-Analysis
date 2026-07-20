@@ -116,8 +116,47 @@ def _estimate_step(tiles, ys, xs, tile_hw, ds=4, max_pairs=6):
     return step_col, step_row
 
 
+# ------------------------------------------------------------ Z leveling #
+def _level_tiles(tiles, ys, xs, step_col, step_row, min_overlap_px=200):
+    """Per-tile Z offsets (um) that make heights agree in the tile OVERLAPS.
+
+    Each VK4 tile carries its own Z reference (per-FOV autofocus), so the stitched floor jumps
+    tile-to-tile. In an overlap the SAME physical pixels appear in both tiles, so the per-pixel
+    median height difference cancels the pin pattern and leaves the pure Z offset. We solve one
+    offset per tile by least squares over all adjacent-pair differences (gauge: mean offset = 0),
+    which spreads residual error evenly instead of accumulating it across the raster."""
+    keys = list(tiles.keys())
+    idx = {k: i for i, k in enumerate(keys)}
+    th, tw = tiles[keys[0]].height, tiles[keys[0]].width
+    ov_c, ov_r = tw - step_col, th - step_row
+    A_rows, rhs = [], []
+
+    def _pair(a_key, b_key, a_sl, b_sl):
+        A, B = tiles[a_key], tiles[b_key]
+        m = (A.height_raw[a_sl] != 0) & (B.height_raw[b_sl] != 0)
+        if int(m.sum()) < min_overlap_px:
+            return
+        d = float(np.median(B.height_um[b_sl][m] - A.height_um[a_sl][m]))
+        r = np.zeros(len(keys)); r[idx[b_key]] = 1.0; r[idx[a_key]] = -1.0
+        A_rows.append(r); rhs.append(-d)          # want offset_b - offset_a = -d
+
+    for (y, x) in keys:
+        if ov_c > 4 and (y, x + 1) in tiles:      # horizontal neighbour
+            _pair((y, x), (y, x + 1),
+                  (slice(None), slice(step_col, tw)), (slice(None), slice(0, ov_c)))
+        if ov_r > 4 and (y + 1, x) in tiles:      # vertical neighbour
+            _pair((y, x), (y + 1, x),
+                  (slice(step_row, th), slice(None)), (slice(0, ov_r), slice(None)))
+    if not A_rows:
+        return {k: 0.0 for k in keys}
+    A_rows.append(np.ones(len(keys))); rhs.append(0.0)     # gauge: mean offset = 0
+    off, *_ = np.linalg.lstsq(np.array(A_rows), np.array(rhs), rcond=None)
+    return {k: float(off[idx[k]]) for k in keys}
+
+
 # --------------------------------------------------------------- assembly #
-def assemble_tiles(vk4_dir, step_col=None, step_row=None, verbose=True) -> AssembledScan:
+def assemble_tiles(vk4_dir, step_col=None, step_row=None, verbose=True,
+                   level_z=True) -> AssembledScan:
     """Stitch every ``_Y*_X*.vk4`` tile in ``vk4_dir`` into one :class:`AssembledScan`.
 
     Tile (Y,X) is placed with its top-left at ((X-Xmin)*step_col, (Y-Ymin)*step_row); in
@@ -149,6 +188,20 @@ def assemble_tiles(vk4_dir, step_col=None, step_row=None, verbose=True) -> Assem
               f"tile {tw}x{th}px, step ({step_col},{step_row})px  "
               f"overlap ({100*(1-step_col/tw):.0f}%,{100*(1-step_row/th):.0f}%)")
 
+    # per-tile Z offsets (um) to reconcile each tile's own autofocus reference at the overlaps
+    offsets = _level_tiles(tiles, ys, xs, step_col, step_row) if level_z else {k: 0.0 for k in tiles}
+    if level_z:
+        # baseline guard: keep every valid, offset-adjusted height strictly positive so the
+        # height_raw==0 "invalid" sentinel is never collided with
+        min_adj = min((float(np.min(vk.height_um[vk.height_raw != 0])) + offsets[k]
+                       for k, vk in tiles.items() if (vk.height_raw != 0).any()), default=0.0)
+        base = max(0.0, zpd - min_adj)                # lift so min adjusted height >= 1 digit
+        offsets = {k: v + base for k, v in offsets.items()}
+        if verbose:
+            span = max(offsets.values()) - min(offsets.values())
+            print(f"  Z-leveled tiles: offset span {span:.1f} um "
+                  f"(min {min(offsets.values()):.1f}, max {max(offsets.values()):.1f})")
+
     W = (max(xs) - min(xs)) * step_col + tw
     H = (max(ys) - min(ys)) * step_row + th
     height = np.zeros((H, W), np.uint32)
@@ -158,7 +211,12 @@ def assemble_tiles(vk4_dir, step_col=None, step_row=None, verbose=True) -> Assem
         r0 = (y - min(ys)) * step_row
         c0 = (x - min(xs)) * step_col
         v = vk.height_raw != 0
-        hs = height[r0:r0 + th, c0:c0 + tw]; hs[v] = vk.height_raw[v]
+        if level_z and offsets[(y, x)] != 0.0:
+            raw_vals = np.clip(np.rint((vk.height_um + offsets[(y, x)]) / zpd),
+                               1, np.iinfo(np.uint32).max).astype(np.uint32)
+        else:
+            raw_vals = vk.height_raw
+        hs = height[r0:r0 + th, c0:c0 + tw]; hs[v] = raw_vals[v]
         height[r0:r0 + th, c0:c0 + tw] = hs
         if has_int and vk.intensity is not None:
             isl = inten[r0:r0 + th, c0:c0 + tw]; isl[v] = vk.intensity[v]
