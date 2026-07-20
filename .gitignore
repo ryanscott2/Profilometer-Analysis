@@ -7,3 +7,7 @@ Results/
 
 # Raw scan tiles (large; kept locally, archived per run to Results/figures/vk4_source.zip)
 VK4/
+
+# pflm_ui.py local state (sample library + staged cell_params for a run)
+.ui_samples.json
+.ui_workspace/
