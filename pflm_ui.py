@@ -420,12 +420,13 @@ class App:
             self._preview_file(path)
 
     def _fit_preview_169(self, e):
-        """Keep the preview host locked to 16:9, letterboxed and centred inside its frame."""
-        aw, ah = max(e.width - 10, 40), max(e.height - 10, 40)
-        if aw / ah > 16 / 9:
+        """Size the preview to a fixed 16:9 box 2/3 of the UI width, centred (capped so it never
+        overflows the preview frame)."""
+        aw, ah = max(e.width - 10, 40), max(e.height - 10, 40)      # available inside the frame
+        w = max(40, min(int(self.root.winfo_width() * 2 / 3), aw))  # target = 2/3 of the UI width
+        h = int(w * 9 / 16)
+        if h > ah:                                                  # height-limited -> shrink to fit
             h, w = ah, int(ah * 16 / 9)
-        else:
-            w, h = aw, int(aw * 9 / 16)
         self.prev_host.place_configure(width=w, height=h)
         self._reshow_image()
 

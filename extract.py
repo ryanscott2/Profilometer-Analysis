@@ -272,9 +272,14 @@ def _diameters_from_profile(rc, prof, floor, depth):
         r = rc[k - 1] + f * (rc[k] - rc[k - 1])
         return r if r < edge else np.nan
 
+    # Clamp the top crossing level to just below the profile's own apex, so a pin whose measured
+    # apex sits under floor+0.85*depth (a rounded/domed laser top, or a classification depth larger
+    # than the folded profile's amplitude) still yields a top diameter instead of NaN.
+    peak = float(np.nanmax(prof))
+    top_level = min(floor + 0.85 * depth, floor + 0.95 * (peak - floor))
     d_base = 2.0 * first_cross(floor + 0.15 * depth)
     d_mid = 2.0 * first_cross(floor + 0.50 * depth)
-    d_top = 2.0 * first_cross(floor + 0.85 * depth)
+    d_top = 2.0 * first_cross(top_level)
     if not np.isfinite(d_base) and np.isfinite(d_mid) and np.isfinite(d_top):
         # debris buries the base crossing; base/mid/top sit at equal level spacing
         # (0.15/0.50/0.85 of depth), so linearly extrapolate the top->mid trend one step
@@ -316,13 +321,20 @@ def _classify_floor_depth(z0, valid, centers_local, pxu, pyu, d_nom_um, pitch_um
     pin_top = float(np.median(z0[pin_core]))
     fv = z0[floor_region]
     anchor = float(np.percentile(fv, 15.0))
-    clean = fv[np.abs(fv - anchor) <= 3.0]
+    coarse_depth = max(pin_top - anchor, 0.0)                 # rough depth before floor refinement
+    # Scale the clean-floor window and debris threshold to the trench depth. A fixed +/-3 um window
+    # is wider than a shallow trench, letting sidewall/redeposit pixels leak into 'clean' and bias
+    # the floor high (under-estimating shallow depth); a fixed +5 um debris cut sits above shallow
+    # pins so debris_frac collapses to 0 and the floor is spuriously called reliable. Deep etches
+    # keep the original +/-3 um / +5 um behaviour (the caps dominate once the trench is deep).
+    clean_win = min(3.0, max(0.75, 0.4 * coarse_depth))
+    clean = fv[np.abs(fv - anchor) <= clean_win]
     if clean.size < 20:
         clean = fv[fv <= np.percentile(fv, 25.0)]
     clean_floor = float(np.median(clean))
     flatness = float(np.std(clean))
     depth = pin_top - clean_floor
-    debris_thresh = clean_floor + max(5.0, 6.0 * flatness)
+    debris_thresh = clean_floor + max(6.0 * flatness, min(5.0, 0.3 * depth))
     debris_frac = float(np.mean(fv > debris_thresh))
     # floor quality: enough clean floor samples and not overwhelmingly buried by debris
     floor_n = int(floor_region.sum())
@@ -429,15 +441,28 @@ def extract_array(scan, placement, array, sample, *,
     depth, floor, top = cls["depth"], cls["clean_floor"], cls["pin_top"]
     floor_flatness, debris_fraction = cls["flatness"], cls["debris_frac"]
     floor_reliable = cls.get("floor_reliable", True)
-    if not np.isfinite(depth):                      # classify failed -> derive from the profile
+    if not np.isfinite(depth):                      # classify failed -> derive fully from profile
         floor, top, depth = _profile_floor_top(prof)
-    elif not floor_reliable:                        # thin / debris-buried floor -> the mean-pin
-        pf, pt, pd = _profile_floor_top(prof)       # radial profile's outer plateau is a better
-        if np.isfinite(pd) and pd > 0:              # floor reference at tight pitch
-            floor, top, depth = pf, pt, pd
+    elif not floor_reliable:                        # thin / debris-buried floor: KEEP the classified
+        pf, _pt, _pd = _profile_floor_top(prof)     # pin-top and take ONLY the floor from the mean-
+        if np.isfinite(pf) and np.isfinite(top) and (top - pf) > 0:   # pin profile's outer plateau
+            floor, depth = pf, top - pf             # (better floor at tight pitch). Using the same
+        # pin-top reference in both branches keeps depth/diameters comparable across debris levels.
 
     # diameters = radial-profile edge, crossings anchored to the classified floor+depth
     d_base, d_mid, d_top = _diameters_from_profile(rc, prof, floor, depth)
+
+    # A pin cannot exceed its pitch without merging into its neighbour; a base/mid diameter above
+    # ~pitch is debris bridging, not a real pin -> drop it so a physically-impossible width never
+    # reaches the CSV or the calibration fit. (Keyed to pitch, not 1.4*d_nom, so it also guards
+    # large-D arrays where 1.4*d_nom already exceeds the merge ceiling.)
+    merge_ceiling = 0.95 * pitch_um
+    merged = ((np.isfinite(d_base) and d_base > merge_ceiling) or
+              (np.isfinite(d_mid) and d_mid > merge_ceiling))
+    if np.isfinite(d_base) and d_base > merge_ceiling:
+        d_base = float("nan")
+    if np.isfinite(d_mid) and d_mid > merge_ceiling:
+        d_mid = float("nan")
 
     pin_sat_frac = float("nan")
     if crop.intensity is not None and np.isfinite(cls.get("r_pin_um", float("nan"))):
@@ -460,7 +485,7 @@ def extract_array(scan, placement, array, sample, *,
                      f"n={cls.get('floor_n', 0)})")
     if np.isfinite(periodicity) and periodicity < 0.12:
         flags.append(f"weak lattice ({periodicity:.2f})")
-    if np.isfinite(d_mid) and d_mid > 1.4 * d_nom:
+    if merged or (np.isfinite(d_mid) and d_mid > 1.4 * d_nom):
         flags.append("wide-D (debris?)")
 
     down = max(1, int(round(min(known_px, known_py) / 4)))
