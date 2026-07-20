@@ -322,6 +322,17 @@ def register_scan(scan, template, n_cells=1, overrides=None, refine=True,
     xppx, yppx = scan.x_um_per_px, scan.y_um_per_px
     feat, edge, pin_mask, valid, z0 = scan_feature(scan)
 
+    # Refine on a depth-robust LOCAL pin mask with the shift clamped below half a pin pitch. The
+    # marker is an absolute, off-lattice anchor, so we trust its origin and only let the refine
+    # snap a little -- otherwise a dense periodic array (large pins, tight pitch) can pull the
+    # phase peak a fraction of a pitch off the true origin. Matches register_sample.
+    if template.arrays:
+        amask = _adaptive_pin_mask(
+            z0, valid, float(np.mean([a.pitch_x_um for a in template.arrays])) / xppx)
+        max_shift = 0.3 * min(a.pitch_x_um for a in template.arrays) / xppx
+    else:
+        amask, max_shift = pin_mask, None
+
     marker_um = template.marker_size_um
     if not np.isfinite(marker_um):
         marker_um = 200.0
@@ -368,8 +379,10 @@ def register_scan(scan, template, n_cells=1, overrides=None, refine=True,
                 orow = pk["row"] - yf * 0.5 * marker_px_y
                 origin = (oc, orow)
                 if refine:
-                    origin, ref = _refine_origin(pin_mask, template, origin,
-                                                 xppx, yppx, yf, xf)
+                    origin, ref = _refine_origin(
+                        amask, template, origin, xppx, yppx, yf, xf,
+                        search_px=(int(max_shift) + 6) if max_shift else 60,
+                        max_shift_px=max_shift)
                     if np.isfinite(ref):
                         score, method = ref, "marker+lattice"   # overlap 0..1, comparable
                     else:

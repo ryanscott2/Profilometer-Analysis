@@ -20,14 +20,13 @@ Pipeline:
    come from those classified populations (robust to debris). The diameter is read from the
    mean pin, built by **stacking the patches centred on each known pin** (no fold wrap/edge
    artifacts), at three heights (base / mid / top) to capture taper.
-4. **Report** (`run_analysis.py`) — `Results/measurements.csv` plus the same plot set as v1.
+4. **Report** (`run_sample.py` + `report.py`) — `Results/measurements.csv` plus the figure set.
 
-## Two workflows
+## Workflow — full tiled sample (`run_sample.py`)
 
-**A. Full tiled sample (`run_sample.py`) — the main workflow for this data.** The whole chip
-is scanned as a continuous `..._Y{n}_X{m}.vk4` tile raster spanning many unit cells. The
-driver stitches the tiles into one scan (`assemble.py`), finds every unit cell by its 200 µm
-alignment marker, and measures all of them. Cell layout notes for this dataset:
+The whole chip is scanned as a continuous `..._Y{n}_X{m}.vk4` tile raster spanning many unit
+cells. The driver stitches the tiles into one scan (`assemble.py`), finds every unit cell by its
+200 µm alignment marker, and measures all of them. Cell layout notes for this dataset:
 
 - The Keyence images **X-mirrored** vs the DXF (the design's bottom-left marker appears at each
   cell's bottom-**right**). This is handled as a per-cell coordinate transform — the array is
@@ -50,14 +49,6 @@ python run_sample.py                    # -> Results/measurements.csv, cell_over
 # laser-parameter plots; or: python run_sample.py <vk4_dir> <out_dir> [<dxf>] [<cell_csv>]
 ```
 
-**B. Individual scans (`run_analysis.py`).** One VK4 per capture (one or a few unit cells),
-laser params by file in `CSV/laser_params.csv`.
-
-```bash
-python run_analysis.py
-# or:  python run_analysis.py <vk4_dir> <out_dir> [<dxf_path>] [<csv_path>]
-```
-
 Inspect just the DXF geometry:
 
 ```bash
@@ -77,45 +68,45 @@ python synth.py                        # writes Results/synth_preview.png
 |--------|----------|
 | `DXF/` | the fabrication DXF (one unit cell, or a larger tiled design) |
 | `VK4/` | Keyence profilometer scans (`*.vk4`) |
-| `CSV/` | `laser_params.csv` — the per-cell laser settings you supply |
-| `Results/` | `measurements.csv`, figures, per-file height maps, per-array QC |
+| `CSV/` | `cell_params.csv` (per-cell laser settings) + `radial_sets.csv` (radial overlays) |
+| `Results/` | `measurements.csv`, figures, per-cell reports, per-array QC |
 
-## Laser parameters CSV
+## Laser parameters CSV (`cell_params.csv`)
 
-A scan can hold several unit cells machined with different settings, which are not in the
-scan or the DXF — you provide them in `CSV/laser_params.csv`, one row per (file, cell):
+Per-cell laser settings are not in the scan or the DXF — you supply them in
+`CSV/cell_params.csv` as a plain **grid in DXF/design orientation**: line `r` (top = row 1) is
+design row `r`, column `c` (left = col 1) is design col `c`, each entry a `P{passes}_S{speed}`
+label. No header, no index columns.
 
 ```csv
-vk4_file,cell,passes,speed,label
-scan_A.vk4,1,20,400,bottom-left
-scan_A.vk4,2,20,500,bottom-right
-scan_A.vk4,3,40,800,top-left
-scan_A.vk4,4,40,1000,top-right
-single_cell_scan.vk4,,20,400,whole scan is one cell
+P30_S400,P35_S400,P40_S400
+P45_S400,P50_S400,P55_S400
+P60_S400,P65_S400,P70_S400
 ```
 
-* `cell` = 1-based tiled-grid order (left→right, bottom→top), as enumerated by registration.
-  The number of cells the analysis looks for in a file = the max `cell` you list for it.
-* `vk4_file` blank/`*` = default for any file; `cell` blank/`*` = every cell of that file.
-* After each run a `laser_params_TEMPLATE.csv` of the cells actually detected is written for
-  you to fill in. Rows beginning with `#` are treated as comments. On an interactive
-  terminal, cells with no CSV entry are prompted for.
+The Keyence scan is X-mirrored vs the design, so author the grid **as the DXF is drawn, not as
+the raw scan looks**. Blank cells are skipped; a blank line still advances the row index (so an
+intentional gap keeps later rows on their true numbers). Radial-average overlay sets live in
+`CSV/radial_sets.csv` — one comma-separated `P{passes}_S{speed}` set per line; empty = overlay
+every parameter present.
 
-## Registration and the manual override
+## Registration
 
-Auto-detection uses the alignment marker plus the pin lattice; the per-file height map
-(`Results/heightmaps/<file>.png`) overlays the detected marker (white square) and pin
-centres (red `+`) so you can confirm it. If a cell mis-registers, pass a manual override to
-`register.register_scan(scan, template, n_cells, overrides={cell_id: {...}})` with
-`origin_col`, `origin_row` (scan pixel of the marker's bottom-left corner) and optionally
-`y_up` (+1/−1) and `rotation_deg`.
+`register_sample` locates every unit cell automatically: it detects each cell's alignment marker
+(an absolute, off-pin-lattice anchor), estimates the tile lattice from the strongest cells, and
+probes every lattice node — so a dense periodic array registers cleanly and spurious marker hits
+are rejected by construction. Confirm the result from the `design(r,c) → marker x/y, rot, reg`
+table printed each run (a `rot` near ±180° flags a re-oriented wafer) and the per-cell reports in
+`Results/figures/cells/`. (`register_scan` remains the low-level single-cell primitive used by
+`selftest.py`.)
 
 ## Outputs (`Results/`)
 
 | file | contents |
 |------|----------|
 | `measurements.csv` | one row per array per cell: measured pitch / base·mid·top Ø / depth, drawn Ø, laser params, registration quality, reliability flags |
-| `heightmaps/<file>.png` | full scan height map with the registration overlay (one per VK4) |
+| `figures/cell_overview.png`, `figures/sample_heightmap.png` | labelled cell map + full-sample height map (design orientation) |
+| `figures/cells/cell_x*_y*.png` | per-cell report: height/intensity with pin overlay + measured-vs-drawn table |
 | `qc/<name>.png` | per-array QC: height + known pins, mean pin with fitted rings, pin/floor/debris classification, radial profile |
 | `figures/overview_3x3.png` | Ø / pitch / depth vs passes, speed, drawn Ø |
 | `figures/per_row.png` | per-band depth & diameter vs speed |
@@ -133,10 +124,11 @@ centres (red `+`) so you can confirm it. If a cell mis-registers, pass a manual 
 - `register.py` — marker detection, DXF↔scan transform (`CellPlacement`, incl. X-mirror +
   rotation), `register_scan` (per-file) and `register_sample` (full tiled sample grid).
 - `extract.py` — per-array measurement (classification-based heights, pin-stacked diameter).
-- `laser_params.py` — CSV readers/template writers (by file, and by cell (row,col)).
+- `laser_params.py` — the `cell_params.csv` grid reader (by-cell (row, col)).
+- `report.py` — shared measurement-row builder + the legacy plot suite.
 - `run_sample.py` — full-sample driver (assemble → register grid → measure → plots).
-- `run_analysis.py` — per-file batch driver + the shared plot set.
-- `synth.py`, `selftest.py` — synthetic scan generator and end-to-end validation (35 checks).
+- `pflm_ui.py` — Tkinter sample-tester GUI (sample library, run/stop, figure preview).
+- `synth.py`, `selftest.py` — synthetic scan generator and end-to-end validation.
 
 ## Notes / assumptions
 

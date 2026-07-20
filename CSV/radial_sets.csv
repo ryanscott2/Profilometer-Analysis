@@ -1,4 +1,0 @@
-# Radial-average overlay comparison sets. One row per set: a comma-separated list of,
-# P{passes}_S{speed} labels whose mean-pin radial profiles are overlaid (one figure per nominal,
-# geometry, written to Results/figures/radial_overlays/set{N}/). Empty this file to instead
-# compare every laser parameter present in the sample.,

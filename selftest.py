@@ -22,7 +22,7 @@ from dxf_geometry import read_design
 from register import register_scan
 from extract import ArraySample, extract_array
 from synth import synth_scan
-import run_analysis as ra
+import report as ra
 
 HERE = Path(__file__).parent
 OUT = HERE / "Results" / "legacy" / "selftest"
@@ -137,31 +137,8 @@ def main():
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"plotting raised: {e!r}")
 
-    # -------------------------------------------------- 4. full driver glue #
-    print("\n[4] full run_analysis driver (2-cell scan, CSV params, overlay heightmap)")
-    drv = OUT / "driver_test"
-    vk4dir = drv / "VK4"; csvdir = drv / "CSV"; resdir = drv / "Results"
-    vk4dir.mkdir(parents=True, exist_ok=True); csvdir.mkdir(parents=True, exist_ok=True)
-    (vk4dir / "synth2.vk4").write_bytes(b"VK4_placeholder")   # read_vk4 is monkeypatched
-    (csvdir / "laser_params.csv").write_text(
-        "vk4_file,cell,passes,speed,label\n"
-        "synth2.vk4,1,20,400,left\nsynth2.vk4,2,40,800,right\n", encoding="utf-8")
-    orig_read = ra.read_vk4
-    ra.read_vk4 = lambda p: scan2                             # serve the 2-cell synth scan
-    try:
-        ddf, dresults, dtmpl = ra.build_table(
-            vk4dir, resdir, dxf, csvdir / "laser_params.csv", interactive=False)
-    finally:
-        ra.read_vk4 = orig_read
-    ck.check(len(ddf) == 2 * template.n_arrays, "driver produced 2 cells x arrays rows")
-    ck.check(set(int(p) for p in ddf.passes.unique()) == {20, 40},
-             "both cells' laser params applied")
-    ck.check((resdir / "measurements.csv").exists(), "measurements.csv written")
-    ck.check((resdir / "heightmaps" / "synth2.png").exists(), "overlay heightmap written")
-    ck.check(ddf["reliable"].all(), "all driver rows reliable")
-
-    # -------------------------------------------------- 5. tiled DXF parsing #
-    print("\n[5] tiled DXF parsing (1xN row + 2x2 grid; regression for the NaN-pitch bug)")
+    # -------------------------------------------------- 4. tiled DXF parsing #
+    print("\n[4] tiled DXF parsing (1xN row + 2x2 grid; regression for the NaN-pitch bug)")
     try:
         import ezdxf
         src = ezdxf.readfile(dxf)
@@ -192,8 +169,8 @@ def main():
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"tiled DXF parsing raised: {e!r}")
 
-    # -------------------------------------------------- 6. non-square pixels #
-    print("\n[6] non-square pixels (xppx != yppx)")
+    # -------------------------------------------------- 5. non-square pixels #
+    print("\n[5] non-square pixels (xppx != yppx)")
     scan_ns, _ = synth_scan(template, x_um_per_px=2.0, y_um_per_px=1.0,
                             origin_px=(120.0, 90.0), depth_um=28.0, seed=4)
     pl_ns = register_scan(scan_ns, template, n_cells=1, cell_pitch_mm=design.cell_pitch_mm)[0]
@@ -218,8 +195,8 @@ def main():
              "non-square: every mid-diameter within 5 µm")
     ck.check(np.abs(ns_depth).max() <= 4.0, "non-square: every depth within 4 µm")
 
-    # -------------------------------------------------- 7. rotation-aware measure #
-    print("\n[7] rotation-aware classification (manual override with rotation_deg)")
+    # -------------------------------------------------- 6. rotation-aware measure #
+    print("\n[6] rotation-aware classification (manual override with rotation_deg)")
     rot = 4.0
     scan_r, _ = synth_scan(template, x_um_per_px=2.0, y_um_per_px=2.0,
                            origin_px=(150.0, 120.0), depth_um=26.0, rotation_deg=rot, seed=5)
@@ -246,15 +223,15 @@ def main():
              "rotation: every depth within 4 µm (classification honors rotation)")
     ck.check(np.abs(r_dia).max() <= 6.0, "rotation: every mid-diameter within 6 µm")
 
-    # -------------------------------------------------- 8. quality gate #
-    print("\n[8] overstated n_cells -> spurious peaks rejected, not measured as real")
+    # -------------------------------------------------- 7. quality gate #
+    print("\n[7] overstated n_cells -> spurious peaks rejected, not measured as real")
     pls_over = register_scan(scan, template, n_cells=3, cell_pitch_mm=design.cell_pitch_mm)
     n_ok = sum(np.isfinite(p.origin_col) for p in pls_over)
     print(f"    n_cells=3 on a 1-cell scan -> {n_ok} valid placement(s)")
     ck.check(n_ok == 1, "overstated n_cells: exactly one valid placement survives")
 
-    # -------------------------------------------------- 9. degenerate DXF #
-    print("\n[9] degenerate DXF (marker + <2 pins) does not crash registration")
+    # -------------------------------------------------- 8. degenerate DXF #
+    print("\n[8] degenerate DXF (marker + <2 pins) does not crash registration")
     try:
         import ezdxf
         doc = ezdxf.new(); doc.header["$INSUNITS"] = 4

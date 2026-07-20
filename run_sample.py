@@ -40,7 +40,7 @@ from assemble import assemble_tiles
 from register import register_sample
 from extract import ArraySample, extract_array
 from laser_params import load_cell_params, CELL_CSV_NAME
-import run_analysis as ra
+import report as ra          # shared measurement-row builder + legacy plot suite
 
 HERE = Path(__file__).parent
 DEF_DXF_DIR = HERE / "DXF"

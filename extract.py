@@ -571,37 +571,3 @@ def _qc(crop, z0, valid, cell_c, rc, prof, lattice, px_px, py_px, res, qc_path, 
     Path(qc_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(qc_path, dpi=150)
     plt.close(fig)
-
-
-# ============================================================ full-scan map = #
-def save_height_map(scan, path, *, title=None, placements=None, design=None):
-    """Colour-gradient height map of the RAW scan (µm axes). If placements+design are
-    given, overlay each cell's marker origin and pin lattice so the registration can be
-    eyeballed."""
-    z = scan.height_um
-    valid = scan.height_raw != 0
-    disp = np.where(valid, z, np.nan)
-    x1 = scan.width * scan.x_um_per_px
-    y1 = scan.height * scan.y_um_per_px
-    fig, ax = plt.subplots(figsize=(11, 9))
-    im = ax.imshow(disp, origin="lower", cmap="viridis", extent=[0, x1, 0, y1],
-                   vmin=np.nanmin(disp) if valid.any() else 0,
-                   vmax=np.nanmax(disp) if valid.any() else 1)
-    if placements and design:
-        for pl, cell in zip(placements, design.cells):
-            if not np.isfinite(pl.origin_col):
-                continue
-            ax.plot(pl.origin_col * scan.x_um_per_px, pl.origin_row * scan.y_um_per_px,
-                    "ws", ms=9, mfc="none", mew=1.6)
-            for a in cell.arrays:
-                cols, rows = pl.dxf_to_px(a.centers_um[:, 0], a.centers_um[:, 1])
-                ax.plot(cols * scan.x_um_per_px, rows * scan.y_um_per_px,
-                        "r+", ms=3, mew=0.5)
-    ax.set_xlabel("x (µm)"); ax.set_ylabel("y (µm)")
-    ax.set_title(title or Path(path).stem)
-    ax.set_aspect("equal")
-    plt.colorbar(im, ax=ax, shrink=0.85, label="raw height (µm)")
-    fig.tight_layout()
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=300)
-    plt.close(fig)

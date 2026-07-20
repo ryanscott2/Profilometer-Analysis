@@ -11,3 +11,8 @@ VK4/
 # pflm_ui.py local state (sample library + staged cell_params for a run)
 .ui_samples.json
 .ui_workspace/
+
+# Per-sample inputs (fabrication DXF + laser-param CSVs) are kept locally and managed via the
+# pflm_ui sample library (.ui_samples.json), not committed.
+DXF/
+CSV/
