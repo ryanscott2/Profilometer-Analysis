@@ -7,10 +7,14 @@ straight from the fabrication DXF** and measures every array of every unit cell 
 Pipeline:
 
 1. **DXF → geometry** (`dxf_geometry.py`) — parse the drawing (units mm, via `ezdxf`) into a
-   unit-cell template: every `CIRCLE` is a pin (drawn Ø = 2·radius); the ~200 µm square
-   `LWPOLYLINE` at the bottom-left is the **alignment marker** = the origin. Pins are grouped
-   into arrays (contiguous blocks of one diameter on a regular grid) with per-array diameter,
-   pitch, `nx×ny`, and pin coordinates **relative to the marker**.
+   unit-cell template: every `CIRCLE` is a pin (drawn Ø = 2·radius); a small `LWPOLYLINE` near the
+   bottom-left is the **alignment marker**. Two marker styles are recognised: the legacy ~200 µm
+   **square** (deprecated; its corner is the cell origin) and a new asymmetric **L** fiducial
+   (50 µm-wide arms) inset from the origin (its offset is derived from the cell boundary, so pins
+   stay in true design coordinates). Pins are grouped into arrays (contiguous blocks of one
+   diameter on a regular grid) with per-array diameter, pitch, `nx×ny`, and coordinates **relative
+   to the cell origin**. (DXF-side L support is in place; the scan-side L matcher is pending a real
+   L-marker scan — square-marker samples are fully supported.)
 2. **Register** (`register.py`) — a VK4 scan may contain several tiled copies of the unit
    cell. Each is located by detecting its 200 µm marker (matched-filter on the scan's edge
    map, polarity-agnostic), then snapping to the pin lattice. Tiled cells are ordered
@@ -20,7 +24,8 @@ Pipeline:
    come from those classified populations (robust to debris). The diameter is read from the
    mean pin, built by **stacking the patches centred on each known pin** (no fold wrap/edge
    artifacts), at three heights (base / mid / top) to capture taper.
-4. **Report** (`run_sample.py` + `report.py`) — `Results/measurements.csv` plus the figure set.
+4. **Report** (`run_sample.py` + `report.py`) — `Results/<sample>/legacy/measurements.csv` plus the
+   figure set (clean figures under `figures/`, the v1 set under `legacy/figures/`).
 
 ## Workflow — full tiled sample (`run_sample.py`)
 
@@ -97,8 +102,10 @@ every parameter present.
 probes every lattice node — so a dense periodic array registers cleanly and spurious marker hits
 are rejected by construction. Confirm the result from the `design(r,c) → marker x/y, rot, reg`
 table printed each run (a `rot` near ±180° flags a re-oriented wafer) and the per-cell reports in
-`Results/figures/cells/`. (`register_scan` remains the low-level single-cell primitive used by
-`selftest.py`.)
+`Results/<sample>/figures/cells/`. Cell (row,col) indices are absolute (a dropped interior
+row/column leaves a hole, not a shift); a `cell_params` entry with no registered cell is warned as
+a possible edge-dropout that could shift the parameter mapping. (`register_scan` remains the
+low-level single-cell primitive used by `selftest.py`.)
 
 ## Outputs (`Results/<dataset name>/`)
 
@@ -115,19 +122,20 @@ relative to that per-run output root.
 > results intact — and it also drops `figures/vk4_source.zip`, so the source archive is rebuilt
 > each run.
 
+Clean outputs live under `figures/`; the v1 plot set, `measurements.csv` and per-array QC live under
+`legacy/`.
+
 | file | contents |
 |------|----------|
-| `measurements.csv` | one row per array per cell: measured pitch / base·mid·top Ø / depth, drawn Ø, laser params, registration quality, reliability flags |
+| `legacy/measurements.csv` | one row per array per cell: base·mid·top Ø (`base_extrapolated` flag when the base crossing was buried), depth, **design** pitch (`pitch_*`) + scan-**measured** pitch (`meas_pitch_*`), drawn Ø, laser params, registration quality, reliability flags |
 | `figures/cell_overview.png`, `figures/sample_heightmap.png` | labelled cell map + full-sample height map (design orientation) |
 | `figures/cells/cell_x*_y*.png` | per-cell report: height/intensity with pin overlay + measured-vs-drawn table |
-| `qc/<name>.png` | per-array QC: height + known pins, mean pin with fitted rings, pin/floor/debris classification, radial profile |
-| `figures/overview_3x3.png` | Ø / pitch / depth vs passes, speed, drawn Ø |
-| `figures/per_row.png` | per-band depth & diameter vs speed |
-| `figures/diameter_fit.png` | per-band measured-vs-drawn Ø with linear fit |
-| `figures/depth_vs_dose.png` | depth vs the passes/speed dose proxy |
-| `figures/dose_collapse.png` | depth & Ø-discrepancy vs dose |
-| `figures/grid_overlays.png` | montage of the known pin grid on every array |
-| `diameter_calibration.txt` | "draw X to get Y" calibration from the fits |
+| `figures/param_summary.png`, `figures/param_depth_scatter.png` | depth & mid-Ø oversizing vs laser passes/speed (reliable arrays; ◇ D300 □ D100 △ D50) |
+| `figures/radial_overlays/<set>/a*.png` | mean-pin radial profiles overlaid across a laser-parameter set |
+| `figures/diameter_calibration.txt` | "draw X to get Y" calibration from the per-band fits |
+| `figures/` (provenance) | DXF copy, `vk4_source.zip`, `cell_params.csv`, `radial_sets.csv`, `run_manifest.json` (git commit + inputs) |
+| `legacy/figures/{overview_3x3,per_row,diameter_fit,depth_vs_dose,dose_collapse,grid_overlays}.png` | the v1 plot set |
+| `legacy/qc/<name>.png` | per-array QC (only with `make_qc`): height + known pins, mean pin with fitted rings, pin/floor/debris classification, radial profile |
 
 ## Modules
 
@@ -145,8 +153,9 @@ relative to that per-run output root.
 
 ## Notes / assumptions
 
-- DXF units are millimetres (`$INSUNITS = 4`); a square 160–240 µm `LWPOLYLINE` at a cell's
-  bottom-left is taken as its alignment marker. A DXF with no marker is treated as a single
+- DXF units are millimetres (`$INSUNITS = 4`); the alignment marker is a `LWPOLYLINE` near a cell's
+  bottom-left — either a 160–240 µm **square** (deprecated) or an **L** fiducial (recognised by its
+  6-vertex outline / low fill fraction). A DXF with no marker is treated as a single
   anchor-less design.
 - Arrays are found by grouping same-diameter pins and splitting spatially, so neighbouring
   arrays never merge even when the inter-array gap equals the pitch (as in this design).
