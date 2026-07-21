@@ -59,16 +59,14 @@ class CellPlacement:
         top-bottom reflection (``y_up`` = -1), plus a small rotation."""
         x_um = np.asarray(x_um, float)
         y_um = np.asarray(y_um, float)
-        col_rel = self.x_right * (x_um / self.x_um_per_px)   # reflect first
-        row_rel = self.y_up * (y_um / self.y_um_per_px)
-        if self.rotation_deg:                                # then rotate in SCAN space
-            th = np.deg2rad(self.rotation_deg)
-            c, s = np.cos(th), np.sin(th)
-            col = self.origin_col + c * col_rel - s * row_rel
-            row = self.origin_row + s * col_rel + c * row_rel
-        else:
-            col = self.origin_col + col_rel
-            row = self.origin_row + row_rel
+        xr = self.x_right * x_um                             # reflect in PHYSICAL um...
+        yr = self.y_up * y_um
+        if self.rotation_deg:                                # ...rotate in um, THEN scale per axis.
+            th = np.deg2rad(self.rotation_deg)               # (Rotating before the per-axis um->px
+            c, s = np.cos(th), np.sin(th)                    # scale is correct for non-square pixels;
+            xr, yr = c * xr - s * yr, s * xr + c * yr        # identical to the old px-space rotation
+        col = self.origin_col + xr / self.x_um_per_px        # when x_um_per_px == y_um_per_px.)
+        row = self.origin_row + yr / self.y_um_per_px
         return col, row
 
 
@@ -231,10 +229,10 @@ def rasterize_cell_pins(cell, x_um_per_px, y_um_per_px, shape, origin,
         ry = 0.5 * a.diameter_um / y_um_per_px
         rrx, rry = int(np.ceil(rx)), int(np.ceil(ry))
         for (x_um, y_um) in a.centers_um:
-            col_rel = x_right * (x_um / x_um_per_px)
-            row_rel = y_up * (y_um / y_um_per_px)
-            ci = int(round(oc + c * col_rel - s * row_rel))
-            ri = int(round(orow + s * col_rel + c * row_rel))
+            xr, yr = x_right * x_um, y_up * y_um             # reflect + rotate in um, then scale
+            xr, yr = c * xr - s * yr, s * xr + c * yr        # (matches CellPlacement.dxf_to_px)
+            ci = int(round(oc + xr / x_um_per_px))
+            ri = int(round(orow + yr / y_um_per_px))
             for dr in range(-rry, rry + 1):
                 for dc in range(-rrx, rrx + 1):
                     if (dc / rx) ** 2 + (dr / ry) ** 2 <= 1.0:
@@ -492,19 +490,39 @@ def _cell_contrast(z0, valid, template, placement, W, H):
 
 def _assign_grid_indices(cells, Pxpx, Pypx):
     """Assign design-frame (cell_row, cell_col) by clustering origins (col 1 = min design-x
-    = left; row 1 = max design-y = top), given the global reflection stored on each cell."""
+    = left; row 1 = max design-y = top), given the global reflection stored on each cell.
+
+    Indices are ABSOLUTE: each successive cluster advances by the origin gap measured in tile
+    pitches (the pitch unit is taken from the survivors' own median adjacent-cluster spacing, which
+    is robust to Pxpx/Pypx being the pin-cluster size rather than the true tile pitch). So a MISSING
+    interior row/column leaves a HOLE in the numbering instead of contiguously renumbering the later
+    cells -- which would silently shift their cell_params (passes/speed) assignment. NOTE: a missing
+    EDGE row/column still cannot be recovered here (no anchor); run_sample warns on that via the
+    reverse CSV check. For a complete grid this is identical to the old dense ranking."""
     if not cells:
         return
     x_right, y_up = cells[0].x_right, cells[0].y_up
     colkey = [x_right * c.origin_col for c in cells]
     rowkey = [y_up * c.origin_row for c in cells]
-    col_groups = _cluster_1d(colkey, 0.5 * Pxpx)
-    row_groups = _cluster_1d(rowkey, 0.5 * Pypx)
-    col_rank = {idx: r for r, g in enumerate(col_groups, 1) for idx, _ in g}
-    Nr = len(row_groups)
-    row_rank = {idx: (Nr - r + 1) for r, g in enumerate(row_groups, 1) for idx, _ in g}
+
+    def _abs_index(groups):
+        reps = [float(np.mean([v for _, v in g])) for g in groups]      # cluster mean, ascending
+        gaps = np.diff(reps)
+        # unit = one tile pitch = the SMALLEST adjacent-cluster gap: the closest two present cells
+        # are one pitch apart, and _cluster_1d already merged anything closer than ~half a cell, so
+        # there are no sub-pitch spurious gaps. (Min, not median: for a small grid missing one
+        # interior cell the median gap is ambiguous, but the min is still the true pitch.)
+        unit = float(gaps[gaps > 1e-6].min()) if np.any(gaps > 1e-6) else 1.0
+        idx = [1]
+        for k in range(1, len(reps)):
+            idx.append(idx[-1] + max(1, int(round((reps[k] - reps[k - 1]) / unit))))
+        return {mi: idx[gi] for gi, g in enumerate(groups) for mi, _ in g}
+
+    col_idx = _abs_index(_cluster_1d(colkey, 0.5 * Pxpx))
+    row_asc = _abs_index(_cluster_1d(rowkey, 0.5 * Pypx))               # ascending design-y = bottom
+    top = max(row_asc.values())                                        # flip so row 1 = top
     for idx, c in enumerate(cells):
-        c.cell_col, c.cell_row = col_rank[idx], row_rank[idx]
+        c.cell_col, c.cell_row = col_idx[idx], top - row_asc[idx] + 1
 
 
 # ------------------------------------------- marker-free DXF-pattern fallback #
@@ -523,8 +541,9 @@ def _cell_pin_pattern(template, xppx, yppx, x_right, y_up, rot_deg, ds, margin_p
     ys = np.concatenate([a.centers_um[:, 1] for a in template.arrays])
     dia = np.concatenate([np.full(len(a.centers_um), a.diameter_um) for a in template.arrays])
     th = np.deg2rad(rot_deg); c, s = np.cos(th), np.sin(th)
-    cr = x_right * (xs / xppx); rr = y_up * (ys / yppx)
-    col = c * cr - s * rr; row = s * cr + c * rr          # full-res px, relative to CAD (0,0)
+    xr = x_right * xs; yr = y_up * ys                     # reflect + rotate in um, then scale per axis
+    xr, yr = c * xr - s * yr, s * xr + c * yr             # (matches dxf_to_px; correct for non-square)
+    col = xr / xppx; row = yr / yppx                      # full-res px, relative to CAD (0,0)
     offc = col.min() - margin_px; offr = row.min() - margin_px
     Wt = int(np.ceil((col.max() + margin_px - offc) / ds)) + 1
     Ht = int(np.ceil((row.max() + margin_px - offr) / ds)) + 1
