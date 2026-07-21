@@ -34,6 +34,19 @@ DEF_OUT = HERE / "Results"
 IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp")
 TEXT_EXT = (".txt", ".csv", ".log", ".json")
 
+# Depth-calibration tool (calibrate_depth.py). Keep these in sync with that module's OUT_NAME /
+# MEAS_REL: it pools the per-sample legacy CSVs and writes the cross-sample analysis here.
+CAL_SCRIPT = "calibrate_depth.py"
+CAL_OUT_NAME = "etch depth"
+MEAS_REL = Path("legacy") / "measurements.csv"
+
+# Prefilled band definitions (one band per line: min_Ø, max_Ø, pitch in µm). Matches the provided
+# 4x4 single-cell DXF: Ø 50–67.5 µm @100 µm pitch and Ø 100–125 µm @150 µm pitch. Editable; blank
+# (or comments only) tells calibrate_depth.py to fall back to the measurements' own 'band' column.
+DEFAULT_BAND_DEFS = ("# min_Ø, max_Ø, pitch (µm) — one band per line; blank = use CSV 'band' column\n"
+                     "50, 67.5, 100\n"
+                     "100, 125, 150\n")
+
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     _DND = True
@@ -94,6 +107,7 @@ class App:
         root.title("PFLM sample tester")
         root.geometry("1520x900")
         self.proc = None
+        self.cal_proc = None                # depth-calibration subprocess (separate from a run)
         self.q = queue.Queue()
         self.samples = self._load_samples()
         self.cur = {"dxf": "", "vk4_dir": ""}
@@ -139,6 +153,11 @@ class App:
         if rad.exists():
             self.radial_text.delete("1.0", "end")
             self.radial_text.insert("1.0", rad.read_text(encoding="utf-8-sig"))
+        # band definitions for the depth calibration: from CSV/band_defs.csv if present, else default
+        bands = HERE / "CSV" / "band_defs.csv"
+        self.cal_bands_text.delete("1.0", "end")
+        self.cal_bands_text.insert("1.0", bands.read_text(encoding="utf-8-sig")
+                                   if bands.exists() else DEFAULT_BAND_DEFS)
 
     # ------------------------------------------------------------------ layout #
     def _build(self):
@@ -263,7 +282,44 @@ class App:
                              "empty = overlay every parameter present",
                   foreground="#666", wraplength=280).grid(row=1, column=0, columnspan=2, sticky="w")
 
-        act = ttk.Frame(right); act.grid(row=2, column=0, sticky="ew"); act.columnconfigure(0, weight=1)
+        # ---------- RIGHT: depth calibration (pool completed samples, post-hoc) ----------
+        # Shells out to calibrate_depth.py on the samples selected here; output streams to the
+        # console and the report/figures land under Results/_depth_calibration (browsable at left).
+        calf = ttk.LabelFrame(right, text="Depth calibration  (pool samples → depth = f(passes, speed))",
+                              padding=4)
+        calf.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        calf.columnconfigure(0, weight=1)
+        clf = ttk.Frame(calf); clf.grid(row=0, column=0, columnspan=2, sticky="nsew")
+        clf.columnconfigure(0, weight=1); clf.rowconfigure(0, weight=1)
+        # exportselection=False keeps the multi-selection when focus moves to another text widget
+        self.cal_list = tk.Listbox(clf, height=5, selectmode="extended", activestyle="none",
+                                   exportselection=False)
+        self.cal_list.grid(row=0, column=0, sticky="nsew")
+        cls = ttk.Scrollbar(clf, orient="vertical", command=self.cal_list.yview)
+        cls.grid(row=0, column=1, sticky="ns"); self.cal_list.config(yscrollcommand=cls.set)
+        ttk.Label(calf, text="samples to include (Ctrl/Shift-click for multi; none selected = all "
+                             "discovered)", foreground="#666", wraplength=280).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(2, 2))
+        ttk.Label(calf, text="bands — one per line: min Ø, max Ø, pitch (µm)  (a pin joins a band "
+                             "only if its Ø is in range AND its pitch matches).  blank = use CSV "
+                             "'band' column", foreground="#666", wraplength=280).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        bdf = ttk.Frame(calf); bdf.grid(row=3, column=0, columnspan=2, sticky="ew")
+        bdf.columnconfigure(0, weight=1)
+        self.cal_bands_text = tk.Text(bdf, height=3, width=30, wrap="none", font=("Consolas", 9),
+                                      undo=True)
+        self.cal_bands_text.grid(row=0, column=0, sticky="nsew")
+        bds = ttk.Scrollbar(bdf, orient="vertical", command=self.cal_bands_text.yview)
+        bds.grid(row=0, column=1, sticky="ns"); self.cal_bands_text.config(yscrollcommand=bds.set)
+        tgtf = ttk.Frame(calf); tgtf.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(2, 2))
+        ttk.Label(tgtf, text="target depth (µm):").grid(row=0, column=0, sticky="w")
+        self.cal_target = tk.StringVar(value="55")
+        ttk.Entry(tgtf, textvariable=self.cal_target, width=16).grid(row=0, column=1, sticky="w", padx=(4, 0))
+        ttk.Label(tgtf, text="(comma-sep OK)", foreground="#666").grid(row=0, column=2, sticky="w", padx=(4, 0))
+        self.cal_btn = ttk.Button(calf, text="Calibrate depth", command=self._calibrate_depth)
+        self.cal_btn.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+
+        act = ttk.Frame(right); act.grid(row=3, column=0, sticky="ew"); act.columnconfigure(0, weight=1)
         self.run_btn = ttk.Button(act, text="▶  Run", command=self._toggle_run)
         self.run_btn.grid(row=0, column=0, sticky="ew", pady=2)
         ttk.Button(act, text="Export figures .zip", command=self._export_zip).grid(row=1, column=0, sticky="ew", pady=2)
@@ -379,6 +435,9 @@ class App:
         if self.proc and self.proc.poll() is None:
             self._stop()
             return
+        if self.cal_proc and self.cal_proc.poll() is None:
+            return messagebox.showerror("Run", "Depth calibration is in progress — wait for it to "
+                                               "finish before starting a sample run.")
         if not self.sample_var.get().strip():
             return messagebox.showerror(
                 "Run", "Select a sample in the Samples dropdown first — its name is used for the "
@@ -424,6 +483,95 @@ class App:
             self._log("\n[stopped]\n")
         self.run_btn.config(text="▶  Run"); self.status.config(text="stopped")
 
+    # ------------------------------------------------------ depth calibration #
+    def _discover_samples(self):
+        """Sample folders under Results/ that hold a legacy/measurements.csv — exactly what
+        calibrate_depth pools. The calibration output folder is skipped (it has no legacy/)."""
+        if not DEF_OUT.is_dir():
+            return []
+        out = []
+        for sub in sorted(p for p in DEF_OUT.iterdir() if p.is_dir()):
+            if sub.name == CAL_OUT_NAME:
+                continue
+            if (sub / MEAS_REL).is_file():
+                out.append(sub.name)
+        return out
+
+    def _refresh_cal_samples(self):
+        """Repopulate the depth-calibration sample list, preserving the current selection. On the
+        first populate select all (default = pool everything). A brand-new sample (e.g. one just
+        run) is auto-selected ONLY when everything was already selected, so an untouched 'all'
+        selection stays 'all' after a new run — while an explicit user subset is left as-is."""
+        prev_names = [self.cal_list.get(i) for i in range(self.cal_list.size())]
+        prev_sel = {self.cal_list.get(i) for i in self.cal_list.curselection()}
+        all_were_selected = bool(prev_names) and prev_sel == set(prev_names)
+        first = not prev_names
+        names = self._discover_samples()
+        self.cal_list.delete(0, tk.END)
+        for n in names:
+            self.cal_list.insert(tk.END, n)
+        for i, n in enumerate(names):
+            if first or n in prev_sel or (all_were_selected and n not in set(prev_names)):
+                self.cal_list.selection_set(i)
+
+    def _calibrate_depth(self):
+        if self.cal_proc and self.cal_proc.poll() is None:
+            return                                          # already running (button is disabled)
+        if self.proc and self.proc.poll() is None:
+            return messagebox.showerror("Depth calibration",
+                                        "A sample run is in progress — wait for it to finish.")
+        names = self._discover_samples()
+        if not names:
+            return messagebox.showerror(
+                "Depth calibration", "No samples with legacy/measurements.csv under Results/. "
+                "Run at least one sample first.")
+        raw = self.cal_target.get().strip()
+        try:
+            vals = [float(x) for x in raw.split(",") if x.strip()]
+            if not vals:
+                raise ValueError("empty")
+        except ValueError:
+            return messagebox.showerror(
+                "Depth calibration",
+                f"Target depth must be a number or comma-separated numbers (got '{raw}').")
+        selected = [self.cal_list.get(i) for i in self.cal_list.curselection()]
+        out_dir = DEF_OUT / CAL_OUT_NAME
+        cmd = [sys.executable, "-u", str(HERE / CAL_SCRIPT),
+               "--results", str(DEF_OUT), "--out", str(out_dir),
+               "--targets", ",".join(f"{v:g}" for v in vals)]
+        # a strict subset -> --include those; all/none selected -> omit so it pools everything.
+        # Pass each name as its own token (calibrate_depth --include is nargs='*'), so names with
+        # spaces or commas survive intact.
+        if selected and len(selected) < len(names):
+            cmd += ["--include", *selected]
+        # band definitions -> workspace CSV + --bands, but only if there is a real band row
+        # (a blank / comments-only box means "use the measurements 'band' column")
+        bands_text = self.cal_bands_text.get("1.0", "end-1c")
+        if any(ln.strip() and not ln.strip().startswith("#") for ln in bands_text.splitlines()):
+            WORKSPACE.mkdir(exist_ok=True)
+            bands_path = WORKSPACE / "band_defs.csv"
+            bands_path.write_text(bands_text, encoding="utf-8")
+            cmd += ["--bands", str(bands_path)]
+        self.console.delete("1.0", "end")
+        self._log("$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd) + "\n")
+        try:
+            self.cal_proc = subprocess.Popen(
+                cmd, cwd=str(HERE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=dict(os.environ, PYTHONUNBUFFERED="1"))
+        except Exception as e:
+            self.cal_proc = None
+            return messagebox.showerror("Depth calibration", str(e))
+        self.cal_btn.config(state="disabled"); self.status.config(text="calibrating depth…")
+        threading.Thread(target=self._cal_reader, args=(self.cal_proc,), daemon=True).start()
+
+    def _cal_reader(self, proc):
+        try:
+            for line in proc.stdout:
+                self.q.put(line)
+        finally:
+            proc.stdout.close()
+            self.q.put(("__cal_done__", proc.wait()))
+
     def _drain_console(self):
         try:
             while True:
@@ -431,6 +579,10 @@ class App:
                 if isinstance(item, tuple) and item and item[0] == "__done__":
                     self.run_btn.config(text="▶  Run")
                     self.status.config(text=f"done (exit {item[1]})")
+                    self._refresh_results()
+                elif isinstance(item, tuple) and item and item[0] == "__cal_done__":
+                    self.cal_btn.config(state="normal")
+                    self.status.config(text=f"depth calibration done (exit {item[1]})")
                     self._refresh_results()
                 else:
                     self._log(item)
@@ -444,6 +596,7 @@ class App:
 
     # ------------------------------------------------- results browser + preview #
     def _refresh_results(self):
+        self._refresh_cal_samples()             # keep the depth-calibration sample list in sync
         self.tree.delete(*self.tree.get_children())
         self._tree_paths = {}
         if not DEF_OUT.exists():
@@ -553,11 +706,12 @@ class App:
         self.status.config(text=f"exported {Path(out).name}")
 
     def _on_close(self):
-        if self.proc and self.proc.poll() is None:
-            try:
-                self.proc.terminate()
-            except Exception:
-                pass
+        for p in (self.proc, self.cal_proc):
+            if p and p.poll() is None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
         self.root.destroy()
 
 

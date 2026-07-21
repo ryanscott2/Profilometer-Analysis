@@ -137,6 +137,53 @@ Clean outputs live under `figures/`; the v1 plot set, `measurements.csv` and per
 | `legacy/figures/{overview_3x3,per_row,diameter_fit,depth_vs_dose,dose_collapse,grid_overlays}.png` | the v1 plot set |
 | `legacy/qc/<name>.png` | per-array QC (only with `make_qc`): height + known pins, mean pin with fitted rings, pin/floor/debris classification, radial profile |
 
+## Depth calibration across samples (`calibrate_depth.py`)
+
+A **post-hoc, additive** tool that pools the completed runs to answer "for this pin geometry, what
+depth does a given (passes, speed) produce — and inversely, what (passes, speed) hits a target
+depth (e.g. 55 µm)?" It is the reframed inverse of the per-run diameter model
+(`report.make_diameter_model`, which fits Ø ~ drawn+passes+speed): here the **response is etch
+depth** and the **predictors are the laser dose**.
+
+Pooling across samples is defensible because `depth_um` = pin-top − clean-floor is a **local**
+differential — per-tile Z offsets and stage tilt cancel — so unlike absolute height it is
+comparable across samples/wafers/dates. Nothing in the per-run pipeline changes; it only **reads**
+each sample's `legacy/measurements.csv`.
+
+```
+python calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
+                          [--results Results] [--out "Results/etch depth"] \
+                          [--bands band_defs.csv] [--max-debris 0.6] [--drop-shallow]
+```
+
+- **Discovers** the samples (folders under `Results/` with a `legacy/measurements.csv`), injects a
+  `sample` column, pools them; `--include`/`--exclude` select the set (default = all).
+- **Gates** for a trustworthy depth read (`reliable`, finite depth, a stricter debris cut) and
+  prints the retained/total counts and *why* rows dropped. `shallow` (<3 µm) points are kept by
+  default — they anchor the low-dose rise — but `--drop-shallow` removes them.
+- **Bands** — `--bands` names a file whose every row is one band, `min_Ø, max_Ø, pitch` (µm): the
+  first two numbers are the drawn-diameter range the band covers, the third its centre-to-centre
+  pitch. A pooled row joins a band only if **both** its drawn Ø is in range (ends inclusive) **and**
+  its pitch matches the band's declared pitch (strict, within ±1 µm); rows matching no band —
+  Ø out of range, mismatched pitch, or missing pitch — are dropped and reported. Omitting `--bands`
+  falls back to the measurements' own `band` column.
+- **Fits per band** (never pooling across pitch/diameter families): a saturating NLS
+  `depth = a·(1−e^{−k·dose})`, a log-dose OLS (+ drawn-Ø covariate), and a passes×speed interaction
+  OLS — all reported with R²/adj-R²/95% CI/p, and a **recommended** form chosen per band.
+- **Pools CIs across samples** with a `sample` random-intercept MixedLM (falls back to a sample
+  fixed factor if it won't converge), and prints a `sample × dose` coverage table so sample↔dose
+  confounding is visible.
+- **Writes** to `Results/etch depth/`: `depth_calibration.txt` (fits, pooled model,
+  coverage, per-target inversion with a prediction interval, and the extrapolation box),
+  `depth_vs_dose.png`, `depth_parity.png`, and `depth_heatmap.png` (passes×speed predicted-depth
+  heatmap with the target-depth contour — read off which (P, S) hits the target).
+
+**From the UI:** the *Depth calibration* panel (right column) lists the discovered samples
+(multi-select; none selected = all), a **band-definitions** box (one `min_Ø, max_Ø, pitch` per line;
+number of rows = number of bands; blank = use the CSV `band` column), and a target depth (default
+`55`, comma-separated allowed). It runs the tool on the selection — output streams to the console
+and the results land in `Results/etch depth/` (browsable at left).
+
 ## Modules
 
 - `dxf_geometry.py` — DXF → unit cells → pin arrays.
@@ -148,7 +195,9 @@ Clean outputs live under `figures/`; the v1 plot set, `measurements.csv` and per
 - `laser_params.py` — the `cell_params.csv` grid reader (by-cell (row, col)).
 - `report.py` — shared measurement-row builder + the legacy plot suite.
 - `run_sample.py` — full-sample driver (assemble → register grid → measure → plots).
-- `pflm_ui.py` — Tkinter sample-tester GUI (sample library, run/stop, figure preview).
+- `calibrate_depth.py` — cross-sample etch-depth calibration (see below); reuses `report._ols_fit`.
+- `pflm_ui.py` — Tkinter sample-tester GUI (sample library, run/stop, figure preview,
+  depth-calibration panel).
 - `synth.py`, `selftest.py` — synthetic scan generator and end-to-end validation.
 
 ## Notes / assumptions
