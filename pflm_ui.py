@@ -49,14 +49,23 @@ except Exception:                                        # pragma: no cover - op
 
 _SLASH = re.compile(r"[/\\]")
 _INVALID_NAME = re.compile(r'[<>:"|?*\x00-\x1f]')
+_RESERVED = {"CON", "PRN", "AUX", "NUL",
+             *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 
 def _safe_name(name):
     """Turn a UI sample name into a filesystem-safe folder name (Windows-safe): slashes become
-    spaces; any other character illegal in a Windows path becomes an underscore."""
+    spaces; any other character illegal in a Windows path becomes an underscore; a Windows reserved
+    device name (CON, PRN, COM1, ...) gets a trailing underscore so it can be a real folder.
+
+    NOTE: '/' -> space is intentional (per the sample-naming convention) and is not one-to-one, so
+    e.g. 'D100/D50' and 'D100 D50' still map to the same folder -- that collision is inherent to the
+    space convention, not a sanitizer bug."""
     name = _SLASH.sub(" ", str(name))
     name = _INVALID_NAME.sub("_", name)
     name = re.sub(r"\s+", " ", name).strip(" .")
+    if name.upper().split(".")[0] in _RESERVED:
+        name += "_"
     return name or "unnamed"
 
 
@@ -534,9 +543,10 @@ class App:
         if not out:
             return
         try:
+            out_resolved = Path(out).resolve()               # don't let the archive include itself
             with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
                 for p in figs.rglob("*"):
-                    if p.is_file():
+                    if p.is_file() and p.resolve() != out_resolved:
                         zf.write(p, arcname=str(p.relative_to(figs)))
         except Exception as e:
             return messagebox.showerror("Export", str(e))
