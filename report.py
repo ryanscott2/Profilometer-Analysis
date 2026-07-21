@@ -79,7 +79,7 @@ def _scatter(ax, df, xcol, ycol, colors):
 # ---------------------------------------------------------------- the plots #
 def make_overview(df, out_dir, colors):
     responses = [("diameter_um", "measured mid diameter (µm)"),
-                 ("pitch_um", "measured pitch (µm)"),
+                 ("pitch_um", "design pitch (µm)"),   # pitch_um is the DXF lattice, not measured
                  ("depth_um", "measured depth (µm)")]
     predictors = [("passes", "laser passes"),
                   ("speed", "scan speed (mm/s)"),

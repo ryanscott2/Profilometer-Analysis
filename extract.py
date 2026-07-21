@@ -100,12 +100,14 @@ class PinFinResult:
     speed: float = float("nan")
     cx_um: float = float("nan")
     cy_um: float = float("nan")
-    # measured geometry
+    # geometry.  NOTE: pitch_*_um are the DESIGN (DXF) lattice pitch the measurement is anchored
+    # to, NOT a scan measurement -- the scan-derived pitch is meas_pitch_*_um (below).
     pitch_um: float = float("nan")
     pitch_x_um: float = float("nan")
     pitch_y_um: float = float("nan")
     diameter_um: float = float("nan")        # mid-height (0.50 * depth)
     base_diameter_um: float = float("nan")   # near floor (0.15 * depth) -> widest
+    base_extrapolated: bool = False          # base_diameter_um extrapolated (base crossing buried)
     top_diameter_um: float = float("nan")    # near plateau (0.85 * depth) -> narrowest
     depth_um: float = float("nan")
     floor_um: float = float("nan")
@@ -117,6 +119,9 @@ class PinFinResult:
     nominal_diameter_um: float = float("nan")
     target_diameter_um: float = float("nan")
     nominal_pitch_um: float = float("nan")
+    meas_pitch_um: float = float("nan")      # scan-measured pitch (autocorrelation) — QC vs design
+    meas_pitch_x_um: float = float("nan")
+    meas_pitch_y_um: float = float("nan")
     reg_score: float = float("nan")
     reg_method: str = ""
     flags: str = ""
@@ -253,14 +258,14 @@ def _diameters_from_profile(rc, prof, floor, depth):
     to far debris bumps); a crossing that reaches the cell edge is returned as NaN.
     """
     if not np.isfinite(prof).any():
-        return np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan, False
     if not (np.isfinite(floor) and np.isfinite(depth)) or depth <= 0:
         n = len(prof)                                     # fallback: profile shape
         top = float(np.nanmedian(prof[:max(2, n // 12)]))
         floor = float(np.nanmin(prof))
         depth = top - floor
         if depth <= 0:
-            return np.nan, np.nan, np.nan
+            return np.nan, np.nan, np.nan, False
     edge = 0.98 * rc[-1]
 
     def first_cross(level):
@@ -280,11 +285,19 @@ def _diameters_from_profile(rc, prof, floor, depth):
     d_base = 2.0 * first_cross(floor + 0.15 * depth)
     d_mid = 2.0 * first_cross(floor + 0.50 * depth)
     d_top = 2.0 * first_cross(top_level)
+    base_extrapolated = False
     if not np.isfinite(d_base) and np.isfinite(d_mid) and np.isfinite(d_top):
-        # debris buries the base crossing; base/mid/top sit at equal level spacing
-        # (0.15/0.50/0.85 of depth), so linearly extrapolate the top->mid trend one step
-        d_base = 2.0 * d_mid - d_top
-    return d_base, d_mid, d_top
+        # Base crossing buried (debris/edge). Extrapolate the mid->top radius-vs-LEVEL line down to
+        # the 0.15*depth level. Honour the ACTUAL top level: top_level may be clamped below
+        # floor+0.85*depth (domed pin), so the three levels are NOT equally spaced and the old
+        # 2*mid-top (equal-spacing) shortcut would bias the base. Flag it — this is not a measurement.
+        l_base, l_mid, l_top = floor + 0.15 * depth, floor + 0.50 * depth, top_level
+        if abs(l_top - l_mid) > 1e-9:
+            r_mid, r_top = 0.5 * d_mid, 0.5 * d_top
+            r_base = r_mid + (r_top - r_mid) * (l_base - l_mid) / (l_top - l_mid)
+            d_base = 2.0 * r_base
+            base_extrapolated = True
+    return d_base, d_mid, d_top, base_extrapolated
 
 
 def _classify_floor_depth(z0, valid, centers_local, pxu, pyu, d_nom_um, pitch_um):
@@ -415,7 +428,8 @@ def extract_array(scan, placement, array, sample, *,
     known_px, known_py = lattice["px_px"], lattice["py_px"]
     meas_px, meas_py, periodicity = _measure_pitch_px(
         z0, valid, sample.nominal_pitch_um / pxu)
-    meas_pitch_um = 0.5 * (meas_px * pxu + meas_py * pyu)
+    meas_pitch_x_um, meas_pitch_y_um = meas_px * pxu, meas_py * pyu
+    meas_pitch_um = 0.5 * (meas_pitch_x_um + meas_pitch_y_um)
     pitch_x_um, pitch_y_um = known_px * pxu, known_py * pyu
     pitch_um = 0.5 * (pitch_x_um + pitch_y_um)
     if abs(meas_pitch_um - pitch_um) > 0.25 * pitch_um and periodicity > 0.15:
@@ -450,7 +464,7 @@ def extract_array(scan, placement, array, sample, *,
         # pin-top reference in both branches keeps depth/diameters comparable across debris levels.
 
     # diameters = radial-profile edge, crossings anchored to the classified floor+depth
-    d_base, d_mid, d_top = _diameters_from_profile(rc, prof, floor, depth)
+    d_base, d_mid, d_top, base_extrapolated = _diameters_from_profile(rc, prof, floor, depth)
 
     # A pin cannot exceed its pitch without merging into its neighbour; a base/mid diameter above
     # ~pitch is debris bridging, not a real pin -> drop it so a physically-impossible width never
@@ -460,7 +474,7 @@ def extract_array(scan, placement, array, sample, *,
     merged = ((np.isfinite(d_base) and d_base > merge_ceiling) or
               (np.isfinite(d_mid) and d_mid > merge_ceiling))
     if np.isfinite(d_base) and d_base > merge_ceiling:
-        d_base = float("nan")
+        d_base = float("nan"); base_extrapolated = False   # dropped -> no longer an extrapolated value
     if np.isfinite(d_mid) and d_mid > merge_ceiling:
         d_mid = float("nan")
 
@@ -487,13 +501,18 @@ def extract_array(scan, placement, array, sample, *,
         flags.append(f"weak lattice ({periodicity:.2f})")
     if merged or (np.isfinite(d_mid) and d_mid > 1.4 * d_nom):
         flags.append("wide-D (debris?)")
+    if base_extrapolated and np.isfinite(d_base):
+        flags.append("base extrapolated")           # base_diameter_um is a fit, not a measurement
 
     down = max(1, int(round(min(known_px, known_py) / 4)))
     thumb = np.where(valid, z0, np.nan)[::down, ::down]
 
     res = PinFinResult(
         pitch_um=pitch_um, pitch_x_um=pitch_x_um, pitch_y_um=pitch_y_um,
+        meas_pitch_um=meas_pitch_um, meas_pitch_x_um=meas_pitch_x_um,
+        meas_pitch_y_um=meas_pitch_y_um,
         diameter_um=float(d_mid), base_diameter_um=float(d_base),
+        base_extrapolated=bool(base_extrapolated),
         top_diameter_um=float(d_top), depth_um=float(depth),
         floor_um=float(floor), top_um=float(top),
         lattice_strength=float(periodicity), coverage=float(coverage),
