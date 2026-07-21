@@ -354,6 +354,93 @@ def print_diameter_calibration(df, out_dir):
     (out_dir / "diameter_calibration.txt").write_text(text, encoding="utf-8")
 
 
+def _ols_fit(X, y, alpha=0.05):
+    """OLS via statsmodels. X already includes the intercept column. Returns
+    (params, conf_int[p,2], r2, adj_r2, n, p, pvalues)."""
+    import statsmodels.api as sm
+    res = sm.OLS(np.asarray(y, float), np.asarray(X, float)).fit()
+    return (np.asarray(res.params), np.asarray(res.conf_int(alpha)),
+            float(res.rsquared), float(res.rsquared_adj),
+            int(res.nobs), X.shape[1], np.asarray(res.pvalues))
+
+
+def _model_design(g):
+    """Centered design matrix for TOP-Ø ~ drawn + passes + speed + drawn:passes + drawn:speed.
+    A predictor (and its interactions) is DROPPED when it is constant within the group, so the fit
+    stays well-posed on a single-speed / single-diameter subset. Returns (X, y, term_names)."""
+    y = g["top_diameter_um"].to_numpy(float)
+    cols = [("Ø at mean (µm)", np.ones(len(g)))]
+    centered, unit = {}, {"drawn": "µm/µm", "passes": "µm/pass", "speed": "µm per mm/s"}
+    for nm, series in (("drawn", g["drawn_diameter_um"]), ("passes", g["passes"]),
+                       ("speed", g["speed"])):
+        v = series.to_numpy(float)
+        if np.ptp(v) > 1e-9:                              # keep only non-constant predictors
+            centered[nm] = v - v.mean()
+            cols.append((f"dØ/d {nm} ({unit[nm]})", centered[nm]))
+    for a, b in (("drawn", "passes"), ("drawn", "speed")):
+        if a in centered and b in centered:
+            cols.append((f"{a}×{b}", centered[a] * centered[b]))
+    return np.column_stack([c[1] for c in cols]), y, [c[0] for c in cols]
+
+
+def make_diameter_model(df, out_dir):
+    """ADDITIVE calibration (does not replace print_diameter_calibration): per band, fit
+    TOP Ø ~ drawn + passes + speed + interactions by OLS on reliable pins, with R²/adj-R² and 95%
+    CIs -- so the drawn->measured relationship is conditional on the laser process rather than a
+    single line pooled over an ~8x dose range. Writes diameter_model.txt + diameter_model.png."""
+    d = df[df.reliable].copy() if "reliable" in df.columns else df.copy()
+    d = d[d["top_diameter_um"].notna() & d["drawn_diameter_um"].notna()
+          & (d["passes"] > 0) & (d["speed"] > 0)]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["Diameter model  (ADDITIVE to diameter_calibration.txt)",
+             "TOP Ø ~ drawn + passes + speed + drawn:passes + drawn:speed  (OLS, reliable pins)",
+             "Predictors are CENTERED per band, so the intercept is the top Ø at that band's mean",
+             "drawn/passes/speed; a term is dropped when constant within the band. 95% CIs shown.",
+             "Conditional on process -- unlike the single pooled per-band line in the calibration.", ""]
+    if not len(d):
+        lines.append("(no reliable pins with a top diameter to fit)")
+        (out_dir / "diameter_model.txt").write_text("\n".join(lines), encoding="utf-8")
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+    cmap = plt.get_cmap("tab10")
+    lo_hi = []
+    for i, band in enumerate(sorted(d["band"].unique())):
+        g = d[d["band"] == band]
+        X, y, names = _model_design(g)
+        pitch = g["nominal_pitch_um"].dropna().iloc[0] if g["nominal_pitch_um"].notna().any() else float("nan")
+        if X.shape[0] < X.shape[1] + 2:
+            lines.append(f"band {band} (pitch {pitch:g} µm): n={len(g)} too few for a "
+                         f"{X.shape[1]}-term fit; skipped\n")
+            continue
+        beta, ci, r2, adj, n, p, pvals = _ols_fit(X, y)
+        pred = X @ beta
+        lines.append(f"band {band} (pitch {pitch:g} µm, n={n}):  R² = {r2:.3f}   adj-R² = {adj:.3f}")
+        for nm, b_, (lo, hi), pv in zip(names, beta, ci, pvals):
+            lines.append(f"    {nm:>22} = {b_:+9.3f}   [95% CI {lo:+.3f}, {hi:+.3f}]   p={pv:.2g}")
+        lines.append("")
+        c = cmap(i % 10)
+        axes[0].scatter(pred, y, s=16, color=c, alpha=0.6, edgecolors="white", linewidths=0.3,
+                        label=f"band {band}  R²={r2:.2f}")
+        axes[1].scatter(pred, y - pred, s=16, color=c, alpha=0.6, edgecolors="white", linewidths=0.3)
+        lo_hi += [float(np.min([pred.min(), y.min()])), float(np.max([pred.max(), y.max()]))]
+    if lo_hi:
+        lim = [min(lo_hi), max(lo_hi)]
+        axes[0].plot(lim, lim, "k--", lw=0.8, alpha=0.6)
+    axes[0].set_xlabel("model-predicted top Ø (µm)"); axes[0].set_ylabel("measured top Ø (µm)")
+    axes[0].set_title("Diameter model parity (per-band OLS on drawn, passes, speed)")
+    axes[0].legend(fontsize=8); axes[0].grid(alpha=0.3)
+    axes[1].axhline(0, color="grey", lw=0.8)
+    axes[1].set_xlabel("model-predicted top Ø (µm)"); axes[1].set_ylabel("residual measured-predicted (µm)")
+    axes[1].set_title("residuals"); axes[1].grid(alpha=0.3)
+    fig.tight_layout()
+    p_png = out_dir / "diameter_model.png"
+    fig.savefig(p_png, dpi=170); plt.close(fig)
+    text = "\n".join(lines)
+    print("\n" + text)
+    (out_dir / "diameter_model.txt").write_text(text, encoding="utf-8")
+    print(f"Wrote {p_png}")
+
+
 def make_plots(df, results, out_dir):
     (out_dir / "figures").mkdir(parents=True, exist_ok=True)
     if not len(df):
