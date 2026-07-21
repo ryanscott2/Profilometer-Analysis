@@ -19,7 +19,10 @@ Usage:
 from __future__ import annotations
 
 import csv
+import datetime
+import json
 import shutil
+import subprocess
 import sys
 import warnings
 import zipfile
@@ -80,6 +83,36 @@ def save_source_docs(dxf_path, vk4_dir, figures_dir):
         for p in vk4s:
             zf.write(p, arcname=p.name)
     print(f"Zipped {len(vk4s)} VK4 files -> {zpath} ({zpath.stat().st_size / 1e6:.0f} MB)")
+
+
+def save_provenance(figures_dir, vk4_dir, dxf_path, cell_csv):
+    """Make a Results/ folder self-describing: copy the run's laser-parameter grid
+    (``cell_params.csv``) and its sibling ``radial_sets.csv`` into figures/, and write a
+    ``run_manifest.json`` recording which code + inputs produced this run (git commit, input paths,
+    the VK4 file list). Cheap, and re-created every run alongside the DXF/VK4 provenance."""
+    figures_dir = Path(figures_dir); figures_dir.mkdir(parents=True, exist_ok=True)
+    cell_csv = Path(cell_csv)
+    for src in (cell_csv, cell_csv.parent / RADIAL_CSV_NAME):
+        if src.exists():
+            shutil.copy2(src, figures_dir / src.name)
+    try:
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(HERE),
+                                         stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        commit = "unknown"
+    vk4_dir = Path(vk4_dir)
+    vk4s = sorted(p.name for p in vk4_dir.glob("*.vk4")) if vk4_dir.is_dir() else []
+    manifest = {
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "git_commit": commit,
+        "dxf": str(dxf_path),
+        "cell_csv": str(cell_csv),
+        "vk4_dir": str(vk4_dir),
+        "n_vk4": len(vk4s),
+        "vk4_files": vk4s,
+    }
+    (figures_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"Wrote provenance (cell_params/radial_sets + run_manifest.json) -> {figures_dir}")
 
 
 def clear_output_dir(out_dir):
@@ -154,6 +187,7 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
     (out_dir / "figures").mkdir(parents=True, exist_ok=True)
     (out_dir / "legacy").mkdir(parents=True, exist_ok=True)
     save_source_docs(dxf_path, vk4_dir, out_dir / "figures")   # DXF copy + VK4 archive (provenance)
+    save_provenance(out_dir / "figures", vk4_dir, dxf_path, cell_csv)   # cell_params/radial + manifest
 
     rows, results = [], []
     res_by_cell = {}
@@ -196,6 +230,17 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
         print(f"WARNING: {len(missing)} registered cell(s) have no entry in {cell_csv} "
               f"(row,col): {sorted(missing)}. Geometry is still measured; add their "
               f"P{{passes}}_S{{speed}} to the grid at that row/column to tag them.")
+    # Reverse check: a cell_params entry with NO registered cell means a design row/column dropped
+    # out of registration. Interior gaps are preserved by the absolute (pitch-gap) cell indexing in
+    # register._assign_grid_indices, but a missing EDGE row/column cannot be recovered from geometry
+    # alone and would shift the surviving cells' (passes,speed) mapping -- so flag it loudly.
+    reg_rc = {(p.cell_row, p.cell_col) for p in placements}
+    unregistered = [rc for rc in params if rc not in reg_rc]
+    if unregistered:
+        print(f"WARNING: {len(unregistered)} cell_params entry(ies) have NO registered cell "
+              f"(row,col): {sorted(unregistered)}. If this is a dropped edge row/column the "
+              f"surviving cell->parameter (passes/speed) mapping may be SHIFTED -- verify the "
+              f"design(r,c) table above before trusting laser-parameter assignments.")
 
     # per-unit-cell report figures
     cells_dir = out_dir / "figures" / "cells"; cells_dir.mkdir(parents=True, exist_ok=True)
@@ -327,7 +372,7 @@ def render_cell_report(scan, placement, template, res_by_array, params, path):
             continue
         rows_t.append([f"D{a.diameter_um:g} P{a.pitch_um:g}", _f(r.depth_um),
                        _f(r.top_diameter_um), _f(r.diameter_um), _f(r.base_diameter_um),
-                       f"{r.pitch_um:.0f}/{a.pitch_um:g}", f"{100*r.debris_fraction:.0f}"])
+                       f"{r.meas_pitch_um:.0f}/{a.pitch_um:g}", f"{100*r.debris_fraction:.0f}"])
     col_labels = ["array (D drawn / P)", "depth µm", "Ø top", "Ø nom", "Ø floor",
                   "pitch m/e", "debris%"]
     tbl = axr.table(cellText=rows_t, colLabels=col_labels, cellLoc="center",
@@ -349,7 +394,7 @@ def make_param_summary(df, out_dir):
     """Single figure: how laser parameters (passes × speed) drive etch depth and mid-diameter
     oversizing. One marker per unit cell, each labelled with its P{passes}_S{speed} id, one
     line per passes value across speed."""
-    d = df[(df["passes"] > 0) & (df["speed"] > 0) & df["depth_um"].notna()].copy()
+    d = df[df["reliable"] & (df["passes"] > 0) & (df["speed"] > 0) & df["depth_um"].notna()].copy()
     if not len(d):
         print("No cells with laser params -> skipping param summary.")
         return
@@ -397,11 +442,12 @@ def make_param_depth_scatter(df, out_dir):
     cell, scatter EVERY pin array's etch depth around that cell's median. Same axes (depth vs
     scan speed, one colour/line per passes value). Marker shape encodes the pin family --
     squares = D100 arrays (drawn Ø >= 75 um), triangles = D50 arrays (drawn Ø < 75 um)."""
-    d = df[(df["passes"] > 0) & (df["speed"] > 0) & df["depth_um"].notna()].copy()
+    d = df[df["reliable"] & (df["passes"] > 0) & (df["speed"] > 0) & df["depth_um"].notna()].copy()
     if not len(d):
         print("No cells with laser params -> skipping depth scatter.")
         return
-    d["family"] = np.where(d["drawn_diameter_um"] >= 75, "D100", "D50")
+    d["family"] = np.select([d["drawn_diameter_um"] >= 200, d["drawn_diameter_um"] >= 75],
+                            ["D300", "D100"], default="D50")
 
     # per-cell median depth == the 'average' the individual points scatter around (identical to
     # the value make_param_summary plots for the depth panel)
@@ -414,10 +460,10 @@ def make_param_depth_scatter(df, out_dir):
     colors = {p: cmap(i / max(1, len(passes_vals) - 1)) for i, p in enumerate(passes_vals)}
     speeds = sorted(d["speed"].unique())
 
-    # squares = D100 family, triangles = D50 family. Each family is sub-dodged and every point
-    # jittered in log10(speed) space so the cloud reads symmetrically on the log x-axis (seeded
-    # so the figure is reproducible run-to-run).
-    fam_style = {"D100": ("s", +0.022), "D50": ("^", -0.022)}
+    # diamonds = D300, squares = D100, triangles = D50 family (by drawn Ø). Each family is
+    # sub-dodged and every point jittered in log10(speed) space so the cloud reads symmetrically on
+    # the log x-axis (seeded so the figure is reproducible run-to-run).
+    fam_style = {"D300": ("D", 0.0), "D100": ("s", +0.022), "D50": ("^", -0.022)}
     rng = np.random.default_rng(0)
     jit = 0.014
 
@@ -450,7 +496,7 @@ def make_param_depth_scatter(df, out_dir):
     ax.grid(alpha=0.3)
     ax.set_title("Etch depth of every pin array vs laser parameters\n"
                  "(o-line = per-cell median; small markers = individual arrays, "
-                 "□ D100  △ D50)")
+                 "◇ D300  □ D100  △ D50)")
 
     passes_leg = ax.legend(title="passes", fontsize=9, loc="upper right")
     ax.add_artist(passes_leg)
@@ -508,13 +554,19 @@ def make_radial_overlays(template, placements, params, res_by_cell, out_dir, set
     that CSV is absent or empty, every laser parameter present in the sample is overlaid instead
     (a single 'all' set). Profiles are the (rc, prof) extract_array already computed per array,
     referenced to each cell's clean floor so the curves share z=0."""
-    # label -> cell_id, keyed by both the canonical P{passes}_S{speed} and any CSV label
+    # label -> cell_id, keyed by both the canonical P{passes}_S{speed} and any CSV label. NOTE:
+    # single-valued, so if two cells share the same passes/speed (a replicate) the later one wins
+    # and the earlier replicate is dropped from the overlays -- warn rather than lose it silently.
     label_to_cell = {}
     for pl in placements:
         pr = params.get((pl.cell_row, pl.cell_col))
         if not (pr and pr.valid):
             continue
-        label_to_cell[f"P{pr.passes}_S{pr.speed:g}"] = pl.cell_id
+        key = f"P{pr.passes}_S{pr.speed:g}"
+        if key in label_to_cell:
+            print(f"WARNING: radial overlays: duplicate laser setting {key} on multiple cells; "
+                  f"only one is shown per overlay (replicates not yet averaged).")
+        label_to_cell[key] = pl.cell_id
         if pr.label:
             label_to_cell[pr.label] = pl.cell_id
     if not label_to_cell:
@@ -631,7 +683,11 @@ def save_sample_overview(scan, template, placements, path, ds=6):
 
 
 def main():
-    warnings.filterwarnings("ignore")
+    # Suppress only the known-benign numpy noise from phase-correlation (divide/invalid on
+    # all-zero windows), not every warning -- a blanket ignore would also hide real deprecation
+    # and runtime warnings.
+    warnings.filterwarnings("ignore", message=".*invalid value encountered.*")
+    warnings.filterwarnings("ignore", message=".*divide by zero encountered.*")
     vk4_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else DEF_VK4_DIR
     out_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else DEF_OUT_DIR
     dxf_path = Path(sys.argv[3]) if len(sys.argv) > 3 else next(DEF_DXF_DIR.glob("*.dxf"))
