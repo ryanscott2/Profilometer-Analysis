@@ -388,10 +388,17 @@ def make_diameter_model(df, out_dir):
     TOP Ø ~ drawn + passes + speed + interactions by OLS on reliable pins, with R²/adj-R² and 95%
     CIs -- so the drawn->measured relationship is conditional on the laser process rather than a
     single line pooled over an ~8x dose range. Writes diameter_model.txt + diameter_model.png."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        import statsmodels.api  # noqa: F401 -- used by _ols_fit; skip this figure if absent
+    except Exception:
+        msg = "diameter_model: statsmodels not installed -> skipping (pip install statsmodels)"
+        print(msg)
+        (out_dir / "diameter_model.txt").write_text(msg + "\n", encoding="utf-8")
+        return
     d = df[df.reliable].copy() if "reliable" in df.columns else df.copy()
     d = d[d["top_diameter_um"].notna() & d["drawn_diameter_um"].notna()
           & (d["passes"] > 0) & (d["speed"] > 0)]
-    out_dir.mkdir(parents=True, exist_ok=True)
     lines = ["Diameter model  (ADDITIVE to diameter_calibration.txt)",
              "TOP Ø ~ drawn + passes + speed + drawn:passes + drawn:speed  (OLS, reliable pins)",
              "Predictors are CENTERED per band, so the intercept is the top Ø at that band's mean",

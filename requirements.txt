@@ -8,6 +8,8 @@ scipy>=1.18.0
 pandas>=3.0.3
 matplotlib>=3.11.0
 ezdxf>=1.4.4          # DXF fabrication-geometry reader
+statsmodels>=0.14.6  # optional: process-conditional diameter model (diameter_model.png/.txt); the
+#                      figure is skipped with a note if this is absent, the rest of the run is fine
 
 # --- pflm_ui.py (optional desktop GUI) ---
 Pillow>=12.3.0        # figure preview (PNG/JPG); PNG also works via Tk without it
