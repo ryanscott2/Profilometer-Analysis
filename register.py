@@ -945,7 +945,11 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
     cell_h = (cell_pitch_um[1] if cell_pitch_um else h_um) / yppx
     min_sep = 0.5 * min(cell_w, cell_h)                  # cells cannot sit closer than ~a cell
     min_pin_pitch = min(a.pitch_x_um for a in template.arrays) / xppx
-    max_shift = 0.3 * min_pin_pitch                      # keep every polish below half a pin pitch
+    max_shift = 0.3 * min_pin_pitch                      # marker-anchored polish: well below half pitch
+    # Lattice NODES are predicted from an averaged step, not marker-anchored, so on a large grid
+    # with a non-uniform tile step they drift; allow the node refine a larger (still sub-half-pitch,
+    # so alias-safe) snap so far cells are not stranded outside the clamp and under-counted.
+    probe_shift = 0.45 * min_pin_pitch
     amask = _adaptive_pin_mask(z0, valid,
                                float(np.mean([a.pitch_x_um for a in template.arrays])) / xppx)
 
@@ -1003,37 +1007,41 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
             nodes = _grid_nodes((O0[0], O0[1]), cv, rv, W, H, cell_w, cell_h)
             placed = _dedup_cells(
                 _probe_lattice(nodes, template, amask, z0, valid, xppx, yppx, y_up, x_right, rot,
-                               max_shift, W, H, min_overlap, min_inbounds, min_contrast_um),
+                               probe_shift, W, H, min_overlap, min_inbounds, min_contrast_um),
                 min_sep)
-            score = (len(placed), -len(nodes))           # most cells, then coarsest (fewest probes)
-            if best is None or score > best[0]:
+            score = (len(placed), len(nodes))            # most cells, then finest -- a doubled step
+            if best is None or score > best[0]:          # ties the count but under-probes columns
                 best = (score, placed)
-    kept = best[1]
-    if not kept:
-        return _fallback("lattice probe verified no cell")
+    kept = best[1] if best else []
 
-    # --- 4. re-fit the lattice from the survivors and re-probe the full row/col span WITH the
-    #        off-by-one de-alias (one representative array per pitch, full window) -- the ONLY pass
-    #        that de-aliases, so every final cell is off-by-one-locked at bounded cost, and any
-    #        interior cell the first pass missed is filled. ---
+    # --- 4. Re-fit the lattice from the step-3 survivors and re-probe the FULL scan extent WITH the
+    #        off-by-one de-alias (one representative array per pitch, full window). The affine
+    #        (row,col)->origin fit averages out the tile-step non-uniformity, and re-deriving the
+    #        step vectors from it then probing every in-scan node (via _grid_nodes, not just the
+    #        survivors' bbox) recovers far cells the rigid step-3 lattice drifted off -- with the
+    #        larger probe_shift clamp absorbing the residual. Off-lattice / off-scan nodes fail the
+    #        overlap / in-bounds / contrast gates, so spurious marker hits are never resurrected. ---
     reps = _pitch_reps(template)
     if len(kept) >= 4:
         _assign_grid_indices(kept, cell_w, cell_h)
         A = np.array([[p.cell_col, p.cell_row, 1.0] for p in kept])
         kx, *_ = np.linalg.lstsq(A, np.array([p.origin_col for p in kept]), rcond=None)
         ky, *_ = np.linalg.lstsq(A, np.array([p.origin_row for p in kept]), rcond=None)
-        rs = [p.cell_row for p in kept]; cs = [p.cell_col for p in kept]
-        nodes = [(float(np.array([c, r, 1.0]) @ kx), float(np.array([c, r, 1.0]) @ ky))
-                 for r in range(min(rs), max(rs) + 1) for c in range(min(cs), max(cs) + 1)]
+        col_vec = (float(kx[0]), float(ky[0]))               # d origin / d cell_col
+        row_vec = (float(kx[1]), float(ky[1]))               # d origin / d cell_row
+        node11 = (float(np.array([1.0, 1.0, 1.0]) @ kx), float(np.array([1.0, 1.0, 1.0]) @ ky))
+        nodes = _grid_nodes(node11, col_vec, row_vec, W, H, cell_w, cell_h)
     else:
         nodes = [(p.origin_col, p.origin_row) for p in kept]   # too few cells for an affine fit
     locked = _dedup_cells(
         _probe_lattice(nodes, template, amask, z0, valid, xppx, yppx, y_up, x_right, rot,
-                       max_shift, W, H, min_overlap, min_inbounds, min_contrast_um,
+                       probe_shift, W, H, min_overlap, min_inbounds, min_contrast_um,
                        dealias_tpl=reps),
         min_sep)
     if len(locked) >= len(kept):
         kept = locked
+    if not kept:
+        return _fallback("lattice probe verified no cell")
 
     _assign_grid_indices(kept, cell_w, cell_h)           # design-frame (row,col) numbering
     kept.sort(key=lambda p: (p.cell_row, p.cell_col))
