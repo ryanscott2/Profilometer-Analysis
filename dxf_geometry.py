@@ -282,13 +282,21 @@ def _find_markers(polys, to_um):
 
 
 def _boundary_square(polys, markers, to_um):
-    """Largest ~square polyline that is not an alignment marker -> the cell/design boundary."""
-    marker_boxes = {(round(m["ref_mm"][0], 4), round(m["ref_mm"][1], 4)) for m in markers}
+    """Largest ~square polyline that is not an alignment marker -> the cell/design boundary.
+
+    A marker is identified by its FULL bounding box, not just its lower-left corner: a cell
+    boundary square commonly shares the (0,0) corner with the origin-anchored square marker, and
+    matching on the corner alone would discard the real boundary (leaving cell size_um = the pin
+    cluster span instead of the true cell size)."""
+    def _bbox(v):
+        return (round(float(v[:, 0].min()), 4), round(float(v[:, 1].min()), 4),
+                round(float(v[:, 0].max()), 4), round(float(v[:, 1].max()), 4))
+    marker_bboxes = {_bbox(m["verts_mm"]) for m in markers}
     best, best_area = None, -1.0
     for poly in polys:
         x0, y0, x1, y1 = poly["bbox"]
-        if (round(x0, 4), round(y0, 4)) in marker_boxes:
-            continue
+        if (round(x0, 4), round(y0, 4), round(x1, 4), round(y1, 4)) in marker_bboxes:
+            continue                                       # this polyline IS a marker
         w, h = x1 - x0, y1 - y0
         if abs(w - h) / max(w, h) > SQUARE_ASPECT_TOL:     # the boundary is a ~square outline
             continue
@@ -545,9 +553,12 @@ def read_design(path: str | Path) -> DXFDesign:
 if __name__ == "__main__":
     import sys
 
-    default = (Path(__file__).parent / "DXF" /
-               "071626_UVLaserPFLM_4x4_singlecell.dxf")
-    p = Path(sys.argv[1]) if len(sys.argv) > 1 else default
+    if len(sys.argv) > 1:
+        p = Path(sys.argv[1])
+    else:                                              # first DXF present, not a hardcoded name
+        p = next((Path(__file__).parent / "DXF").glob("*.dxf"), None)
+        if p is None:
+            raise SystemExit("no DXF given and none found in DXF/")
     design = read_design(p)
     print(design.summary())
     print(f"\nmarkers={design.n_markers}  cell_pitch_mm={design.cell_pitch_mm}  "
