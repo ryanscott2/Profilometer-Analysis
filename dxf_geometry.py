@@ -52,10 +52,17 @@ except ImportError as e:  # pragma: no cover - dependency check
 # ------------------------------------------------------------------ constants #
 MM_TO_UM = 1000.0
 
-# alignment-marker acceptance window (a drawn square of nominally 200 um side)
+# alignment-marker acceptance windows. Two marker styles are supported:
+#   * square (DEPRECATED) — a ~200 um filled square whose bottom-left corner IS the cell origin.
+#   * L      — an asymmetric "L" fiducial (short 50 um-wide arms). Its corner is inset from the
+#              cell origin (offset derived from the cell-boundary square), and its asymmetry lets
+#              registration resolve the sample's mirror/rotation (see register.py).
 MARKER_NOMINAL_UM = 200.0
-MARKER_TOL_UM = 40.0            # accept 160..240 um squares as the marker
+MARKER_TOL_UM = 40.0            # accept 160..240 um squares as the (deprecated) square marker
 SQUARE_ASPECT_TOL = 0.15        # |w-h|/max(w,h) below this counts as "square"
+SQUARE_FILL_MIN = 0.85         # enclosed-area / bbox-area at/above which a square counts as filled
+L_AREA_RATIO = (0.35, 0.80)    # enclosed-area / bbox-area band for an L (a filled square is ~1.0)
+L_MARKER_UM = (80.0, 300.0)    # accept L fiducials whose larger bbox side is in this range
 
 # clustering / grid tolerances
 DIAM_ROUND_UM = 0.1             # pins whose diameters agree to this share a "diameter"
@@ -117,6 +124,10 @@ class UnitCell:
     bbox_mm: tuple                     # (x0,y0,x1,y1) cell bounding box, absolute DXF mm
     arrays: list                       # list[PinArray]
     n_pins: int
+    marker_shape: str = ""             # "square" (deprecated) | "L" | "" (no marker)
+    marker_polygon_um: np.ndarray | None = None   # marker vertices (N,2 um) relative to the cell
+    #                                               origin -- the scan rasterises this to locate the
+    #                                               cell and (for the asymmetric L) resolve mirror/rot
 
     @property
     def size_um(self) -> tuple:
@@ -172,8 +183,18 @@ class DXFDesign:
 
 
 # ---------------------------------------------------------------- DXF reading #
+def _poly_area(verts):
+    """Enclosed (shoelace) area of a closed polygon, given its vertices (N,2). Sign-agnostic."""
+    x, y = verts[:, 0], verts[:, 1]
+    return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
 def _read_entities(path):
-    """Return (pins Nx3 [x,y,r] in mm, squares list of (x0,y0,x1,y1) mm, units str)."""
+    """Return (pins Nx3 [x,y,r] in mm, polys list, units str).
+
+    Each ``poly`` is a dict describing one closed LWPOLYLINE/POLYLINE: ``verts`` (N,2 mm),
+    ``bbox`` (x0,y0,x1,y1 mm), ``area_mm2`` (enclosed area), ``n_verts``. Marker/boundary
+    classification (square vs L vs cell outline) happens downstream from these."""
     doc = ezdxf.readfile(str(path))
     msp = doc.modelspace()
 
@@ -181,7 +202,7 @@ def _read_entities(path):
     units = {0: "unitless", 1: "in", 4: "mm", 5: "cm", 6: "m", 13: "um"}.get(insunits, "mm")
 
     pins = []
-    squares = []
+    polys = []
     for e in msp:
         t = e.dxftype()
         if t == "CIRCLE":
@@ -200,45 +221,78 @@ def _read_entities(path):
                 continue
             x0, y0 = pts[:, 0].min(), pts[:, 1].min()
             x1, y1 = pts[:, 0].max(), pts[:, 1].max()
-            w, h = x1 - x0, y1 - y0
-            if w <= 0 or h <= 0:
+            if x1 - x0 <= 0 or y1 - y0 <= 0:
                 continue
-            if abs(w - h) / max(w, h) <= SQUARE_ASPECT_TOL:   # ~square
-                squares.append((x0, y0, x1, y1))
+            polys.append(dict(verts=pts, bbox=(x0, y0, x1, y1),
+                              area_mm2=_poly_area(pts), n_verts=len(pts)))
 
-    return np.array(pins, float).reshape(-1, 3), squares, units
+    return np.array(pins, float).reshape(-1, 3), polys, units
 
 
 # ----------------------------------------------------------- marker handling #
-def _find_markers(squares, to_um):
-    """Return list of alignment-marker squares as dicts with origin/center/size (in mm)."""
+def _marker_shape(poly, to_um):
+    """Classify a closed polyline as an alignment marker: 'square' (deprecated), 'L', or None.
+
+    Square: ~square bbox, near-filled, ~200 um side. L: a 6-vertex outline whose enclosed area
+    is well below its bounding box (an L fills ~0.5-0.6 of its bbox; a filled square fills ~1.0),
+    with an arm-scale bbox. Everything else (pins are CIRCLEs; the big cell outline is too large)
+    falls through to None."""
+    x0, y0, x1, y1 = poly["bbox"]
+    w_um, h_um = (x1 - x0) * to_um, (y1 - y0) * to_um
+    bbox_area = (x1 - x0) * (y1 - y0)
+    ratio = poly["area_mm2"] / bbox_area if bbox_area > 0 else 0.0
+    aspect = abs(w_um - h_um) / max(w_um, h_um)
+    side_um = 0.5 * (w_um + h_um)
+    if (aspect <= SQUARE_ASPECT_TOL and ratio >= SQUARE_FILL_MIN
+            and abs(side_um - MARKER_NOMINAL_UM) <= MARKER_TOL_UM):
+        return "square"
+    if (poly["n_verts"] == 6 and L_AREA_RATIO[0] <= ratio <= L_AREA_RATIO[1]
+            and L_MARKER_UM[0] <= max(w_um, h_um) <= L_MARKER_UM[1]):
+        return "L"
+    return None
+
+
+def _find_markers(polys, to_um):
+    """Return alignment markers (square [deprecated] or L) as dicts.
+
+    Each marker carries ``ref_mm`` (bbox-min corner, the detectable anchor), ``center_mm``,
+    ``size_um`` (mean bbox side), ``shape`` ('square'|'L') and ``verts_mm`` (the polygon). The
+    DESIGN origin a cell's pins are relative to is resolved later (``read_design``): the square
+    sits AT the origin so its corner IS the origin; the L is inset, so the origin comes from the
+    cell-boundary corner and the L's offset is derived from the geometry."""
     markers = []
-    for (x0, y0, x1, y1) in squares:
-        side_um = 0.5 * ((x1 - x0) + (y1 - y0)) * to_um
-        if abs(side_um - MARKER_NOMINAL_UM) <= MARKER_TOL_UM:
-            markers.append(dict(
-                origin_mm=(x0, y0),
-                center_mm=(0.5 * (x0 + x1), 0.5 * (y0 + y1)),
-                size_um=side_um,
-            ))
+    for poly in polys:
+        shape = _marker_shape(poly, to_um)
+        if shape is None:
+            continue
+        x0, y0, x1, y1 = poly["bbox"]
+        markers.append(dict(
+            ref_mm=(x0, y0),
+            center_mm=(0.5 * (x0 + x1), 0.5 * (y0 + y1)),
+            size_um=0.5 * ((x1 - x0) + (y1 - y0)) * to_um,
+            shape=shape,
+            verts_mm=poly["verts"],
+        ))
     # order tiled markers left->right, bottom->top (row-major with a y tolerance)
     if markers:
-        ys = np.array([m["origin_mm"][1] for m in markers])
+        ys = np.array([m["ref_mm"][1] for m in markers])
         ytol = 0.25 * np.ptp(ys) / max(1, len(set(np.round(ys, 3)))) if np.ptp(ys) else 1.0
-        markers.sort(key=lambda m: (round(m["origin_mm"][1] / max(ytol, 1e-6)),
-                                    m["origin_mm"][0]))
+        markers.sort(key=lambda m: (round(m["ref_mm"][1] / max(ytol, 1e-6)), m["ref_mm"][0]))
     return markers
 
 
-def _boundary_square(squares, markers, to_um):
-    """Largest square that is not an alignment marker -> the cell/design boundary."""
-    marker_boxes = {(round(m["origin_mm"][0], 4), round(m["origin_mm"][1], 4))
-                    for m in markers}
+def _boundary_square(polys, markers, to_um):
+    """Largest ~square polyline that is not an alignment marker -> the cell/design boundary."""
+    marker_boxes = {(round(m["ref_mm"][0], 4), round(m["ref_mm"][1], 4)) for m in markers}
     best, best_area = None, -1.0
-    for (x0, y0, x1, y1) in squares:
+    for poly in polys:
+        x0, y0, x1, y1 = poly["bbox"]
         if (round(x0, 4), round(y0, 4)) in marker_boxes:
             continue
-        area = (x1 - x0) * (y1 - y0)
+        w, h = x1 - x0, y1 - y0
+        if abs(w - h) / max(w, h) > SQUARE_ASPECT_TOL:     # the boundary is a ~square outline
+            continue
+        area = w * h
         if area > best_area:
             best, best_area = (x0, y0, x1, y1), area
     return best
@@ -252,7 +306,7 @@ def _assign_cells(pins_xy_mm, markers, dx, dy, span_x, span_y):
     the finite axis separates the cells and the degenerate axis uses the full pin span, so
     pins are never assigned to every cell (the failure mode of a naive isfinite(dx&dy) gate).
     """
-    origins = np.array([m["origin_mm"] for m in markers], float)     # (M,2)
+    origins = np.array([m["ref_mm"] for m in markers], float)        # (M,2) marker anchor corners
     wx = dx if np.isfinite(dx) else (span_x + 1.0)                   # window width per axis
     wy = dy if np.isfinite(dy) else (span_y + 1.0)
     tol = 0.02 * min(wx, wy)
@@ -270,8 +324,8 @@ def _cell_pitch(markers):
     """Estimate the tile pitch (dx,dy) of a tiled marker grid."""
     if len(markers) < 2:
         return (float("nan"), float("nan"))
-    ox = np.array([m["origin_mm"][0] for m in markers])
-    oy = np.array([m["origin_mm"][1] for m in markers])
+    ox = np.array([m["ref_mm"][0] for m in markers])
+    oy = np.array([m["ref_mm"][1] for m in markers])
 
     def min_positive_gap(v):
         u = np.array(sorted(set(np.round(v, 4))))
@@ -407,7 +461,7 @@ def _assign_bands(arrays):
 def read_design(path: str | Path) -> DXFDesign:
     """Parse a DXF into a :class:`DXFDesign`.  See module docstring."""
     path = Path(path)
-    pins_mm, squares, units = _read_entities(path)
+    pins_mm, polys, units = _read_entities(path)
     to_um = MM_TO_UM if units in ("mm",) else {
         "cm": 1e4, "m": 1e6, "in": 25400.0, "um": 1.0, "unitless": MM_TO_UM,
     }.get(units, MM_TO_UM)
@@ -418,8 +472,8 @@ def read_design(path: str | Path) -> DXFDesign:
     pins_um = pins_mm.copy()
     pins_um[:, :3] *= to_um                      # x,y,r all to um
 
-    markers = _find_markers(squares, to_um)
-    boundary = _boundary_square(squares, markers, to_um)
+    markers = _find_markers(polys, to_um)
+    boundary = _boundary_square(polys, markers, to_um)
     cell_pitch = _cell_pitch(markers)
     raw_bbox_mm = (float(pins_mm[:, 0].min()), float(pins_mm[:, 1].min()),
                    float(pins_mm[:, 0].max()), float(pins_mm[:, 1].max()))
@@ -436,16 +490,24 @@ def read_design(path: str | Path) -> DXFDesign:
         else:
             masks, (wx, wy) = [np.ones(len(pins_mm), bool)], (span_x, span_y)
         for k, (m, mask) in enumerate(zip(markers, masks), start=1):
-            ox_mm, oy_mm = m["origin_mm"]
+            ref_mm = m["ref_mm"]
+            # DESIGN origin (pins are reported relative to it). The deprecated square sits ON the
+            # origin, so its own corner IS the origin. The L is inset, so a single-cell L takes the
+            # origin from the cell-boundary corner and its offset is encoded in marker_polygon_um.
+            if m["shape"] == "L" and len(markers) == 1 and boundary is not None:
+                ox_mm, oy_mm = boundary[0], boundary[1]
+            else:
+                ox_mm, oy_mm = ref_mm
             ox_um, oy_um = ox_mm * to_um, oy_mm * to_um
             if len(markers) > 1:
                 cell_pins_um = pins_um[mask]
-                bbox_mm = (ox_mm, oy_mm, ox_mm + wx, oy_mm + wy)
+                bbox_mm = (ref_mm[0], ref_mm[1], ref_mm[0] + wx, ref_mm[1] + wy)
             else:
                 cell_pins_um = pins_um            # single cell: everything belongs to it
                 bbox_mm = boundary if boundary is not None else raw_bbox_mm
 
             arrays = _assign_bands(_build_arrays(cell_pins_um, (ox_um, oy_um)))
+            marker_poly_um = (np.asarray(m["verts_mm"], float) - np.array([ox_mm, oy_mm])) * to_um
             cells.append(UnitCell(
                 cell_id=k,
                 marker_origin_mm=(ox_mm, oy_mm),
@@ -454,6 +516,8 @@ def read_design(path: str | Path) -> DXFDesign:
                 bbox_mm=bbox_mm,
                 arrays=arrays,
                 n_pins=sum(a.n_pins for a in arrays),
+                marker_shape=m["shape"],
+                marker_polygon_um=marker_poly_um,
             ))
     else:
         # no alignment marker: treat the whole drawing as one anchor-less "cell"
