@@ -127,6 +127,15 @@ def clear_output_dir(out_dir):
     Side effect: this also removes ``figures/vk4_source.zip``, so ``save_source_docs`` rebuilds
     the source archive every run instead of reusing a current one."""
     out_dir = Path(out_dir)
+    # Refuse to wipe a dangerous target -- this recursively deletes every child, so an out_dir that
+    # is the code directory, ANY ancestor of it (deleting which would erase the repo/source), the
+    # current working dir, or a filesystem root (e.g. a mistaken CLI `run_sample.py <vk4> .`) must
+    # be rejected. The GUI always passes Results/<sample> (a descendant), so this only guards misuse.
+    resolved, here = out_dir.resolve(), HERE.resolve()
+    if (resolved == here or resolved in here.parents
+            or resolved == Path.cwd().resolve() or resolved == resolved.anchor):
+        raise SystemExit(f"refusing to clear unsafe output dir {resolved} (must be a dedicated "
+                         f"results subfolder, not '.', a drive root, or a code/parent directory)")
     if not out_dir.exists():
         return
     for child in out_dir.iterdir():
