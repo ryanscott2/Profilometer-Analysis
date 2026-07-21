@@ -270,6 +270,7 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
     make_radial_overlays(template, placements, params, res_by_cell, out_dir,
                          sets_csv=Path(cell_csv).parent / RADIAL_CSV_NAME)
     ra.print_diameter_calibration(df, out_dir / "figures")
+    ra.make_diameter_model(df, out_dir / "figures")     # process-conditional model (drawn,P,S) + R²/CI
     ra.make_plots(df, results, out_dir / "legacy")
     return df, results, placements
 
