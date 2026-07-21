@@ -108,6 +108,9 @@ def read_vk4(path: str | Path, *, load_intensity: bool = True) -> VK4:
         raise ValueError(f"{path}: not a VK4 file (magic={raw[:4]!r})")
 
     def u32(byte_off: int) -> int:
+        if byte_off < 0 or byte_off + 4 > len(raw):        # bounds-check so a truncated/corrupt
+            raise ValueError(f"{path}: truncated or corrupt VK4 "  # file gives a clear error, not
+                             f"(offset {byte_off} past end, len={len(raw)})")  # a raw struct.error
         return struct.unpack_from("<I", raw, byte_off)[0]
 
     setting = u32(_OFF_SETTING)
@@ -120,6 +123,9 @@ def read_vk4(path: str | Path, *, load_intensity: bool = True) -> VK4:
     dt = tuple(u32(setting + (_MC_YEAR + i) * 4) for i in range(6))  # Y,M,D,h,m,s
 
     def read_block(block_off: int) -> tuple[np.ndarray, int, int, int, int, int]:
+        if block_off < 0 or block_off + 28 > len(raw):     # 7 * uint32 header; guard before unpack
+            raise ValueError(f"{path}: truncated or corrupt VK4 "
+                             f"(block@{block_off} header past end, len={len(raw)})")
         w, h, bit_depth, _compression, byte_size, rmin, rmax = struct.unpack_from(
             "<7I", raw, block_off
         )
