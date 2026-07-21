@@ -140,9 +140,20 @@ def assemble_tiles(vk4_dir, step_col=None, step_row=None, verbose=True) -> Assem
     vk0 = tiles[(ys[0], xs[0])]
     xppx, yppx, zpd = vk0.x_um_per_px, vk0.y_um_per_px, vk0.z_um_per_digit
     th, tw = vk0.height, vk0.width
-    for (y, x), vk in tiles.items():
-        if abs(vk.x_um_per_px - xppx) > 1e-6 or abs(vk.z_um_per_digit - zpd) > 1e-9:
-            raise ValueError(f"tile Y{y}_X{x} has inconsistent calibration; cannot assemble")
+    has_int0 = vk0.intensity is not None
+    for (y, x), vk in tiles.items():                     # fail closed on any tile inconsistency
+        if (abs(vk.x_um_per_px - xppx) > 1e-6 or abs(vk.y_um_per_px - yppx) > 1e-6
+                or abs(vk.z_um_per_digit - zpd) > 1e-9):
+            raise ValueError(f"tile Y{y}_X{x} has inconsistent x/y/z calibration; cannot assemble")
+        if (vk.height, vk.width) != (th, tw):
+            raise ValueError(f"tile Y{y}_X{x} shape {vk.width}x{vk.height} != {tw}x{th}; "
+                             f"cannot assemble")
+        if vk.height_raw.dtype != vk0.height_raw.dtype:
+            raise ValueError(f"tile Y{y}_X{x} height dtype {vk.height_raw.dtype} != "
+                             f"{vk0.height_raw.dtype}; cannot assemble")
+        if (vk.intensity is not None) != has_int0:
+            raise ValueError(f"tile Y{y}_X{x} intensity presence differs from the first tile; "
+                             f"cannot assemble")
 
     if step_col is None or step_row is None:
         sc, sr = _estimate_step(tiles, ys, xs, (th, tw))
