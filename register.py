@@ -580,6 +580,29 @@ def _adaptive_pin_mask(z0, valid, pitch_px, min_prom_um=2.0):
     return valid & ((z0 - bg) > min_prom_um)
 
 
+def _marker_feature(z0, valid, pitch_px):
+    """Feature map for marker matched-filtering: LOCAL height prominence ``z0 − local-background``.
+
+    The alignment marker is detected on HEIGHT, not intensity: on the real scans the L barely shows
+    in intensity (its reflectivity ~ the surround) but stands out clearly in height. Local
+    prominence (background = mean over ~1.5 pin pitch) has a second benefit -- the L sits ISOLATED
+    in an empty corner (background = floor -> full prominence), whereas each pin is surrounded by
+    pins (background raised by neighbours -> smaller prominence), so the marker stands out even more
+    than the big pins. Returns a 0..1 map (|NCC| downstream is polarity-agnostic if the L is
+    recessed rather than proud)."""
+    from scipy.ndimage import uniform_filter
+    k = int(max(5, round(1.5 * pitch_px)))
+    vf = valid.astype(np.float32)
+    zf = np.where(valid, z0, 0.0).astype(np.float32)
+    bg = (uniform_filter(zf, size=k, mode="nearest")
+          / np.maximum(uniform_filter(vf, size=k, mode="nearest"), 1e-6))
+    prom = np.where(valid, z0 - bg, 0.0)
+    if not valid.any():
+        return np.zeros_like(prom)
+    lo, hi = np.percentile(prom[valid], 2), np.percentile(prom[valid], 99.5)
+    return np.clip((prom - lo) / (hi - lo + 1e-9), 0.0, 1.0)
+
+
 def _pattern_ncc(img, tpl):
     """Normalized cross-correlation of ``img`` with ``tpl``, FULL mode, in [-1, 1].
 
@@ -772,13 +795,34 @@ def _register_by_pattern(scan, template, z0, valid, *, cell_pitch_um=None,
     return kept
 
 
+def _rasterize_marker(cell, xppx, yppx, x_right, y_up, rot_deg, pad_px=4):
+    """Filled binary raster of the cell's alignment-marker polygon (``marker_polygon_um`` -- verts
+    in um relative to the DESIGN origin) under the given reflection/rotation, matching dxf_to_px.
+
+    This is the matched-filter TEMPLATE: the actual marker SHAPE (an asymmetric L, or the deprecated
+    square). Using the real shape is what discriminates the marker from the round pins -- a filled
+    square latched onto the large D300 pins. Returns (T, t0c, t0r) with (t0c, t0r) = the pixel of
+    CAD origin (0,0) inside T, so a detection maps straight to the cell origin even for an inset L."""
+    from matplotlib.path import Path as MplPath
+    poly = np.asarray(cell.marker_polygon_um, float)
+    th = np.deg2rad(rot_deg); c, s = np.cos(th), np.sin(th)
+    xr = x_right * poly[:, 0]; yr = y_up * poly[:, 1]      # reflect + rotate in um, then scale per axis
+    xr, yr = c * xr - s * yr, s * xr + c * yr
+    col = xr / xppx; row = yr / yppx                       # px relative to CAD (0,0)
+    offc = float(col.min()) - pad_px; offr = float(row.min()) - pad_px
+    Wt = int(np.ceil(float(col.max()) + pad_px - offc)) + 1
+    Ht = int(np.ceil(float(row.max()) + pad_px - offr)) + 1
+    gx, gy = np.meshgrid(np.arange(Wt), np.arange(Ht))
+    pts = np.column_stack([gx.ravel() + offc, gy.ravel() + offr])
+    inside = MplPath(np.column_stack([col, row])).contains_points(pts).reshape(Ht, Wt)
+    return inside.astype(float), -offc, -offr
+
+
 def _solid_square_ncc_markers(feat, marker_px, min_sep, max_n=40, thresh=0.30):
-    """Locate solid-square alignment markers by |NCC| of a FILLED-square template against the
-    feature map. Markers are solid squares (not outlines) and large relative to the pins, so a
-    filled-square matched filter is far more discriminative than the old outline-on-edges match.
-    |NCC| is polarity-agnostic (marker milled proud OR recessed). Over-detection is harmless --
-    the per-cell two-point solve + overlap gate downstream reject false markers -- so this is
-    deliberately permissive. Returns [(col, row, score)], strongest first."""
+    """Locate the deprecated SOLID-SQUARE alignment marker by |NCC| of a filled-square template
+    against the (intensity) feature map. This is the original, proven square detector -- kept for
+    square-marker samples; the L fiducial uses ``_detect_marker_origins`` on the height map instead.
+    Returns [(col, row, score)] marker CENTRES, strongest first (the caller maps centre -> origin)."""
     sq = max(5, int(round(marker_px)))
     marg = max(2, int(round(0.35 * sq)))
     T = np.zeros((sq + 2 * marg, sq + 2 * marg))
@@ -794,6 +838,32 @@ def _solid_square_ncc_markers(feat, marker_px, min_sep, max_n=40, thresh=0.30):
         if not np.isfinite(v) or v < thresh:
             break
         out.append((float(l - Wt + 1 + t0), float(k - Ht + 1 + t0), float(v)))
+        r0, r1 = max(0, k - sep), min(corr.shape[0], k + sep + 1)
+        c0, c1 = max(0, l - sep), min(corr.shape[1], l + sep + 1)
+        corr[r0:r1, c0:c1] = -np.inf
+    return out
+
+
+def _detect_marker_origins(feat, cell, xppx, yppx, x_right, y_up, rot, min_sep,
+                           max_n=60, thresh=0.2):
+    """Locate alignment markers by |NCC| of the rasterised marker-polygon template against the
+    feature map, returning each as a CELL ORIGIN (col, row) -- the template carries the origin
+    reference (``t0``), so an asymmetric/inset L maps to the true origin directly (no square-centre
+    assumption). |NCC| is polarity-agnostic (marker milled proud OR recessed). Over-detection is
+    harmless (the overlap/lattice gates downstream reject false peaks). Strongest first."""
+    T, t0c, t0r = _rasterize_marker(cell, xppx, yppx, x_right, y_up, rot)
+    Ht, Wt = T.shape
+    if T.sum() < 3:
+        return []
+    corr = np.abs(_pattern_ncc(feat, T))
+    sep = max(2, int(round(min_sep)))
+    out = []
+    for _ in range(max_n):
+        idx = int(np.argmax(corr)); k, l = np.unravel_index(idx, corr.shape)
+        v = corr[k, l]
+        if not np.isfinite(v) or v < thresh:
+            break
+        out.append(((l - Wt + 1) + t0c, (k - Ht + 1) + t0r, float(v)))
         r0, r1 = max(0, k - sep), min(corr.shape[0], k + sep + 1)
         c0, c1 = max(0, l - sep), min(corr.shape[1], l + sep + 1)
         corr[r0:r1, c0:c1] = -np.inf
@@ -923,11 +993,16 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
 
     Marker-anchored **lattice** registration (quality over runtime):
 
-    1. Detect solid alignment-marker candidates (permissive |NCC|). The marker sits in an empty
-       corner, OFF the pin lattice, so it is an *absolute* origin reference: a phase-clamped refine
-       plus off-by-one-pin de-alias locks each detection to the true cell origin. This is what makes
-       a dense, uniform, periodic array (large pins on a tight pitch) resolvable -- an overlap gate
-       alone cannot tell a real placement from a one-pin-pitch-shifted one, but the marker can.
+    1. Detect alignment markers by matched-filtering the marker's own POLYGON shape
+       (``marker_polygon_um``, rasterised) against the feature map -- NOT a filled square, which on
+       a large-pin sample (D300) correlates more strongly with the round pins than with the thin L
+       and mislocks. The L fiducial is detected on the HEIGHT-prominence map (it barely shows in
+       intensity); the deprecated square on intensity. The marker sits in an empty corner, OFF the
+       pin lattice, so it is an *absolute* origin reference (the template carries the origin, so an
+       inset/asymmetric L maps straight to the cell origin); a phase-clamped refine plus off-by-one
+       de-alias then locks each to the true origin. This is what makes a dense uniform periodic
+       array resolvable -- an overlap gate alone cannot tell a real placement from a
+       one-pin-pitch-shifted one, but the marker can.
     2. Take the highest-overlap detections as anchors, estimate the tile step vectors from their
        geometry (the tile pitch is NOT in the single-cell DXF, so it is measured here), and fix the
        one global stage rotation.
@@ -936,14 +1011,14 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
        grid never drifts a pin off at the far corners. Off-lattice spurious detections (e.g. a pin
        mistaken for the marker) are never on a node, so they are rejected by construction.
 
-    The DXF is mapped mirrored (``mirror_x=True`` -> x_right=-1) so the array is never flipped;
-    survivors are indexed in the DESIGN frame ((1,1) = DXF top-left) by ``_assign_grid_indices``.
-    Falls back to :func:`_register_by_pattern` (marker-free pin-pattern correlation) when no marker
-    anchors a cell -- note a marker-less single uniform periodic array is genuinely off-by-one
-    ambiguous, so a corner marker (ideally an asymmetric fiducial) is required for that geometry.
+    The reflection is the known Keyence X-mirror (``mirror_x`` -> x_right=-1) so the array is never
+    flipped; survivors are indexed in the DESIGN frame ((1,1) = DXF top-left) by
+    ``_assign_grid_indices``. Falls back to :func:`_register_by_pattern` (marker-free pin-pattern
+    correlation) when no marker polygon is present or none anchors a cell -- note a marker-less
+    single uniform periodic array is genuinely off-by-one ambiguous, so a corner marker (ideally an
+    asymmetric fiducial) is required for that geometry.
     """
-    x_right = -1 if mirror_x else 1
-    xppx, yppx = scan.x_um_per_px, scan.y_um_per_px
+    xppx, yppx = scan.x_um_per_px, scan.y_um_per_px   # x_right/y_up are resolved from the marker below
     H, W = scan.height_raw.shape
     feat, edge, pin_mask, valid, z0 = scan_feature(scan)
 
@@ -955,10 +1030,6 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
                                     min_contrast_um=min_contrast_um,
                                     x_right_options=((-1, 1) if mirror_x else (1, -1)))
 
-    marker_um = template.marker_size_um
-    if not np.isfinite(marker_um):
-        marker_um = 200.0
-    mx, my = marker_um / xppx, marker_um / yppx
     w_um, h_um = template.size_um
     cell_w = (cell_pitch_um[0] if cell_pitch_um else w_um) / xppx
     cell_h = (cell_pitch_um[1] if cell_pitch_um else h_um) / yppx
@@ -969,25 +1040,46 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
     # with a non-uniform tile step they drift; allow the node refine a larger (still sub-half-pitch,
     # so alias-safe) snap so far cells are not stranded outside the clamp and under-counted.
     probe_shift = 0.45 * min_pin_pitch
-    amask = _adaptive_pin_mask(z0, valid,
-                               float(np.mean([a.pitch_x_um for a in template.arrays])) / xppx)
+    mean_pitch_px = float(np.mean([a.pitch_x_um for a in template.arrays])) / xppx
+    amask = _adaptive_pin_mask(z0, valid, mean_pitch_px)
 
-    # --- 1. marker candidates -> absolute, off-by-one-safe anchor origins ---
-    marker_px = 0.5 * (mx + my)
-    markers = _solid_square_ncc_markers(feat, marker_px, max(0.6 * marker_px, 20),
-                                        max_n=max(8, 2 * expect_max))
+    # --- 1. detect every alignment marker as a cell ORIGIN, BY MARKER TYPE (read from the DXF), each
+    #        with its proven method. The reflection is the known, fixed Keyence X-mirror
+    #        (``mirror_x``): the pin lattice is reflection-symmetric and the marker |NCC| does not
+    #        reliably resolve the flip on these pin-dominated feature maps, so we trust the hardware
+    #        mirror rather than a fragile asymmetry vote. False peaks (chip border, pins) are rejected
+    #        by the pin-overlap + lattice gates below. ---
+    if template.marker_polygon_um is None or len(template.marker_polygon_um) < 3:
+        return _fallback("template has no alignment-marker polygon")
+    x_right, y_up = (-1 if mirror_x else 1), int(y_up)
+    ex = max(8, 2 * expect_max)
+    poly = np.asarray(template.marker_polygon_um, float)
+    if template.marker_shape == "L":
+        # L fiducial: rasterised-polygon matched filter -> the detection IS the cell origin (the
+        # template carries the origin, correct for the inset/asymmetric L). Search the HEIGHT-
+        # prominence map (the L barely shows in intensity -- reflectivity ~ the surround) AND
+        # intensity, unioned (a given sample's Ls may show in one or the other). Peel at MARKER
+        # scale -- a cell-scale sep merged adjacent cells' markers and lost them.
+        mfeat = _marker_feature(z0, valid, mean_pitch_px)
+        marker_sep = max(0.6 * max(np.ptp(poly[:, 0]) / xppx, np.ptp(poly[:, 1]) / yppx), 20.0)
+        markers = (_detect_marker_origins(mfeat, template, xppx, yppx, x_right, y_up, 0.0, marker_sep, max_n=ex)
+                   + _detect_marker_origins(feat, template, xppx, yppx, x_right, y_up, 0.0, marker_sep, max_n=ex))
+    else:
+        # deprecated SQUARE marker: the original filled-square-on-intensity detector, mapping the
+        # detected marker CENTRE to the cell origin (the square sits ON the origin).
+        marker_um = template.marker_size_um if np.isfinite(template.marker_size_um) else 200.0
+        mx, my = marker_um / xppx, marker_um / yppx
+        marker_px = 0.5 * (mx + my)
+        centres = _solid_square_ncc_markers(feat, marker_px, max(0.6 * marker_px, 20), max_n=ex)
+        markers = [(mc - x_right * 0.5 * mx, mr - y_up * 0.5 * my, sc) for (mc, mr, sc) in centres]
     if not markers:
         return _fallback("no alignment marker detected")
 
     cand = []
-    for (mc, mr, _sc) in markers:
-        o0 = (mc - x_right * 0.5 * mx, mr - y_up * 0.5 * my)   # marker centre -> CAD origin (rot~0)
-        # First pass: a phase-clamped refine only, NO de-alias. The marker is an absolute,
-        # off-pin-lattice anchor, so a <half-pitch refine already locks the true origin without
-        # aliasing. De-aliasing raw candidates is pointless work (most are spurious peaks far from
-        # any cell) and can only mis-snap them -- off-by-one is resolved later, per lattice node,
-        # where "the expected location" is actually defined.
-        o, ov = _refine_origin(amask, template, o0, xppx, yppx, y_up, x_right, 0.0,
+    for (oc, orow, _sc) in markers:
+        # Each detection is already a CELL ORIGIN. A phase-clamped refine (<half a pin pitch) polishes
+        # it against the pin lattice without aliasing; off-by-one is resolved later, per lattice node.
+        o, ov = _refine_origin(amask, template, (oc, orow), xppx, yppx, y_up, x_right, 0.0,
                                search_px=int(max_shift) + 6, max_shift_px=max_shift)
         if np.isfinite(ov) and ov >= min_overlap:
             cand.append((float(o[0]), float(o[1]), float(ov)))

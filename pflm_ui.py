@@ -604,8 +604,7 @@ class App:
 
         def add(parent, path):
             for child in sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
-                node = self.tree.insert(parent, "end", text=child.name,
-                                        open=(parent == "" or child.name == "figures"))
+                node = self.tree.insert(parent, "end", text=child.name, open=False)  # start collapsed
                 self._tree_paths[node] = child
                 if child.is_dir():
                     add(node, child)
