@@ -44,7 +44,10 @@ cells. The driver stitches the tiles into one scan (`assemble.py`), finds every 
   use a dedicated finite-edge solver: it fits lattice phase modulo pitch, enumerates every integer
   array-index hypothesis, and accepts an absolute origin only when physical pin terminations resolve
   **both** axes. Evidence is counted by lattice nodes with a spatial block bootstrap, not by pixels.
-  An interior-only or one-edge crop still fails closed with an actionable ambiguity error.
+  For a single interior image, `register_sample` returns an explicitly labelled `uniform-phase`
+  placement: rotation and pin centres are aligned for geometry measurement, while
+  `absolute_origin=false` and `ambiguous_axes` prevent its arbitrary pitch-equivalent index from
+  masquerading as an absolute origin. The strict low-level path can still fail closed.
 - Cells are indexed by **design (row, col) with (1,1) = DXF top-left** (marker-anchored). Laser
   parameters are supplied per cell in `CSV/cell_params.csv` as a plain **grid in that design
   orientation**: line `r` = design row `r` (top first), column `c` = design col `c` (left first),
@@ -110,8 +113,11 @@ are rejected by construction. L-marker detection uses a coarse-to-fine −5° to
 the deprecated symmetric square retains its proven legacy detector. Marker-free aperiodic layouts
 use whole-pattern correlation; a complete single uniform grid instead uses finite-array termination
 evidence. It resolves a partial scan only when at least one pin-termination edge plus roughly one
-pitch of valid floor is visible in **each** lattice direction. Otherwise it fails closed rather than
-choosing a pitch-equivalent index. Confirm the result from the `design(r,c) → marker x/y, rot, reg`
+pitch of valid floor is visible in **each** lattice direction. Otherwise the default high-level path
+uses a centred, pitch-equivalent `uniform-phase` placement so diameter/depth can be measured from one
+subsection; its absolute pin index remains explicitly unresolved. Pass
+`allow_uniform_phase_only=False` to `register_sample` wherever absolute identity is mandatory.
+Confirm the result from the `design(r,c) → marker x/y, rot, reg`
 table printed each run (a `rot` near ±180° flags a re-oriented wafer) and the per-cell reports in
 `Results/<sample>/figures/cells/`. Cell (row,col) indices are absolute (a dropped interior
 row/column leaves a hole, not a shift); a `cell_params` entry with no registered cell is warned as
@@ -136,7 +142,7 @@ Clean outputs live under `figures/`; the v1 plot set, `measurements.csv` and per
 
 | file | contents |
 |------|----------|
-| `legacy/measurements.csv` | one row per array per cell: base·mid·top Ø (`base_extrapolated` flag when the base crossing was buried), depth, **design** pitch (`pitch_*`) + scan-**measured** pitch (`meas_pitch_*`), drawn Ø, laser params, registration quality, reliability flags |
+| `legacy/measurements.csv` | one row per array per cell: base·mid·top Ø (`base_extrapolated` flag when the base crossing was buried), depth, **design** pitch (`pitch_*`) + scan-**measured** pitch (`meas_pitch_*`), drawn Ø, laser params, registration quality, `absolute_origin` / `ambiguous_axes`, reliability flags |
 | `figures/cell_overview.png`, `figures/sample_heightmap.png` | labelled cell map + full-sample height map (design orientation) |
 | `figures/cells/cell_x*_y*.png` | per-cell report: height/intensity with pin overlay + measured-vs-drawn table |
 | `figures/param_summary.png`, `figures/param_depth_scatter.png` | depth & mid-Ø oversizing vs laser passes/speed (reliable arrays; ◇ D300 □ D100 △ D50) |

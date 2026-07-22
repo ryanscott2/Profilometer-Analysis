@@ -51,9 +51,11 @@ class CellPlacement:
     x_right: int = 1             # +1: CAD +x -> +col; -1: X-mirrored (Keyence imaging flip)
     rotation_deg: float = 0.0
     score: float = float("nan")  # registration quality (higher = better)
-    method: str = ""             # "marker+lattice" / "lattice" / "manual" / "grid+lattice"
+    method: str = ""             # includes "uniform-edge" / "uniform-phase" for markerless grids
     cell_row: int = 0            # design-frame unit-cell index (1 = top), set by register_sample
     cell_col: int = 0            # design-frame unit-cell index (1 = left)
+    absolute_origin: bool = True # False for a lattice-phase lock with unresolved integer index
+    ambiguous_axes: str = ""     # any unresolved design axes, e.g. "xy" for an interior crop
 
     def dxf_to_px(self, x_um, y_um):
         """CAD (marker-relative, um) -> scan pixel (col, row). Vectorised.
@@ -675,7 +677,8 @@ def _uniform_component_centers(pin_mask, array, xppx, yppx):
     return np.column_stack([rc[:, 1] * xppx, rc[:, 0] * yppx])
 
 
-def _fit_uniform_lattice(centers_xy_um, pitch_um, angle_limits=(-5.0, 5.0)):
+def _fit_uniform_lattice(centers_xy_um, pitch_um, angle_limits=(-5.0, 5.0),
+                         min_components=9):
     """Fit square-lattice angle and phase, robustly, without assigning absolute indices.
 
     Circular coherence supplies exactly the information a periodic crop contains: orientation and
@@ -685,10 +688,11 @@ def _fit_uniform_lattice(centers_xy_um, pitch_um, angle_limits=(-5.0, 5.0)):
     from scipy.optimize import minimize_scalar
 
     xy = np.asarray(centers_xy_um, float)
-    if len(xy) < 9:
+    min_components = max(6, int(min_components))
+    if len(xy) < min_components:
         raise RegistrationAmbiguityError(
-            f"Only {len(xy)} isolated pin components were found; at least 9 are required to fit "
-            "a markerless lattice reliably.")
+            f"Only {len(xy)} isolated pin components were found; at least {min_components} are "
+            "required to fit a markerless lattice reliably.")
     lo, hi = map(float, angle_limits)
     if not np.isfinite(lo + hi) or hi <= lo:
         raise ValueError("uniform-lattice angle limits must be finite and increasing")
@@ -724,7 +728,7 @@ def _fit_uniform_lattice(centers_xy_um, pitch_um, angle_limits=(-5.0, 5.0)):
 
     pu, pv, residual, coherence = _phase_and_residual(xy, angle)
     inlier = residual <= 0.24 * pitch_um
-    if inlier.sum() < 9 or inlier.mean() < 0.55 or coherence < 0.55:
+    if inlier.sum() < min_components or inlier.mean() < 0.55 or coherence < 0.55:
         raise RegistrationAmbiguityError(
             f"Pin components do not support one reliable {pitch_um:g} um lattice "
             f"({int(inlier.sum())}/{len(xy)} inliers, coherence {coherence:.2f}). Check the DXF "
@@ -737,7 +741,12 @@ def _fit_uniform_lattice(centers_xy_um, pitch_um, angle_limits=(-5.0, 5.0)):
     angle = float(opt.x)
     pu, pv, residual, coherence = _phase_and_residual(pts, angle)
     pts = pts[residual <= 0.18 * pitch_um]
-    if len(pts) < 9 or coherence < 0.70:
+    # A single D300 VK4 frame contains only ~3x4 pins; after excluding border-clipped components it
+    # can legitimately leave 6-8 clean centroids.  Six high-coherence inliers still overdetermine
+    # angle plus two phase coordinates, while the independent node-quality gates below remain in
+    # force.  Larger/noisier images still need coherence >= 0.70.
+    min_final = 6 if coherence >= 0.80 else 9
+    if len(pts) < min_final or coherence < 0.70:
         raise RegistrationAmbiguityError(
             f"Lattice phase remained unstable after robust fitting ({len(pts)} inliers, "
             f"coherence {coherence:.2f}).")
@@ -840,13 +849,16 @@ def _block_bootstrap_margin(present, testable, best_pred, alt_pred, *, seed=2026
 
 
 def _register_uniform_lattice(scan, template, z0, valid, *, x_right_options=(-1, 1),
-                              y_up_options=(1, -1), angles_deg=None):
+                              y_up_options=(1, -1), angles_deg=None,
+                              allow_phase_only=False):
     """Register one finite, markerless uniform array using termination evidence.
 
     The lattice fit determines rotation and phase only modulo pitch.  Every finite integer-index
     hypothesis is then scored on independent lattice nodes, including valid floor nodes where a
     shifted hypothesis predicts a nonexistent edge pin.  Both axes must beat their nearest alias by
-    a block-bootstrap lower bound greater than zero; otherwise registration fails closed.
+    a block-bootstrap lower bound greater than zero.  When ``allow_phase_only`` is true, an
+    unresolved finite index returns a centred pitch-equivalent placement explicitly labelled
+    ``uniform-phase`` instead of claiming an absolute origin.
     """
     a = template.arrays[0]
     if not np.isclose(a.pitch_x_um, a.pitch_y_um, rtol=1e-6, atol=1e-6):
@@ -870,16 +882,21 @@ def _register_uniform_lattice(scan, template, z0, valid, *, x_right_options=(-1,
         else:
             limits = (float(av.min()), float(av.max()))
     angle, phase_u, phase_v, _inliers = _fit_uniform_lattice(
-        centers, float(a.pitch_x_um), limits)
+        centers, float(a.pitch_x_um), limits,
+        min_components=(6 if allow_phase_only else 9))
     qu, qv, testable, present = _uniform_node_grid(
         pin_mask, valid, a, xppx, yppx, angle, phase_u, phase_v)
     n_present = int(present.sum())
     present_u = np.flatnonzero(present.any(axis=0))
     present_v = np.flatnonzero(present.any(axis=1))
-    if n_present < 9 or len(present_u) < 3 or len(present_v) < 3:
+    phase_patch_ok = (n_present >= 6 and min(len(present_u), len(present_v)) >= 2
+                      and max(len(present_u), len(present_v)) >= 3)
+    absolute_patch_ok = (n_present >= 9 and len(present_u) >= 3 and len(present_v) >= 3)
+    if not (absolute_patch_ok or (allow_phase_only and phase_patch_ok)):
         raise RegistrationAmbiguityError(
             f"Only {n_present} testable pins spanning {len(present_u)}x{len(present_v)} lattice "
-            "lines were found; finite-edge registration needs at least a 3x3 observed patch.")
+            "lines were found; absolute finite-edge registration needs a 3x3 patch, while "
+            "phase-only registration needs at least a 2x3 patch.")
 
     test_prefix = np.pad(testable.astype(np.int32), ((1, 0), (1, 0))).cumsum(0).cumsum(1)
     pres_prefix = np.pad(present.astype(np.int32), ((1, 0), (1, 0))).cumsum(0).cumsum(1)
@@ -899,7 +916,8 @@ def _register_uniform_lattice(scan, template, z0, valid, *, x_right_options=(-1,
     _err, _negmatch, best_u, best_v, total, matched, missing, extra = best
     recall = matched / max(1, n_present)
     precision = matched / max(1, total)
-    if matched < 9 or recall < 0.75 or precision < 0.70:
+    min_matched = 6 if allow_phase_only and not absolute_patch_ok else 9
+    if matched < min_matched or recall < 0.75 or precision < 0.70:
         raise RegistrationAmbiguityError(
             f"The best finite-array hypothesis explains only {matched}/{n_present} observed and "
             f"{matched}/{total} predicted testable pins (recall {recall:.2f}, precision "
@@ -932,11 +950,30 @@ def _register_uniform_lattice(scan, template, z0, valid, *, x_right_options=(-1,
             f"{axis}: next alias +{evidence[axis][0]:g} node loss, "
             f"bootstrap 1% bound {evidence[axis][1]:g}"
             for axis in ambiguous)
-        raise RegistrationAmbiguityError(
-            "Uniform markerless lattice phase was found, but the finite array index is not "
-            f"identifiable along {','.join(ambiguous)} ({detail}). Capture at least one physical "
-            "pin-termination edge plus roughly one pitch of valid floor in both lattice directions, "
-            "or provide a trusted manual origin.")
+        if not allow_phase_only:
+            raise RegistrationAmbiguityError(
+                "Uniform markerless lattice phase was found, but the finite array index is not "
+                f"identifiable along {','.join(ambiguous)} ({detail}). Capture at least one physical "
+                "pin-termination edge plus roughly one pitch of valid floor in both lattice "
+                "directions, enable phase-only registration, or provide a trusted manual origin.")
+
+        # Pick a deterministic representative of the pitch-equivalent family.  Preserve every axis
+        # that finite-edge evidence actually resolved; on each ambiguous axis centre the observed
+        # lattice span inside the DXF array.  This maximises useful partial-image coverage while the
+        # metadata below makes clear that the chosen integer index is only a coordinate convention.
+        obs_u = qu[present.any(axis=0)]
+        obs_v = qv[present.any(axis=1)]
+        target_u = int(round(0.5 * (obs_u[0] + obs_u[-1] - (a.nx - 1))))
+        target_v = int(round(0.5 * (obs_v[0] + obs_v[-1] - (a.ny - 1))))
+        pool = [cnd for cnd in candidates
+                if ("x" in ambiguous or cnd[2] == best_u)
+                and ("y" in ambiguous or cnd[3] == best_v)]
+        optimum = min((cnd[0], cnd[1]) for cnd in pool)
+        pool = [cnd for cnd in pool if (cnd[0], cnd[1]) == optimum]
+        best = min(pool, key=lambda cnd:
+                   ((cnd[2] - target_u) ** 2 if "x" in ambiguous else 0)
+                   + ((cnd[3] - target_v) ** 2 if "y" in ambiguous else 0))
+        _err, _negmatch, best_u, best_v, total, matched, missing, extra = best
 
     xr = int(xr_options[0]); yu = int(yu_options[0])
     origin_qu = best_u if xr > 0 else best_u + a.nx - 1
@@ -949,7 +986,8 @@ def _register_uniform_lattice(scan, template, z0, valid, *, x_right_options=(-1,
     return [CellPlacement(
         1, float(origin_x / xppx), float(origin_y / yppx), xppx, yppx,
         y_up=yu, x_right=xr, rotation_deg=float(angle), score=float(score),
-        method="uniform-edge", cell_row=1, cell_col=1)]
+        method=("uniform-phase" if ambiguous else "uniform-edge"), cell_row=1, cell_col=1,
+        absolute_origin=not bool(ambiguous), ambiguous_axes="".join(ambiguous))]
 
 
 def _marker_feature(z0, valid, pitch_px):
@@ -1039,7 +1077,7 @@ def _dealias_origin(pin_mask, template, origin, xppx, yppx, y_up, x_right, rot_d
 def _register_by_pattern(scan, template, z0, valid, *, cell_pitch_um=None,
                          min_overlap=0.5, min_inbounds=0.8, min_contrast_um=4.0,
                          x_right_options=(-1, 1), y_up_options=(1, -1), angles_deg=None,
-                         coarse_cell_px=120.0):
+                         coarse_cell_px=120.0, allow_uniform_phase_only=False):
     """Locate and register every unit cell WITHOUT an alignment marker, by coarse-to-fine
     phase correlation of the rasterised DXF pin pattern against the scan's pin map.
 
@@ -1068,7 +1106,8 @@ def _register_by_pattern(scan, template, z0, valid, *, cell_pitch_um=None,
                 "fiducial, or provide a trusted manual origin.")
         return _register_uniform_lattice(
             scan, template, z0, valid, x_right_options=x_right_options,
-            y_up_options=y_up_options, angles_deg=angles_deg)
+            y_up_options=y_up_options, angles_deg=angles_deg,
+            allow_phase_only=allow_uniform_phase_only)
     xppx, yppx = scan.x_um_per_px, scan.y_um_per_px
     H, W = scan.height_raw.shape
     w_um, h_um = template.size_um                          # cell size from the DXF
@@ -1551,7 +1590,8 @@ def _dedup_cells(cells, min_sep):
 
 def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
                     min_inbounds=0.8, min_contrast_um=4.0, expect_max=80,
-                    mirror_x=True, y_up=1, anchor_frac=0.85):
+                    mirror_x=True, y_up=1, anchor_frac=0.85,
+                    allow_uniform_phase_only=True):
     """Detect and register EVERY unit cell tiled across an assembled sample (Tier 1).
 
     Marker-anchored **lattice** registration (quality over runtime):
@@ -1578,8 +1618,9 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
     flipped; survivors are indexed in the DESIGN frame ((1,1) = DXF top-left) by
     ``_assign_grid_indices``. Falls back to :func:`_register_by_pattern` when no marker polygon is
     present or none anchors a cell. Aperiodic layouts use pin-pattern correlation; a markerless
-    complete uniform array uses finite pin-termination evidence and fails closed if both absolute
-    lattice indices are not identifiable.
+    complete uniform array uses finite pin-termination evidence. If its absolute indices remain
+    ambiguous, ``allow_uniform_phase_only`` permits a visibly labelled lattice-phase placement so a
+    single subsection can still be measured; set it false wherever absolute pin identity is needed.
     """
     xppx, yppx = scan.x_um_per_px, scan.y_um_per_px   # x_right/y_up are resolved from the marker below
     H, W = scan.height_raw.shape
@@ -1587,10 +1628,18 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
 
     def _fallback(reason):
         print(f"register_sample: {reason}; falling back to marker-free registration.")
-        return _register_by_pattern(scan, template, z0, valid,
-                                    cell_pitch_um=cell_pitch_um, min_inbounds=min_inbounds,
-                                    min_contrast_um=min_contrast_um,
-                                    x_right_options=((-1, 1) if mirror_x else (1, -1)))
+        found = _register_by_pattern(
+            scan, template, z0, valid, cell_pitch_um=cell_pitch_um,
+            min_inbounds=min_inbounds, min_contrast_um=min_contrast_um,
+            x_right_options=((-1, 1) if mirror_x else (1, -1)),
+            allow_uniform_phase_only=allow_uniform_phase_only)
+        for p in found:
+            if not p.absolute_origin:
+                print("WARNING: markerless uniform subsection registered by lattice phase only; "
+                      f"absolute pin index is unresolved on {p.ambiguous_axes.upper()} axis/axes. "
+                      "Geometry measurements are aligned, but do not interpret the reported DXF "
+                      "origin or individual pin indices as absolute.")
+        return found
 
     w_um, h_um = template.size_um
     cell_w = (cell_pitch_um[0] if cell_pitch_um else w_um) / xppx
