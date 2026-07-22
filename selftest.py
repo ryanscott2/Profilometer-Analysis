@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import os
 import warnings
 from pathlib import Path
 
@@ -32,6 +33,59 @@ import report as ra
 
 HERE = Path(__file__).parent
 OUT = HERE / "Results" / "legacy" / "selftest"
+
+
+def _dxf_candidates(name: str, fixture_group: str) -> list[Path]:
+    """Return read-only DXF locations in local-first, portable-fallback order."""
+    candidates: list[Path] = []
+
+    # An explicit override is useful when the Stanford OneDrive folder is mounted elsewhere.
+    if override := os.environ.get("PFLM_DXF_DIR"):
+        candidates.append(Path(override) / name)
+
+    # Prefer the fabrication files in the user's synced data tree.  The three standalone
+    # markerless layouts currently live in the older OneDrive checkout's fixture directory.
+    onedrive = os.environ.get("OneDriveCommercial") or os.environ.get("OneDrive")
+    if onedrive:
+        data_root = Path(onedrive) / "SU26" / "UV Laser PFLM"
+        candidates.extend((
+            data_root / "DXF" / name,
+            data_root / "PYTHON" / "PFLM_Profilometer_Analysis"
+            / "tests" / "fixtures" / fixture_group / name,
+        ))
+
+    # These paths make the same test portable to GitHub Actions and other machines.  No source
+    # is ever opened for writing; the repository DXF is only a fallback test fixture.
+    candidates.extend((
+        HERE / "DXF" / name,
+        HERE / "tests" / "fixtures" / fixture_group / name,
+    ))
+
+    # Keep error messages readable if an override happens to duplicate another location.
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path).casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def _resolve_dxf(name: str, fixture_group: str) -> Path:
+    """Select an existing DXF without copying, normalizing, or modifying it."""
+    candidates = _dxf_candidates(name, fixture_group)
+    for path in candidates:
+        if path.is_file():
+            return path
+    searched = "\n    ".join(str(path) for path in candidates)
+    raise FileNotFoundError(f"Could not find {name}; searched:\n    {searched}")
+
+
+def _canonical_dxf_sha256(path: Path) -> str:
+    """Hash text-DXF content while treating LF and CRLF checkouts identically."""
+    content = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(content).hexdigest()
 
 
 def _raises(fn, *args):
@@ -61,13 +115,11 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     ck = Checker()
 
-    # Versioned real fixture keeps the gate portable; fall back to a user's local DXF for older
-    # checkouts that predate the fixture directory.
-    dxf = HERE / "tests" / "fixtures" / "registration" / "071826_UVPFLM_D300.dxf"
-    if not dxf.is_file():
-        dxf = next((HERE / "DXF").glob("*.dxf"))
+    # Local runs use the OneDrive fabrication DXF; CI uses the versioned equivalent.
+    dxf = _resolve_dxf("071826_UVPFLM_D300.dxf", "registration")
     design = read_design(dxf)
     template = design.cells[0]
+    print(f"DXF source (read-only): {dxf}")
     print(f"DXF: {template.n_arrays} arrays / {template.n_pins} pins, "
           f"marker {template.marker_size_um:.0f} µm\n")
 
@@ -468,8 +520,12 @@ def main():
     # ---------------------------------------- 14. L-fiducial detection + tiled-grid recovery (#20, #16) #
     print("\n[14] L-marker detection + register_sample tiled-grid recovery (production path)")
     try:
-        _cands = list((HERE / "tests" / "fixtures" / "registration").glob("*.dxf"))
-        _cands += list((HERE / "DXF").glob("*.dxf"))
+        _cands = []
+        for _fixture_name in ("071826_UVPFLM_D300.dxf", "072026_UVPFLM_D100D50.dxf"):
+            try:
+                _cands.append(_resolve_dxf(_fixture_name, "registration"))
+            except FileNotFoundError:
+                pass
         if (HERE / "Results").is_dir():
             _cands += list((HERE / "Results").glob("*/figures/*.dxf"))
         _Ltmpl = None
@@ -511,7 +567,6 @@ def main():
     # --------------------------------------------- 15. markerless uniform-array aliasing (#2) #
     print("\n[15] real markerless DXFs: finite-edge alias elimination (#2)")
     try:
-        _fixture_dir = HERE / "tests" / "fixtures" / "markerless"
         _cases = (
             ("D50_P100_1cm2.dxf", 50.0, 100.0, 100, 10_000,
              "1d9ab5d1596b6941631507cbff841e4c3b2d65663decd43ce7b730fbfc6f5807"),
@@ -523,12 +578,13 @@ def main():
         )
         _loaded = []
         for _name, _dia, _pitch, _grid, _npins, _sha in _cases:
-            _path = _fixture_dir / _name
+            _path = _resolve_dxf(_name, "markerless")
+            print(f"    {_name} source (read-only): {_path}")
             _design = read_design(_path)
             _cell = _design.cells[0]
             _array = _cell.arrays[0]
-            ck.check(hashlib.sha256(_path.read_bytes()).hexdigest() == _sha,
-                     f"#2 {_name}: original fixture SHA-256 is unchanged")
+            ck.check(_canonical_dxf_sha256(_path) == _sha,
+                     f"#2 {_name}: fixture content is unchanged (LF/CRLF equivalent)")
             ck.check(not _design.is_unit_cell and _design.n_markers == 0
                      and len(_design.cells) == 1 and _cell.marker_polygon_um is None,
                      f"#2 {_name}: parsed as one markerless cell")
@@ -762,10 +818,11 @@ def main():
     # ------------------------------------------------ 16. multi-degree rotation recovery (#19) #
     print("\n[16] real L-fiducial: register_scan + marker-free multi-degree rotation (#19)")
     try:
-        _lpath = HERE / "tests" / "fixtures" / "registration" / "072026_UVPFLM_D100D50.dxf"
-        ck.check(hashlib.sha256(_lpath.read_bytes()).hexdigest()
+        _lpath = _resolve_dxf("072026_UVPFLM_D100D50.dxf", "registration")
+        print(f"    registration source (read-only): {_lpath}")
+        ck.check(_canonical_dxf_sha256(_lpath)
                  == "2c1c655ee9ab507a76386782eee88489e75e9d412663bd1631ea349f40aaf4ae",
-                 "#19: real L-marker fixture SHA-256 is unchanged")
+                 "#19: real L-marker content is unchanged (LF/CRLF equivalent)")
         _lt = read_design(_lpath).cells[0]
         ck.check(_lt.marker_shape == "L" and _lt.marker_polygon_um is not None,
                  "#19: rotation fixture contains the real asymmetric L fiducial")
