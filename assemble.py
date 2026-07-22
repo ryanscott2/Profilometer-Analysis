@@ -118,20 +118,37 @@ def _estimate_step(tiles, ys, xs, tile_hw, ds=4):
     th, tw = tile_hw
     tol = max(3 * ds, 8)                                 # group near-identical shifts; keeps pin-pitch aliases apart
     dxs, dys = [], []
-    for (y, x) in [(y, x) for y in ys for x in xs[:-1] if (y, x) in tiles and (y, x + 1) in tiles]:
+    xpairs = [(y, x) for y in ys for x in xs[:-1] if (y, x) in tiles and (y, x + 1) in tiles]
+    ypairs = [(y, x) for y in ys[:-1] for x in xs if (y, x) in tiles and (y + 1, x) in tiles]
+    edge = 0                                             # pairs whose best shift pinned at the 50% edge
+    for (y, x) in xpairs:
         A = _feat(tiles[(y, x)])[::ds, ::ds]; B = _feat(tiles[(y, x + 1)])[::ds, ::ds]
-        W = A.shape[1]
-        d, _p, ncc = _best_shift(A, B, range(int(0.5 * W), int(0.98 * W)), "x")
+        W = A.shape[1]; lo = int(0.5 * W)
+        d, _p, ncc = _best_shift(A, B, range(lo, int(0.98 * W)), "x")
         if ncc > 0.3:
-            dxs.append(d * ds)
-    for (y, x) in [(y, x) for y in ys[:-1] for x in xs if (y, x) in tiles and (y + 1, x) in tiles]:
+            if d > lo:
+                dxs.append(d * ds)
+            else:                                        # peak pinned at the 50%-overlap search limit
+                edge += 1
+    for (y, x) in ypairs:
         A = _feat(tiles[(y, x)])[::ds, ::ds]; B = _feat(tiles[(y + 1, x)])[::ds, ::ds]
-        H = A.shape[0]
-        d, _p, ncc = _best_shift(A, B, range(int(0.5 * H), int(0.98 * H)), "y")
+        H = A.shape[0]; lo = int(0.5 * H)
+        d, _p, ncc = _best_shift(A, B, range(lo, int(0.98 * H)), "y")
         if ncc > 0.3:
-            dys.append(d * ds)
-    step_col = _dominant(dxs, tol) or tw
-    step_row = _dominant(dys, tol) or th
+            if d > lo:
+                dys.append(d * ds)
+            else:
+                edge += 1
+    if edge:                                             # true overlap likely exceeds the 50% window
+        print(f"WARNING: {edge} tile pair(s) correlated best at the 50%-overlap search limit -> the "
+              f"true overlap may exceed 50% (the step search covers only ~2-50% overlap); those "
+              f"pairs are ignored. If assembly then fails, pass explicit step_col/step_row.")
+    # Return None (NOT the tile size) when adjacent pairs exist on an axis but NONE yielded a usable
+    # shift: the caller must fail closed rather than silently assemble at 0% overlap (which mis-places
+    # every tile). Fall back to the tile size only when there are no adjacent pairs at all (single
+    # row/column -- that axis has no overlap to measure).
+    step_col = (_dominant(dxs, tol) if xpairs else tw)
+    step_row = (_dominant(dys, tol) if ypairs else th)
     return step_col, step_row
 
 
@@ -173,11 +190,29 @@ def assemble_tiles(vk4_dir, step_col=None, step_row=None, verbose=True) -> Assem
         if (vk.intensity is not None) != has_int0:
             raise ValueError(f"tile Y{y}_X{x} intensity presence differs from the first tile; "
                              f"cannot assemble")
+        if has_int0 and (vk.intensity.shape != (th, tw)
+                         or vk.intensity.dtype != vk0.intensity.dtype):
+            raise ValueError(f"tile Y{y}_X{x} intensity {vk.intensity.shape}/{vk.intensity.dtype} "
+                             f"!= expected {(th, tw)}/{vk0.intensity.dtype} (must match the height "
+                             f"raster); cannot assemble")
 
     if step_col is None or step_row is None:
         sc, sr = _estimate_step(tiles, ys, xs, (th, tw))
-        step_col = step_col or sc
-        step_row = step_row or sr
+        if step_col is None:
+            if sc is None:
+                raise ValueError(
+                    "tile-step estimation failed on the column (x) axis: adjacent tiles exist but "
+                    "none exceeded the correlation gate (NCC>0.3). Refusing to assume 0% overlap "
+                    "(= full tile width), which would misplace every tile and silently corrupt all "
+                    "downstream coordinates. Pass an explicit step_col, or check tile overlap/order.")
+            step_col = sc
+        if step_row is None:
+            if sr is None:
+                raise ValueError(
+                    "tile-step estimation failed on the row (y) axis: adjacent tiles exist but none "
+                    "exceeded the correlation gate (NCC>0.3). Refusing to assume 0% overlap (= full "
+                    "tile height). Pass an explicit step_row, or check tile overlap/order.")
+            step_row = sr
     if verbose:
         print(f"assembling {len(tiles)} tiles ({len(ys)}Y x {len(xs)}X), "
               f"tile {tw}x{th}px, step ({step_col},{step_row})px  "
@@ -187,7 +222,7 @@ def assemble_tiles(vk4_dir, step_col=None, step_row=None, verbose=True) -> Assem
     H = (max(ys) - min(ys)) * step_row + th
     height = np.zeros((H, W), np.uint32)
     has_int = vk0.intensity is not None
-    inten = np.zeros((H, W), np.uint16) if has_int else None
+    inten = np.zeros((H, W), vk0.intensity.dtype) if has_int else None  # carry full precision (not uint16)
     for (y, x), vk in tiles.items():           # stamp each tile's raw height (no Z normalisation)
         r0 = (y - min(ys)) * step_row
         c0 = (x - min(xs)) * step_col

@@ -115,7 +115,7 @@ def save_provenance(figures_dir, vk4_dir, dxf_path, cell_csv):
     print(f"Wrote provenance (cell_params/radial_sets + run_manifest.json) -> {figures_dir}")
 
 
-def clear_output_dir(out_dir):
+def clear_output_dir(out_dir, protect=()):
     """Delete everything under ``out_dir`` so each run starts from a clean Results folder.
 
     Without this, stale artifacts from a previous run linger next to the new ones — e.g. per-cell
@@ -136,8 +136,20 @@ def clear_output_dir(out_dir):
             or resolved == Path.cwd().resolve() or resolved == resolved.anchor):
         raise SystemExit(f"refusing to clear unsafe output dir {resolved} (must be a dedicated "
                          f"results subfolder, not '.', a drive root, or a code/parent directory)")
+    # Also refuse if out_dir IS, or CONTAINS, any input directory (VK4 tiles / DXF / cell CSV):
+    # clearing recursively deletes every child, so a mistaken out_dir pointed at the VK4 folder would
+    # erase the irreplaceable raw source scans. The guard above only covers the code/CWD/root dirs.
+    for src in protect:
+        if not src:
+            continue
+        sp = Path(src).resolve()
+        if resolved == sp or resolved in sp.parents:
+            raise SystemExit(f"refusing to clear output dir {resolved}: it is or contains an input "
+                             f"directory ({sp}). Clearing would delete the raw source scans / DXF / "
+                             f"CSV. Use a dedicated output folder separate from the inputs.")
     if not out_dir.exists():
         return
+    failed = []
     for child in out_dir.iterdir():
         try:
             if child.is_dir():
@@ -145,7 +157,13 @@ def clear_output_dir(out_dir):
             else:
                 child.unlink()
         except OSError as e:                             # e.g. a figure open in a viewer on Windows
-            print(f"WARNING: could not remove {child}: {e}")
+            failed.append(f"{child}: {e}")
+    if failed:                                           # fail closed: a PARTIAL clear must not look
+        raise SystemExit(                                # like success -- stale files would mix into
+            "could not clear the output directory before this run (files locked / open in a viewer?):"
+            + "".join(f"\n  {m}" for m in failed)        # this run's figures/ and the export zip.
+            + "\nClose anything viewing those files and re-run -- refusing to write this run on top "
+              "of a half-cleared directory.")
     print(f"Cleared previous outputs in {out_dir}")
 
 
@@ -183,15 +201,15 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
     print(f"  {'design(r,c)':>11} {'CSV label':>10} {'mark x_mm':>10} {'y_mm':>7} {'rot deg':>8} {'reg':>5}")
     for p in sorted(placements, key=lambda q: (q.cell_row, q.cell_col)):
         pr = params.get((p.cell_row, p.cell_col))
-        note = ("  <-- low reg" if p.score < 0.5 else
-                "  (grid-infill)" if p.method == "grid-infill" else "")
+        note = "  <-- low reg" if p.score < 0.5 else ""    # (no cell ever has method 'grid-infill')
         print(f"  {f'({p.cell_row},{p.cell_col})':>11} {(pr.label if pr else '-'):>10} "
               f"{p.origin_col * scan.x_um_per_px / 1000:>10.2f} "
               f"{p.origin_row * scan.y_um_per_px / 1000:>7.2f} "
               f"{p.rotation_deg:>+8.2f} {p.score:>5.2f}{note}")
 
     out_dir = Path(out_dir)
-    clear_output_dir(out_dir)                # wipe prior outputs before writing this run's results
+    # wipe prior outputs before writing this run's results -- but never a dir that holds an input
+    clear_output_dir(out_dir, protect=(vk4_dir, Path(dxf_path).parent, Path(cell_csv).parent))
     qc_dir = out_dir / "legacy" / "qc"       # created on demand by extract only when make_qc=True
     (out_dir / "figures").mkdir(parents=True, exist_ok=True)
     (out_dir / "legacy").mkdir(parents=True, exist_ok=True)

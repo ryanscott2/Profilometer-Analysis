@@ -120,6 +120,16 @@ def read_vk4(path: str | Path, *, load_intensity: bool = True) -> VK4:
     x_pm = u32(setting + _MC_X_PER_PIXEL * 4)
     y_pm = u32(setting + _MC_Y_PER_PIXEL * 4)
     z_pm = u32(setting + _MC_Z_PER_DIGIT * 4)
+    # Sanity-check the calibration factors (picometres). A shifted / foreign setting-block layout can
+    # land these on a reserved 0 or the wrong field, which would silently emit 0 or mis-scaled heights
+    # (every reported depth then wrong, with no error). Plausible bands: x/y 0.001-100 um/px, z 1 pm
+    # - 1 um/digit. Fail loudly on an unrecognised layout rather than trust a bad scale.
+    for _nm, _v, _lo, _hi in (("x_per_pixel", x_pm, 1e3, 1e8), ("y_per_pixel", y_pm, 1e3, 1e8),
+                              ("z_per_digit", z_pm, 1, 1e6)):
+        if not (_lo <= _v <= _hi):
+            raise ValueError(f"{path}: implausible {_nm} = {_v} pm (expected {_lo:g}-{_hi:g} pm); "
+                             f"the VK4 setting-block layout may be unrecognised -- refusing to emit "
+                             f"a mis-scaled height field.")
     dt = tuple(u32(setting + (_MC_YEAR + i) * 4) for i in range(6))  # Y,M,D,h,m,s
 
     def read_block(block_off: int) -> tuple[np.ndarray, int, int, int, int, int]:
@@ -154,7 +164,9 @@ def read_vk4(path: str | Path, *, load_intensity: bool = True) -> VK4:
     if load_intensity and light_off:
         try:
             intensity = read_block(light_off)[0].copy()
-        except ValueError:
+        except ValueError as e:                          # present but unparseable (e.g. compressed):
+            print(f"WARNING: {path}: intensity block present (light_off={light_off}) but unreadable "
+                  f"({e}); continuing without an intensity channel.")   # surface it, don't fail the read
             intensity = None  # intensity is optional; never fail the whole read
 
     return VK4(

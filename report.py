@@ -319,6 +319,15 @@ def print_diameter_calibration(df, out_dir):
         s = series.dropna()
         return s.iloc[0] if len(s) else default
 
+    def invert(target, a, b, ref):
+        """measured = a*drawn + b  ->  drawn = (target-b)/a. A near-flat slope (|a|~0) or a result far
+        outside the drawn range makes "draw X" meaningless -> NaN, so an absurd actionable value
+        (e.g. a=0.01 -> 'draw 500 µm') is never printed. ``ref`` = the largest drawn Ø in the band."""
+        if not (np.isfinite(a) and np.isfinite(b)) or abs(a) < 1e-3:
+            return float("nan")
+        x = (target - b) / a
+        return x if (np.isfinite(x) and 0.0 < x < 3.0 * ref) else float("nan")
+
     for band in sorted(dfd.band.dropna().unique()):
         gband = dfd[dfd.band == band]                    # every nominal Ø drawn in this band
         g = d[d.band == band]                            # reliable+plausible subset for the fit
@@ -326,21 +335,24 @@ def print_diameter_calibration(df, out_dir):
         pitch = _first(gband.nominal_pitch_um)
         seg = [f"band {band} (pitch {pitch:g}, target Ø {tgt:g} µm, n={len(g)}):"]
         nominal_ds = sorted(gband.drawn_diameter_um.unique())
+        ref = max(nominal_ds) if nominal_ds else tgt      # sane upper bound for an inverted "draw X"
         for col, nm in [("top_diameter_um", "TOP"), ("diameter_um", "MID")]:
             fb = fit(g, col)
             if fb:
                 a, b = fb
-                draw = (tgt - b) / a if a else float("nan")
-                seg.append(f"    {nm}: measured = {a:.3f}*drawn {b:+.1f}  "
-                           f"->  draw {draw:6.1f} µm to get {tgt:g} µm {nm.lower()}-Ø")
+                draw = invert(tgt, a, b, ref)
+                dtxt = (f"draw {draw:6.1f} µm to get {tgt:g} µm {nm.lower()}-Ø" if np.isfinite(draw)
+                        else f"slope {a:.3g} too flat to invert to {tgt:g} µm {nm.lower()}-Ø")
+                seg.append(f"    {nm}: measured = {a:.3f}*drawn {b:+.1f}  ->  {dtxt}")
             else:
                 seg.append(f"    {nm}: (need >=2 reliable drawn diameters to fit a line)")
             for D in nominal_ds:                         # one result per nominal diameter
                 gd = g[np.isclose(g.drawn_diameter_um, D)]
                 meas = (f"measured {gd[col].median():6.1f} µm (n={len(gd)})" if len(gd)
                         else "no reliable measurement")
-                inv = (f"  ->  draw {(D - fb[1]) / fb[0]:6.1f} µm to get {D:g} µm {nm.lower()}-Ø"
-                       if fb and fb[0] else "")
+                di = invert(D, fb[0], fb[1], ref) if fb else float("nan")
+                inv = (f"  ->  draw {di:6.1f} µm to get {D:g} µm {nm.lower()}-Ø"
+                       if np.isfinite(di) else "")
                 seg.append(f"        drawn {D:6.1f} µm: {meas}{inv}")
         lines.append("\n".join(seg))
     if d.drawn_diameter_um.nunique() >= 2:
@@ -421,7 +433,17 @@ def make_diameter_model(df, out_dir):
             continue
         beta, ci, r2, adj, n, p, pvals = _ols_fit(X, y)
         pred = X @ beta
-        lines.append(f"band {band} (pitch {pitch:g} µm, n={n}):  R² = {r2:.3f}   adj-R² = {adj:.3f}")
+        lines.append(f"band {band} (pitch {pitch:g} µm, n={n}, df_resid={n - p}):  "
+                     f"R² = {r2:.3f}   adj-R² = {adj:.3f}")
+        cond = float(np.linalg.cond(X)) if X.shape[1] > 1 else 1.0
+        if cond > 1e8:            # near-collinear design (e.g. speed co-swept with passes)
+            lines.append(f"    WARNING: design condition number {cond:.1e} — predictors are nearly "
+                         f"collinear; the per-term coefficients below are NOT individually reliable "
+                         f"(their combination still fits; don't read dØ/d passes vs dØ/d speed apart).")
+        if n - p < 5:             # too few residual DOF -> R² is structurally optimistic
+            lines.append(f"    WARNING: only {n - p} residual DOF (n={n}, p={p}); the R² above is "
+                         f"optimistically inflated — treat this band as underpowered (lean on adj-R² "
+                         f"and the 95% CIs, not R²).")
         for nm, b_, (lo, hi), pv in zip(names, beta, ci, pvals):
             lines.append(f"    {nm:>22} = {b_:+9.3f}   [95% CI {lo:+.3f}, {hi:+.3f}]   p={pv:.2g}")
         lines.append("")
