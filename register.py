@@ -247,11 +247,11 @@ def rasterize_cell_pins(cell, x_um_per_px, y_um_per_px, shape, origin,
     return mask
 
 
-def _cell_pin_extent_px(cell, xppx, yppx):
-    """Pin extent (col_min, col_max, row_min, row_max) from the marker origin, in px."""
+def _cell_pin_extent_um(cell):
+    """Pin-centre extent from the marker origin in physical coordinates (um)."""
     xs = np.concatenate([a.centers_um[:, 0] for a in cell.arrays])
     ys = np.concatenate([a.centers_um[:, 1] for a in cell.arrays])
-    return (xs.min() / xppx, xs.max() / xppx, ys.min() / yppx, ys.max() / yppx)
+    return xs.min(), xs.max(), ys.min(), ys.max()
 
 
 def _overlap_score(win_bool, design_bool):
@@ -275,15 +275,20 @@ def _refine_origin(pin_mask, cell, origin, xppx, yppx, y_up, x_right=1, rot_deg=
     """
     if not cell.arrays:                         # degenerate template: nothing to refine on
         return origin, float("nan")
-    cxmin, cxmax, cymin, cymax = _cell_pin_extent_px(cell, xppx, yppx)
+    xmin, xmax, ymin, ymax = _cell_pin_extent_um(cell)
     oc, orow = origin
     th = np.deg2rad(rot_deg); cth, sth = np.cos(th), np.sin(th)
     rr_v, cc_v = [], []                         # tight window around the footprint corners
-    for cx in (cxmin, cxmax):
-        for cy in (cymin, cymax):
-            col_rel, row_rel = x_right * cx, y_up * cy
-            cc_v.append(oc + cth * col_rel - sth * row_rel)
-            rr_v.append(orow + sth * col_rel + cth * row_rel)
+    for x_um in (xmin, xmax):
+        for y_um in (ymin, ymax):
+            # Rotate in physical space, exactly as dxf_to_px/rasterize_cell_pins do, and only
+            # then convert each axis to pixels. Rotating already-scaled pixel coordinates is
+            # geometrically wrong whenever x/y pixel sizes differ.
+            x_rel, y_rel = x_right * x_um, y_up * y_um
+            x_rot = cth * x_rel - sth * y_rel
+            y_rot = sth * x_rel + cth * y_rel
+            cc_v.append(oc + x_rot / xppx)
+            rr_v.append(orow + y_rot / yppx)
     r_lo, r_hi = int(min(rr_v) - search_px), int(max(rr_v) + search_px + 1)
     c_lo, c_hi = int(min(cc_v) - search_px), int(max(cc_v) + search_px + 1)
     r0, r1 = max(0, r_lo), min(pin_mask.shape[0], r_hi)
@@ -1405,8 +1410,21 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
                     c[2] + (0.5 * c[3] if template.marker_shape == "L" else 0.0)
                     for c in fam]))
             dedup = max(families, key=lambda fam: (len(fam), _family_evidence(fam)))
-        kept = [CellPlacement(0, c[0], c[1], xppx, yppx, y_up=y_up, x_right=x_right,
-                              rotation_deg=rot, score=c[2], method="marker") for c in dedup]
+        # One-dimensional layouts used to return the marker candidates directly. That skipped
+        # the same de-alias, in-bounds, overlap, and ablation-contrast gates used for 2-D scans.
+        # Run every surviving anchor through the shared probe so single rows/columns cannot admit
+        # a periodic false lock or a flat/unablated apparent marker.
+        kept = _dedup_cells(
+            _probe_lattice(
+                [(c[0], c[1]) for c in dedup], template, amask, z0, valid,
+                xppx, yppx, y_up, x_right, rot, probe_shift, W, H,
+                min_overlap, min_inbounds, min_contrast_um,
+                dealias_tpl=_pitch_reps(template),
+            ),
+            min_sep,
+        )
+        if not kept:
+            return _fallback("one-dimensional marker anchors failed the cell-quality gates")
         _assign_grid_indices(kept, cell_w, cell_h)
         kept.sort(key=lambda p: (p.cell_row, p.cell_col))
         for i, p in enumerate(kept, 1):

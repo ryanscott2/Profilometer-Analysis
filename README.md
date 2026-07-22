@@ -53,7 +53,7 @@ cells. The driver stitches the tiles into one scan (`assemble.py`), finds every 
 
 ```bash
 # 1. DXF/*.dxf present; drop the tile raster in VK4/ (…_Y1_X1.vk4 …)
-python run_sample.py                    # -> Results/measurements.csv, cell_overview.png, plots
+python run_sample.py                    # -> Results/direct/{figures,legacy,...}
 # then fill CSV/cell_params.csv (a P{passes}_S{speed} grid, DXF orientation) and re-run for the
 # laser-parameter plots; or: python run_sample.py <vk4_dir> <out_dir> [<dxf>] [<cell_csv>]
 ```
@@ -78,7 +78,7 @@ python synth.py                        # writes Results/synth_preview.png
 | `DXF/` | the fabrication DXF (one unit cell, or a larger tiled design) |
 | `VK4/` | Keyence profilometer scans (`*.vk4`) |
 | `CSV/` | `cell_params.csv` (per-cell laser settings) + `radial_sets.csv` (radial overlays) |
-| `Results/` | analysis outputs. The UI writes each run under `Results/<sample name>/` (the sample selected in the UI; a sample must be selected to run); a direct `run_sample.py` writes to whatever `out_dir` you pass |
+| `Results/` | analysis outputs. Every run uses a dedicated `Results/<dataset name>/` child; direct runs default to `Results/direct/` |
 
 ## Laser parameters CSV (`cell_params.csv`)
 
@@ -117,17 +117,15 @@ low-level single-cell primitive used by `selftest.py`.)
 ## Outputs (`Results/<dataset name>/`)
 
 The UI writes each run under `Results/<sample name>/` — named after the sample selected in the UI
-(a sample must be selected to run) — so different datasets keep separate result sets. (A direct
-`python run_sample.py <vk4_dir> <out_dir> …` writes to `out_dir` as given.) The paths below are
-relative to that per-run output root.
+(a sample must be selected to run) — so different datasets keep separate result sets. A direct run
+defaults to `Results/direct/`; an explicit output must still be a dedicated child of this
+repository's `Results/` root. The paths below are relative to that per-run output root.
 
-> **Each run first clears its output folder.** Every file and folder under the run's output root
-> is deleted before the new figures are written, so stale artifacts from a prior run of the *same*
-> dataset (per-cell reports, radial-overlay sets keyed by cell position / set name) never linger.
-> Only that dataset's folder is touched — other datasets are left intact. The wipe happens only
-> *after* registration succeeds — a run that fails before producing anything leaves the previous
-> results intact — and it also drops `figures/vk4_source.zip`, so the source archive is rebuilt
-> each run.
+> **Each run is transactional.** New artifacts are written to an owned hidden staging sibling and
+> validated before the completed directory atomically replaces the prior result. A failed run
+> leaves the last completed result intact. Replacement is restricted to a dedicated child of
+> `Results/`; arbitrary, unowned, root, or input-overlapping directories are refused. An internal
+> `.pflm-results.json` sentinel records ownership so recursive cleanup cannot target user data.
 
 Clean outputs live under `figures/`; the v1 plot set, `measurements.csv` and per-array QC live under
 `legacy/`.
@@ -161,7 +159,7 @@ each sample's `legacy/measurements.csv`.
 python calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
                           [--results Results] [--out "Results/etch depth"] \
                           [--bands band_defs.csv] [--cell-filters cells.json] \
-                          [--max-debris 0.6] [--drop-shallow]
+                          [--max-debris 0.6] [--drop-shallow] [--allow-legacy-qc]
 ```
 
 - **Discovers** the samples (folders under `Results/` with a `legacy/measurements.csv`), injects a
@@ -174,22 +172,29 @@ python calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
   `depth_calibration.txt` for provenance. A sample whose CSV lacks a `cell_id` column is skipped
   (fail-closed) rather than pooled unfiltered.
 - **Gates** for a trustworthy depth read (`reliable`, finite depth, a stricter debris cut) and
-  prints the retained/total counts and *why* rows dropped. `shallow` (<3 µm) points are kept by
-  default — they anchor the low-dose rise — but `--drop-shallow` removes them.
+  prints the retained/total counts and *why* rows dropped. Missing `reliable` or
+  `debris_fraction` fields fail closed. `--allow-legacy-qc` is an explicit unsafe compatibility
+  override for manually reviewed older CSVs. `shallow` (<3 µm) points are kept by default — they
+  anchor the low-dose rise — but `--drop-shallow` removes them.
 - **Bands** — `--bands` names a file whose every row is one band, `min_Ø, max_Ø, pitch` (µm): the
   first two numbers are the drawn-diameter range the band covers, the third its centre-to-centre
   pitch. A pooled row joins a band only if **both** its drawn Ø is in range (ends inclusive) **and**
   its pitch matches the band's declared pitch (strict, within ±1 µm); rows matching no band —
   Ø out of range, mismatched pitch, or missing pitch — are dropped and reported. Omitting `--bands`
-  falls back to the measurements' own `band` column.
+  falls back to the measurements' own `band` **plus nominal pitch**, so a local `band 1` from a
+  D50/P100 design cannot alias a `band 1` from a D300/P350 design.
+- **Collapses technical replicates** to one median observation per sample/cell/band before fitting;
+  arrays sharing a cell exposure are not counted as independent trials.
 - **Fits per band** (never pooling across pitch/diameter families): a saturating NLS
   `depth = a·(1−e^{−k·dose})`, a log-dose OLS (+ drawn-Ø covariate), and a passes×speed interaction
-  OLS — all reported with R²/adj-R²/95% CI/p, and a **recommended** form chosen per band.
+  OLS — all reported with R²/adj-R²/AICc/95% CI/p. The **recommended** form has the lowest
+  small-sample AICc among fits with meaningful predictive signal (R²/adj-R² at least 0.10);
+  otherwise inverse recommendations are suppressed.
 - **Pools CIs across samples** with a `sample` random-intercept MixedLM (falls back to a sample
   fixed factor if it won't converge), and prints a `sample × dose` coverage table so sample↔dose
   confounding is visible.
 - **Writes** to `Results/etch depth/`: `depth_calibration.txt` (fits, pooled model,
-  coverage, per-target inversion with a prediction interval, and the extrapolation box),
+  coverage, per-target inversion with an inverse-mean confidence interval, and the extrapolation box),
   `depth_vs_dose.png`, `depth_parity.png`, and `depth_heatmap.png` (passes×speed predicted-depth
   heatmap with the target-depth contour — read off which (P, S) hits the target).
 

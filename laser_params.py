@@ -12,6 +12,7 @@ not as the raw profilometer image looks. No header, no index columns, no other l
 from __future__ import annotations
 
 import csv
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,15 +31,21 @@ class CellParams:
         return self.passes and self.passes > 0 and self.speed and self.speed > 0
 
 
-_PXSY_RE = re.compile(r"P\s*([\d.]+)\s*_?\s*S\s*([\d.]+)", re.IGNORECASE)
+_POSITIVE_NUMBER = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+_PXSY_RE = re.compile(
+    rf"P\s*(\d+)\s*_?\s*S\s*({_POSITIVE_NUMBER})", re.IGNORECASE)
 
 
 def parse_pxsy(text):
     """Parse a 'P{passes}_S{speed}' label -> (passes:int, speed:float, label:str) or None."""
-    m = _PXSY_RE.search(str(text))
+    label = str(text).strip()
+    m = _PXSY_RE.fullmatch(label)
     if not m:
         return None
-    return int(float(m.group(1))), float(m.group(2)), str(text).strip()
+    passes, speed = int(m.group(1)), float(m.group(2))
+    if passes <= 0 or not math.isfinite(speed) or speed <= 0:
+        return None
+    return passes, speed, label
 
 
 def load_cell_params(csv_path) -> dict:
@@ -58,7 +65,12 @@ def load_cell_params(csv_path) -> dict:
     with p.open(newline="", encoding="utf-8-sig") as fh:
         for r_idx, row in enumerate(csv.reader(fh), start=1):
             for c_idx, val in enumerate(row, start=1):
-                parsed = parse_pxsy(val) if str(val).strip() else None
-                if parsed:
-                    out[(r_idx, c_idx)] = CellParams(parsed[0], parsed[1], parsed[2])
+                if not str(val).strip():
+                    continue
+                parsed = parse_pxsy(val)
+                if not parsed:
+                    raise ValueError(
+                        f"{p}: invalid laser label at row {r_idx}, column {c_idx}: {val!r}; "
+                        "expected P{positive integer passes}_S{positive finite speed}")
+                out[(r_idx, c_idx)] = CellParams(parsed[0], parsed[1], parsed[2])
     return out

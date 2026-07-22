@@ -38,6 +38,8 @@ class AssembledScan:
     grid_rows: int              # number of tile rows (Y)
     grid_cols: int              # number of tile cols (X)
     tile_shape: tuple           # (h, w) of one tile
+    step_col_row: int = 0       # row drift when advancing one tile column
+    step_row_col: int = 0       # column drift when advancing one tile row
     y_indices: tuple = ()       # sorted Y indices present
     x_indices: tuple = ()       # sorted X indices present
 
@@ -92,24 +94,31 @@ def _best_shift(A, B, drange, axis, perp=30):
     return best
 
 
-def _dominant(shifts, tol):
-    """The step the plurality of pairs agree on: the median of the LARGEST cluster of values within
-    ``tol`` px. Robust to periodic-pin aliasing -- an NCC over a regular pin lattice can lock one
-    pin pitch off on *some* adjacent pairs, but those aliased shifts are inconsistent while the true
-    (fixed-raster) step recurs across pairs, so the dominant cluster is the true step. Returns None
-    for no input."""
-    if not shifts:
+def _dominant_vector(vectors, tol):
+    """Consensus 2-D tile-origin vector, or ``None`` when adjacent pairs do not agree.
+
+    Both the primary step and perpendicular stage drift matter.  A majority cluster is required so
+    a periodic texture cannot win by an arbitrary plurality, and the component-wise median keeps a
+    single noisy pair from skewing the mosaic.
+    """
+    if not vectors:
         return None
-    best = []
-    for s in shifts:
-        c = [t for t in shifts if abs(t - s) <= tol]
-        if len(c) > len(best):
+    best, best_resid = [], float("inf")
+    for s in vectors:
+        c = [t for t in vectors if np.hypot(t[0] - s[0], t[1] - s[1]) <= tol]
+        centre = np.median(np.asarray(c, float), axis=0)
+        resid = float(np.mean([np.hypot(t[0] - centre[0], t[1] - centre[1]) for t in c]))
+        if len(c) > len(best) or (len(c) == len(best) and resid < best_resid):
             best = c
-    return int(round(np.median(best)))
+            best_resid = resid
+    if len(best) < (len(vectors) // 2 + 1 if len(vectors) > 1 else 1):
+        return None
+    centre = np.median(np.asarray(best, float), axis=0)
+    return int(round(centre[0])), int(round(centre[1]))
 
 
 def _estimate_step(tiles, ys, xs, tile_hw, ds=4):
-    """Global tile step (step_col, step_row) in px, from the CONSENSUS of EVERY adjacent pair.
+    """Global 2-D column/row step vectors from the consensus of every adjacent pair.
 
     Using all pairs + a dominant-cluster vote (not a few-pair plain median) is what makes this
     alias-safe on periodic-pin samples: the earlier code sampled ~6 pairs and took the median, so
@@ -117,26 +126,26 @@ def _estimate_step(tiles, ys, xs, tile_hw, ds=4):
     median could land on the aliased step and compress the whole mosaic (cells then overlap)."""
     th, tw = tile_hw
     tol = max(3 * ds, 8)                                 # group near-identical shifts; keeps pin-pitch aliases apart
-    dxs, dys = [], []
+    col_vectors, row_vectors = [], []
     xpairs = [(y, x) for y in ys for x in xs[:-1] if (y, x) in tiles and (y, x + 1) in tiles]
     ypairs = [(y, x) for y in ys[:-1] for x in xs if (y, x) in tiles and (y + 1, x) in tiles]
     edge = 0                                             # pairs whose best shift pinned at the 50% edge
     for (y, x) in xpairs:
         A = _feat(tiles[(y, x)])[::ds, ::ds]; B = _feat(tiles[(y, x + 1)])[::ds, ::ds]
         W = A.shape[1]; lo = int(0.5 * W)
-        d, _p, ncc = _best_shift(A, B, range(lo, int(0.98 * W)), "x")
+        d, p, ncc = _best_shift(A, B, range(lo, int(0.98 * W)), "x")
         if ncc > 0.3:
             if d > lo:
-                dxs.append(d * ds)
+                col_vectors.append((d * ds, p * ds))
             else:                                        # peak pinned at the 50%-overlap search limit
                 edge += 1
     for (y, x) in ypairs:
         A = _feat(tiles[(y, x)])[::ds, ::ds]; B = _feat(tiles[(y + 1, x)])[::ds, ::ds]
         H = A.shape[0]; lo = int(0.5 * H)
-        d, _p, ncc = _best_shift(A, B, range(lo, int(0.98 * H)), "y")
+        d, p, ncc = _best_shift(A, B, range(lo, int(0.98 * H)), "y")
         if ncc > 0.3:
             if d > lo:
-                dys.append(d * ds)
+                row_vectors.append((p * ds, d * ds))
             else:
                 edge += 1
     if edge:                                             # true overlap likely exceeds the 50% window
@@ -147,17 +156,18 @@ def _estimate_step(tiles, ys, xs, tile_hw, ds=4):
     # shift: the caller must fail closed rather than silently assemble at 0% overlap (which mis-places
     # every tile). Fall back to the tile size only when there are no adjacent pairs at all (single
     # row/column -- that axis has no overlap to measure).
-    step_col = (_dominant(dxs, tol) if xpairs else tw)
-    step_row = (_dominant(dys, tol) if ypairs else th)
-    return step_col, step_row
+    col_step = (_dominant_vector(col_vectors, tol) if xpairs else (tw, 0))
+    row_step = (_dominant_vector(row_vectors, tol) if ypairs else (0, th))
+    return col_step, row_step
 
 
 # --------------------------------------------------------------- assembly #
 def assemble_tiles(vk4_dir, step_col=None, step_row=None, verbose=True) -> AssembledScan:
     """Stitch every ``_Y*_X*.vk4`` tile in ``vk4_dir`` into one :class:`AssembledScan`.
 
-    Tile (Y,X) is placed with its top-left at ((X-Xmin)*step_col, (Y-Ymin)*step_row); in
-    overlaps, valid pixels of later-placed tiles win. Step defaults to a measured estimate.
+    Tile origins follow two measured 2-D vectors (advance one tile column / one tile row), preserving
+    consistent cross-axis stage drift instead of forcing the mosaic onto an axis-aligned grid. In
+    overlaps, valid pixels of later-placed tiles win. Primary steps may be overridden explicitly.
 
     Heights are stamped RAW -- no tile-to-tile Z normalisation. A sample scanned with consistent
     microscope settings shares one Z reference across its tiles, so reconciling per-tile offsets
@@ -165,10 +175,17 @@ def assemble_tiles(vk4_dir, step_col=None, step_row=None, verbose=True) -> Assem
     """
     vk4_dir = Path(vk4_dir)
     tiles = {}
+    sources = {}
     for f in sorted(vk4_dir.glob("*.vk4")):
         m = _TILE_RE.search(f.name)
         if m:
-            tiles[(int(m.group(1)), int(m.group(2)))] = read_vk4(f)
+            key = (int(m.group(1)), int(m.group(2)))
+            if key in sources:
+                raise ValueError(
+                    f"duplicate tile coordinates Y{key[0]} X{key[1]}: "
+                    f"'{sources[key].name}' and '{f.name}'")
+            sources[key] = f
+            tiles[key] = read_vk4(f)
     if not tiles:
         raise SystemExit(f"No '_Y*_X*.vk4' tiles found in {vk4_dir}")
 
@@ -197,35 +214,48 @@ def assemble_tiles(vk4_dir, step_col=None, step_row=None, verbose=True) -> Assem
                              f"raster); cannot assemble")
 
     if step_col is None or step_row is None:
-        sc, sr = _estimate_step(tiles, ys, xs, (th, tw))
+        col_est, row_est = _estimate_step(tiles, ys, xs, (th, tw))
         if step_col is None:
-            if sc is None:
+            if col_est is None:
                 raise ValueError(
                     "tile-step estimation failed on the column (x) axis: adjacent tiles exist but "
                     "none exceeded the correlation gate (NCC>0.3). Refusing to assume 0% overlap "
                     "(= full tile width), which would misplace every tile and silently corrupt all "
                     "downstream coordinates. Pass an explicit step_col, or check tile overlap/order.")
-            step_col = sc
+            step_col = col_est[0]
         if step_row is None:
-            if sr is None:
+            if row_est is None:
                 raise ValueError(
                     "tile-step estimation failed on the row (y) axis: adjacent tiles exist but none "
                     "exceeded the correlation gate (NCC>0.3). Refusing to assume 0% overlap (= full "
                     "tile height). Pass an explicit step_row, or check tile overlap/order.")
-            step_row = sr
+            step_row = row_est[1]
+        col_cross = col_est[1] if col_est is not None else 0
+        row_cross = row_est[0] if row_est is not None else 0
+    else:
+        col_cross = row_cross = 0
+    col_step = (int(step_col), int(col_cross))
+    row_step = (int(row_cross), int(step_row))
     if verbose:
         print(f"assembling {len(tiles)} tiles ({len(ys)}Y x {len(xs)}X), "
-              f"tile {tw}x{th}px, step ({step_col},{step_row})px  "
+              f"tile {tw}x{th}px, col-step {col_step}px, row-step {row_step}px  "
               f"overlap ({100*(1-step_col/tw):.0f}%,{100*(1-step_row/th):.0f}%)")
 
-    W = (max(xs) - min(xs)) * step_col + tw
-    H = (max(ys) - min(ys)) * step_row + th
-    height = np.zeros((H, W), np.uint32)
+    raw_origins = {
+        key: ((key[1] - min(xs)) * col_step[0] + (key[0] - min(ys)) * row_step[0],
+              (key[1] - min(xs)) * col_step[1] + (key[0] - min(ys)) * row_step[1])
+        for key in tiles
+    }
+    min_c = min(c for c, _ in raw_origins.values())
+    min_r = min(r for _, r in raw_origins.values())
+    origins = {key: (c - min_c, r - min_r) for key, (c, r) in raw_origins.items()}
+    W = max(c + tw for c, _ in origins.values())
+    H = max(r + th for _, r in origins.values())
+    height = np.zeros((H, W), vk0.height_raw.dtype)
     has_int = vk0.intensity is not None
     inten = np.zeros((H, W), vk0.intensity.dtype) if has_int else None  # carry full precision (not uint16)
     for (y, x), vk in tiles.items():           # stamp each tile's raw height (no Z normalisation)
-        r0 = (y - min(ys)) * step_row
-        c0 = (x - min(xs)) * step_col
+        c0, r0 = origins[(y, x)]
         v = vk.height_raw != 0
         hs = height[r0:r0 + th, c0:c0 + tw]; hs[v] = vk.height_raw[v]
         height[r0:r0 + th, c0:c0 + tw] = hs
@@ -239,6 +269,7 @@ def assemble_tiles(vk4_dir, step_col=None, step_row=None, verbose=True) -> Assem
                          x_um_per_px=xppx, y_um_per_px=yppx, z_um_per_digit=zpd,
                          step_col=step_col, step_row=step_row,
                          grid_rows=len(ys), grid_cols=len(xs), tile_shape=(th, tw),
+                         step_col_row=col_step[1], step_row_col=row_step[0],
                          y_indices=tuple(ys), x_indices=tuple(xs))
 
 

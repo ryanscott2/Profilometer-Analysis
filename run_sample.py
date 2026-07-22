@@ -21,9 +21,11 @@ from __future__ import annotations
 import csv
 import datetime
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import warnings
 import zipfile
 from pathlib import Path
@@ -38,7 +40,7 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 
 sys.path.insert(0, str(Path(__file__).parent))
-from dxf_geometry import read_design
+from dxf_geometry import read_design, validate_equivalent_cells
 from assemble import assemble_tiles
 from register import RegistrationAmbiguityError, register_sample
 from extract import ArraySample, extract_array
@@ -50,6 +52,7 @@ DEF_DXF_DIR = HERE / "DXF"
 DEF_VK4_DIR = HERE / "VK4"
 DEF_CSV_DIR = HERE / "CSV"
 DEF_OUT_DIR = HERE / "Results"
+RESULTS_SENTINEL = ".pflm-results.json"
 
 # Radial-average overlay figures are configured by CSV/radial_sets.csv: each row is one
 # comparison set -- a list of P{passes}_S{speed} labels whose mean-pin radial profiles are
@@ -115,56 +118,114 @@ def save_provenance(figures_dir, vk4_dir, dxf_path, cell_csv):
     print(f"Wrote provenance (cell_params/radial_sets + run_manifest.json) -> {figures_dir}")
 
 
-def clear_output_dir(out_dir, protect=()):
-    """Delete everything under ``out_dir`` so each run starts from a clean Results folder.
+def _sentinel_valid(path, final_dir=None, states=None):
+    try:
+        data = json.loads((Path(path) / RESULTS_SENTINEL).read_text(encoding="utf-8"))
+        if data.get("format") != "PFLM_RESULTS" or data.get("version") != 1:
+            return False
+        if final_dir is not None:
+            recorded = Path(data["final_dir"]).resolve()
+            if recorded != Path(final_dir).resolve():
+                return False
+        if states is not None and data.get("state") not in set(states):
+            return False
+        return True
+    except (OSError, ValueError, AttributeError, KeyError, TypeError):
+        return False
 
-    Without this, stale artifacts from a previous run linger next to the new ones — e.g. per-cell
-    reports (``figures/cells/cell_x*_y*.png``) or radial-overlay sets from a different sample or
-    parameter grid, which are keyed by cell position / set name and are NOT overwritten when the
-    new run has a different layout. Called only after registration succeeds, so a run that fails
-    before producing anything never wipes the prior good results.
 
-    Side effect: this also removes ``figures/vk4_source.zip``, so ``save_source_docs`` rebuilds
-    the source archive every run instead of reusing a current one."""
-    out_dir = Path(out_dir)
-    # Refuse to wipe a dangerous target -- this recursively deletes every child, so an out_dir that
-    # is the code directory, ANY ancestor of it (deleting which would erase the repo/source), the
-    # current working dir, or a filesystem root (e.g. a mistaken CLI `run_sample.py <vk4> .`) must
-    # be rejected. The GUI always passes Results/<sample> (a descendant), so this only guards misuse.
-    resolved, here = out_dir.resolve(), HERE.resolve()
-    if (resolved == here or resolved in here.parents
-            or resolved == Path.cwd().resolve() or resolved == resolved.anchor):
-        raise SystemExit(f"refusing to clear unsafe output dir {resolved} (must be a dedicated "
-                         f"results subfolder, not '.', a drive root, or a code/parent directory)")
-    # Also refuse if out_dir IS, or CONTAINS, any input directory (VK4 tiles / DXF / cell CSV):
-    # clearing recursively deletes every child, so a mistaken out_dir pointed at the VK4 folder would
-    # erase the irreplaceable raw source scans. The guard above only covers the code/CWD/root dirs.
+def _looks_like_legacy_output(path):
+    """Recognise pre-sentinel PFLM results so existing datasets can be migrated safely once."""
+    path = Path(path)
+    return ((path / "legacy" / "measurements.csv").is_file()
+            and (path / "figures").is_dir())
+
+
+def _validate_output_target(out_dir, protect=(), results_root=DEF_OUT_DIR):
+    """Validate a dedicated owned dataset directory and return its resolved path.
+
+    Output is restricted to a strict descendant of ``results_root``. Existing non-empty folders
+    must carry our sentinel or match the pre-sentinel PFLM output structure; arbitrary directories
+    are never recursively cleared or replaced.
+    """
+    resolved = Path(out_dir).resolve()
+    root = Path(results_root).resolve()
+    if resolved == root or root not in resolved.parents:
+        raise SystemExit(
+            f"refusing unsafe output dir {resolved}: choose a dedicated dataset subfolder under "
+            f"{root} (the Results root itself and unrelated directories are never replaced)")
     for src in protect:
         if not src:
             continue
         sp = Path(src).resolve()
-        if resolved == sp or resolved in sp.parents:
-            raise SystemExit(f"refusing to clear output dir {resolved}: it is or contains an input "
-                             f"directory ({sp}). Clearing would delete the raw source scans / DXF / "
-                             f"CSV. Use a dedicated output folder separate from the inputs.")
-    if not out_dir.exists():
-        return
-    failed = []
-    for child in out_dir.iterdir():
-        try:
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-        except OSError as e:                             # e.g. a figure open in a viewer on Windows
-            failed.append(f"{child}: {e}")
-    if failed:                                           # fail closed: a PARTIAL clear must not look
-        raise SystemExit(                                # like success -- stale files would mix into
-            "could not clear the output directory before this run (files locked / open in a viewer?):"
-            + "".join(f"\n  {m}" for m in failed)        # this run's figures/ and the export zip.
-            + "\nClose anything viewing those files and re-run -- refusing to write this run on top "
-              "of a half-cleared directory.")
-    print(f"Cleared previous outputs in {out_dir}")
+        if resolved == sp or resolved in sp.parents or sp in resolved.parents:
+            raise SystemExit(
+                f"refusing output dir {resolved}: it overlaps input path {sp}; keep Results and "
+                "raw VK4/DXF/CSV inputs in separate directories")
+    if resolved.exists() and any(resolved.iterdir()):
+        if not (_sentinel_valid(resolved, resolved, ("complete",))
+                or _looks_like_legacy_output(resolved)):
+            raise SystemExit(
+                f"refusing to replace unowned non-empty directory {resolved}: missing "
+                f"{RESULTS_SENTINEL} and not recognisable as an earlier PFLM result")
+    return resolved
+
+
+def _write_results_sentinel(path, final_dir, state):
+    payload = {"format": "PFLM_RESULTS", "version": 1, "state": state,
+               "final_dir": str(Path(final_dir).resolve())}
+    (Path(path) / RESULTS_SENTINEL).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _prepare_output_transaction(out_dir, protect=(), results_root=DEF_OUT_DIR):
+    """Create an owned hidden staging sibling while leaving the last good result untouched."""
+    final_dir = _validate_output_target(out_dir, protect=protect, results_root=results_root)
+    final_dir.parent.mkdir(parents=True, exist_ok=True)
+    backup = final_dir.parent / f".{final_dir.name}.previous"
+    if backup.exists():
+        if final_dir.exists():
+            if not (_sentinel_valid(backup, final_dir, ("complete",))
+                    or _looks_like_legacy_output(backup)):
+                raise SystemExit(f"refusing to remove unowned recovery directory {backup}")
+            shutil.rmtree(backup)
+        else:
+            os.replace(backup, final_dir)
+            print(f"Recovered previous completed output after an interrupted swap -> {final_dir}")
+    for stale in final_dir.parent.glob(f".{final_dir.name}.staging-*"):
+        if (stale.is_dir()
+                and _sentinel_valid(stale, final_dir, ("staging",))):
+            shutil.rmtree(stale)
+    stage = Path(tempfile.mkdtemp(prefix=f".{final_dir.name}.staging-", dir=final_dir.parent))
+    _write_results_sentinel(stage, final_dir, "staging")
+    return stage, final_dir
+
+
+def _commit_output_transaction(stage, final_dir):
+    """Validate and swap a staged run into place, restoring the previous run on swap failure."""
+    stage, final_dir = Path(stage).resolve(), Path(final_dir).resolve()
+    if (stage.parent != final_dir.parent
+            or not stage.name.startswith(f".{final_dir.name}.staging-")
+            or not _sentinel_valid(stage, final_dir, ("staging",))):
+        raise RuntimeError(f"refusing to commit unowned or mismatched staging directory {stage}")
+    required = (stage / "legacy" / "measurements.csv", stage / "figures" / "run_manifest.json")
+    missing = [str(p.relative_to(stage)) for p in required if not p.is_file()]
+    if missing:
+        raise RuntimeError(f"staged analysis is incomplete; missing required outputs: {missing}")
+    _write_results_sentinel(stage, final_dir, "complete")
+    backup = final_dir.parent / f".{final_dir.name}.previous"
+    if backup.exists():
+        raise RuntimeError(f"recovery directory unexpectedly exists: {backup}")
+    if final_dir.exists():
+        os.replace(final_dir, backup)
+    try:
+        os.replace(stage, final_dir)
+    except BaseException:
+        if backup.exists() and not final_dir.exists():
+            os.replace(backup, final_dir)
+        raise
+    if backup.exists():
+        shutil.rmtree(backup)
+    print(f"Committed complete analysis transaction -> {final_dir}")
 
 
 def _band_targets(template):
@@ -175,7 +236,16 @@ def _band_targets(template):
 
 
 def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
+    # Build the new run beside the last good result. Nothing below writes to the final
+    # destination until every required artifact has been produced successfully.
+    stage_dir, final_out_dir = _prepare_output_transaction(
+        out_dir,
+        protect=(vk4_dir, dxf_path, cell_csv),
+        results_root=DEF_OUT_DIR,
+    )
+    out_dir = stage_dir
     design = read_design(dxf_path)
+    validate_equivalent_cells(design)
     template = design.cells[0]
     band_target = _band_targets(template)
     print(design.summary())
@@ -211,8 +281,6 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
               f"{p.rotation_deg:>+8.2f} {p.score:>5.2f}{note}")
 
     out_dir = Path(out_dir)
-    # wipe prior outputs before writing this run's results -- but never a dir that holds an input
-    clear_output_dir(out_dir, protect=(vk4_dir, Path(dxf_path).parent, Path(cell_csv).parent))
     qc_dir = out_dir / "legacy" / "qc"       # created on demand by extract only when make_qc=True
     (out_dir / "figures").mkdir(parents=True, exist_ok=True)
     (out_dir / "legacy").mkdir(parents=True, exist_ok=True)
@@ -293,6 +361,7 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
     ra.print_diameter_calibration(df, out_dir / "figures")
     ra.make_diameter_model(df, out_dir / "figures")     # process-conditional model (drawn,P,S) + R²/CI
     ra.make_plots(df, results, out_dir / "legacy")
+    _commit_output_transaction(out_dir, final_out_dir)
     return df, results, placements
 
 
@@ -692,7 +761,6 @@ def save_sample_overview(scan, template, placements, path, ds=6):
     base = np.where(valid, scan.intensity if scan.intensity is not None else scan.height_um,
                     np.nan)[::ds, ::ds]
     base = _flip_lr(base)
-    Wd = base.shape[1]
     allc = template.all_centers_um()
     bx0, bx1, by0, by1 = _cell_content_box(template)
     ccx, ccy = 0.5 * (bx0 + bx1), 0.5 * (by0 + by1)     # true cell centre (marker + pins)
@@ -720,7 +788,7 @@ def main():
     warnings.filterwarnings("ignore", message=".*invalid value encountered.*")
     warnings.filterwarnings("ignore", message=".*divide by zero encountered.*")
     vk4_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else DEF_VK4_DIR
-    out_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else DEF_OUT_DIR
+    out_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else DEF_OUT_DIR / "direct"
     dxf_path = Path(sys.argv[3]) if len(sys.argv) > 3 else next(DEF_DXF_DIR.glob("*.dxf"))
     cell_csv = Path(sys.argv[4]) if len(sys.argv) > 4 else DEF_CSV_DIR / CELL_CSV_NAME
     analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv)

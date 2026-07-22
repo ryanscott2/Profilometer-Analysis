@@ -408,7 +408,10 @@ def make_diameter_model(df, out_dir):
         print(msg)
         (out_dir / "diameter_model.txt").write_text(msg + "\n", encoding="utf-8")
         return
-    d = df[df.reliable].copy() if "reliable" in df.columns else df.copy()
+    # Use the same clean calibration subset as the simpler diameter fits. In particular,
+    # debris-widened ("wide-D") reads are valid measurements but must not teach the process
+    # model that debris is a reproducible diameter gain.
+    d = _fit_subset(df)
     d = d[d["top_diameter_um"].notna() & d["drawn_diameter_um"].notna()
           & (d["passes"] > 0) & (d["speed"] > 0)]
     lines = ["Diameter model  (ADDITIVE to diameter_calibration.txt)",

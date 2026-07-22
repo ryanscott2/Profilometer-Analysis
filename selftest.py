@@ -312,7 +312,8 @@ def main():
         _rng = np.random.default_rng(0)
         _tiles = {(0, 0): _T(_rng.standard_normal((80, 80))), (0, 1): _T(_rng.standard_normal((80, 80)))}
         _sc, _sr = assemble._estimate_step(_tiles, [0], [0, 1], (80, 80))
-        ck.check(_sc is None and _sr == 80, "H1: no-correlation x-pair -> None (fail closed); no y-pair -> tile size")
+        ck.check(_sc is None and _sr == (0, 80),
+                 "H1: no-correlation x-pair -> None (fail closed); no y-pair -> tile vector")
 
         # H2: an inverted/undefined top diameter is suppressed to NaN, not published wider than mid.
         _rc = np.arange(0, 40, 1.0)
@@ -330,20 +331,45 @@ def main():
         ck.check(_cols([0.0, 300.0, 600.0]) == [1, 2, 3], "H3: complete row -> cols 1,2,3 (unchanged)")
         ck.check(_cols([0.0, 600.0, 1200.0]) == [1, 3, 5], "H3: alternating dropout -> cols 1,3,5 (not 1,2,3)")
 
-        # H4: clear_output_dir refuses to wipe a directory that holds an input; clears otherwise.
+        # H4: output replacement is owned, root-confined, and transactional.
         _tmp = Path(tempfile.mkdtemp())
         try:
-            _vk4 = _tmp / "out" / "VK4"; _vk4.mkdir(parents=True)
+            _root = _tmp / "Results"; _root.mkdir()
+            _unsafe = _root / "overlap"
+            _vk4 = _unsafe / "VK4"; _vk4.mkdir(parents=True)
             _scan = _vk4 / "raw_Y0_X0.vk4"; _scan.write_text("precious", encoding="utf-8")
             _refused = False
             try:
-                run_sample.clear_output_dir(_tmp / "out", protect=(_vk4,))
+                run_sample._prepare_output_transaction(
+                    _unsafe, protect=(_vk4,), results_root=_root)
             except SystemExit:
                 _refused = True
             ck.check(_refused and _scan.exists(), "H4: out_dir holding the VK4 input -> refused, scan preserved")
-            _o2 = _tmp / "out2"; _o2.mkdir(); (_o2 / "stale.png").write_text("old", encoding="utf-8")
-            run_sample.clear_output_dir(_o2, protect=(_tmp / "elsewhere",))
-            ck.check(not (_o2 / "stale.png").exists(), "H4: inputs elsewhere -> stale output cleared")
+
+            _unowned = _root / "unowned"; _unowned.mkdir()
+            (_unowned / "precious.txt").write_text("mine", encoding="utf-8")
+            _refused = False
+            try:
+                run_sample._prepare_output_transaction(_unowned, results_root=_root)
+            except SystemExit:
+                _refused = True
+            ck.check(_refused and (_unowned / "precious.txt").exists(),
+                     "H4: arbitrary non-empty directory is never recursively replaced")
+
+            _final = _root / "sample"; _final.mkdir()
+            run_sample._write_results_sentinel(_final, _final, "complete")
+            (_final / "old.txt").write_text("last-good", encoding="utf-8")
+            _stage, _dest = run_sample._prepare_output_transaction(_final, results_root=_root)
+            ck.check((_final / "old.txt").read_text() == "last-good",
+                     "H4: previous completed result remains intact while staging")
+            (_stage / "legacy").mkdir(); (_stage / "figures").mkdir()
+            (_stage / "legacy" / "measurements.csv").write_text("x\n1\n", encoding="utf-8")
+            (_stage / "figures" / "run_manifest.json").write_text("{}", encoding="utf-8")
+            run_sample._commit_output_transaction(_stage, _dest)
+            ck.check(not (_final / "old.txt").exists()
+                     and (_final / "legacy" / "measurements.csv").is_file()
+                     and run_sample._sentinel_valid(_final),
+                     "H4: only a complete staged run atomically replaces the prior result")
         finally:
             shutil.rmtree(_tmp, ignore_errors=True)
     except Exception as e:                                   # pragma: no cover
@@ -465,8 +491,8 @@ def main():
             _pitch = (_allcL[:, 0].max() + _gap, _allcL[:, 1].max() + _gap)
             pls_L = register_sample(scan_L, _Ltmpl, cell_pitch_um=_pitch, mirror_x=False)
             ck.check(len(pls_L) == 3, "L: three tiled cells detected via register_sample")
-            ck.check(bool(pls_L) and all(p.method == "marker" for p in pls_L),
-                     "L: located via the marker branch (L polygon), no square fallback")
+            ck.check(bool(pls_L) and all(p.method == "lattice" for p in pls_L),
+                     "L: one-row marker anchors pass the shared lattice/de-alias/quality gates")
             _errs = [min(max(abs(p.origin_col - a), abs(p.origin_row - b)) for a, b in _trL["origins"])
                      for p in pls_L]
             ck.check(bool(_errs) and max(_errs) <= 2.0, "L: every +5 deg origin within 2 px of truth")
@@ -607,6 +633,148 @@ def main():
                      "#19: marker-free fallback recovers +3 deg within 0.15 deg")
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"multi-degree rotation regression path raised: {e!r}")
+
+    # ------------------------------------------ 17. adversarial-review regression matrix #
+    print("\n[17] adversarial-review safety, geometry, parsing, and statistics guards")
+    try:
+        import copy
+        import tempfile
+        import shutil
+        import assemble
+        import calibrate_depth as cd
+        import laser_params
+        import pflm_ui
+        from dxf_geometry import validate_equivalent_cells
+
+        # Laser labels must consume the whole cell and encode a positive integer pass count and
+        # positive finite speed. A malformed nonblank grid entry must identify its exact location.
+        ck.check(laser_params.parse_pxsy("P12_S400")[:2] == (12, 400.0),
+                 "labels: canonical P12_S400 parses")
+        _bad_labels = ("P1.5_S400", "P0_S400", "P2_S0", "P2_S400junk", "xP2_S400")
+        ck.check(all(laser_params.parse_pxsy(x) is None for x in _bad_labels),
+                 "labels: partial, fractional-pass, and nonpositive labels are rejected")
+        _td = Path(tempfile.mkdtemp())
+        try:
+            _bad_csv = _td / "cell_params.csv"
+            _bad_csv.write_text("P1_S100,P2_S200\nP3_S300,bad\n", encoding="utf-8")
+            try:
+                laser_params.load_cell_params(_bad_csv)
+                _msg = ""
+            except ValueError as _err:
+                _msg = str(_err)
+            ck.check("row 2, column 2" in _msg,
+                     "labels: invalid CSV entry reports row and column")
+        finally:
+            shutil.rmtree(_td, ignore_errors=True)
+
+        # Sanitized UI names are not unique identifiers; reject two names mapping to one folder.
+        ck.check(pflm_ui._sample_name_collision("D100 D50", {"D100/D50": {}}) == "D100/D50",
+                 "UI: colliding sanitized sample names are detected before overwrite")
+
+        # The production one-template path must reject a heterogeneous multi-cell fabrication DXF.
+        _hetero = copy.deepcopy(dgrid)
+        _hetero.cells[1].arrays[0].centers_um = _hetero.cells[1].arrays[0].centers_um.copy()
+        _hetero.cells[1].arrays[0].centers_um[0, 0] += 5.0
+        ck.check(_raises(validate_equivalent_cells, _hetero),
+                 "DXF: heterogeneous tiled cells are rejected instead of using cells[0]")
+        validate_equivalent_cells(dgrid)
+        ck.check(True, "DXF: equivalent tiled cells remain accepted")
+
+        # Estimate both components of each tile-origin vector, including perpendicular stage drift.
+        class _Tile:
+            def __init__(self, a):
+                self.height_raw = np.ones_like(a, dtype=np.uint16)
+                self.intensity = a
+                self.height_um = a
+        _rng17 = np.random.default_rng(42)
+        _global = _rng17.normal(size=(300, 300))
+        _orig = {(0, 0): (20, 0), (0, 1): (120, 8),
+                 (1, 0): (28, 100), (1, 1): (128, 108)}
+        _tiles17 = {k: _Tile(_global[r:r + 160, c:c + 160])
+                    for k, (c, r) in _orig.items()}
+        _cv, _rv = assemble._estimate_step(_tiles17, [0, 1], [0, 1], (160, 160), ds=2)
+        ck.check(_cv == (100, 8) and _rv == (8, 100),
+                 "assembly: full 2-D column/row step vectors preserve cross-axis drift")
+
+        # Duplicate filename coordinates must fail with both source names before a silent overwrite.
+        _td = Path(tempfile.mkdtemp())
+        _read0 = assemble.read_vk4
+        try:
+            (_td / "first_Y0_X0.vk4").write_bytes(b"1")
+            (_td / "second_Y0_X0.vk4").write_bytes(b"2")
+            assemble.read_vk4 = lambda _p: object()
+            try:
+                assemble.assemble_tiles(_td, verbose=False)
+                _dupmsg = ""
+            except ValueError as _err:
+                _dupmsg = str(_err)
+            ck.check("first_Y0_X0.vk4" in _dupmsg and "second_Y0_X0.vk4" in _dupmsg,
+                     "assembly: duplicate Y/X coordinates name both conflicting files")
+        finally:
+            assemble.read_vk4 = _read0
+            shutil.rmtree(_td, ignore_errors=True)
+
+        # Rotated footprint bounds must remain correct with anisotropic pixels.
+        _anis, _atruth = synth_scan(
+            _lt, x_um_per_px=2.0, y_um_per_px=3.0, origin_px=(160.0, 130.0),
+            rotation_deg=4.0, depth_um=30.0, seed=417)
+        _ap = register_scan(_anis, _lt, n_cells=1)[0]
+        _ao = _atruth["origins"][0]
+        ck.check(max(abs(_ap.origin_col - _ao[0]), abs(_ap.origin_row - _ao[1])) <= 2.0,
+                 "registration: rotated non-square-pixel origin remains within 2 px")
+
+        # QC must be strict by default; cell-band aggregation removes array pseudo-replication.
+        _legacy = pd.DataFrame({"depth_um": [10.0], "passes": [1], "speed": [100.0],
+                                "dose_ratio": [0.01]})
+        ck.check(_raises(cd.apply_gates, _legacy),
+                 "calibration: missing reliable/debris QC fails closed by default")
+        _raw = pd.DataFrame({
+            "sample": ["A"] * 6, "cell_id": [1, 1, 1, 2, 2, 2], "band": [1] * 6,
+            "passes": [10] * 3 + [20] * 3, "speed": [100.0] * 6,
+            "dose_ratio": [0.1] * 3 + [0.2] * 3,
+            "depth_um": [9.0, 10.0, 11.0, 19.0, 20.0, 21.0],
+            "drawn_diameter_um": [100.0] * 6, "nominal_pitch_um": [150.0] * 6,
+            "reliable": [True] * 6, "debris_fraction": [0.1] * 6,
+        })
+        _gated, _ = cd.apply_gates(_raw)
+        _units = cd.aggregate_cell_bands(_gated)
+        ck.check(len(_units) == 2 and set(_units["array_rows"]) == {3}
+                 and set(_units["depth_um"]) == {10.0, 20.0},
+                 "calibration: six array rows collapse to two independent cell-band medians")
+        _other_pitch = _units.iloc[[0]].copy()
+        _other_pitch["sample"] = "B"; _other_pitch["cell_id"] = 1
+        _other_pitch["nominal_pitch_um"] = 350.0
+        _family_keys = {key for key, _g in cd._band_groups(
+            pd.concat([_units, _other_pitch], ignore_index=True), band_meta=None)}
+        ck.check(_family_keys == {(1, 150.0), (1, 350.0)},
+                 "calibration: same local band number at different pitches remains separate")
+
+        _best, _ = cd.choose_recommended(
+            {"ok": True, "aicc": 12.0, "r2": 0.5},
+            {"ok": True, "aicc": 8.0, "adj_r2": 0.4},
+            {"ok": True, "aicc": 10.0, "adj_r2": 0.6})
+        ck.check(_best == "log-dose", "calibration: model selection uses lowest AICc, not in-sample R²")
+        _none, _why = cd.choose_recommended(
+            {"ok": True, "aicc": 1.0, "r2": 0.05},
+            {"ok": True, "aicc": 2.0, "adj_r2": 0.05}, {"ok": False})
+        ck.check(_none is None and "suppressed" in _why,
+                 "calibration: poor fits suppress inverse recommendations")
+        _satfit = {"ok": True, "a": 100.0, "k": 2.0,
+                   "beta": np.array([100.0, 2.0]), "cov": np.diag([1.0, 0.01])}
+        _, _lo, _hi, _note = cd.invert_target("saturating", _satfit, {}, {}, 50.0)
+        ck.check(np.isfinite(_lo) and np.isfinite(_hi) and "CI" in _note and " PI " not in _note,
+                 "calibration: parameter-only inverse interval is labeled CI, not prediction interval")
+
+        _dirty = pd.DataFrame({"reliable": [True, True], "flags": ["", "wide-D"],
+                               "top_diameter_um": [100.0, 180.0],
+                               "diameter_um": [105.0, 190.0],
+                               "drawn_diameter_um": [100.0, 100.0],
+                               "passes": [10, 10], "speed": [100.0, 100.0]})
+        ck.check(len(ra._fit_subset(_dirty)) == 1
+                 and "_fit_subset" in inspect.getsource(ra.make_diameter_model),
+                 "diameter model: debris-widened wide-D rows use the clean fit subset")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"adversarial-review regression path raised: {e!r}")
 
     df.to_csv(OUT / "synth_measurements.csv", index=False)
     print(f"\nWrote synthetic measurements + plots to {OUT}")
