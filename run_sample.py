@@ -275,6 +275,8 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
     for p in sorted(placements, key=lambda q: (q.cell_row, q.cell_col)):
         pr = params.get((p.cell_row, p.cell_col))
         note = "  <-- low reg" if p.score < 0.5 else ""    # (no cell ever has method 'grid-infill')
+        if not p.absolute_origin:
+            note += f"  <-- PHASE ONLY; absolute {p.ambiguous_axes.upper()} index unresolved"
         print(f"  {f'({p.cell_row},{p.cell_col})':>11} {(pr.label if pr else '-'):>10} "
               f"{p.origin_col * scan.x_um_per_px / 1000:>10.2f} "
               f"{p.origin_row * scan.y_um_per_px / 1000:>7.2f} "

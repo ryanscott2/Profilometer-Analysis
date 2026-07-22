@@ -124,6 +124,8 @@ class PinFinResult:
     meas_pitch_y_um: float = float("nan")
     reg_score: float = float("nan")
     reg_method: str = ""
+    absolute_origin: bool = True
+    ambiguous_axes: str = ""
     flags: str = ""
     floor_flatness_um: float = float("nan")
     debris_fraction: float = float("nan")
@@ -436,6 +438,8 @@ def extract_array(scan, placement, array, sample, *,
         target_diameter_um=sample.target_diameter_um,
         nominal_pitch_um=sample.nominal_pitch_um,
         reg_score=placement.score, reg_method=placement.method,
+        absolute_origin=placement.absolute_origin,
+        ambiguous_axes=placement.ambiguous_axes,
     )
     if crop is None:
         return PinFinResult(flags="off-scan (registration/crop failed)", **base)

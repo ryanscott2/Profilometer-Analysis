@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -614,6 +615,55 @@ def main():
                 ck.check(abs(_mp[0].rotation_deg - _reg_angle) <= 0.01,
                          f"#2 {_name}: markerless rotation recovered within 0.01 deg")
 
+            # A single interior image has no absolute pin index, but its pitch phase is measurable.
+            # Centre the visible patch in a pitch-equivalent DXF placement and prove that downstream
+            # diameter/depth extraction uses only the visible, phase-aligned pins.
+            _phase_full, _ = synth_scan(
+                _cell, x_um_per_px=_reg_scale, y_um_per_px=_reg_scale,
+                origin_px=_reg_origin, marker=False, depth_um=30.0,
+                seed=850 + _case_i)
+            _phase_pitch = _array.pitch_x_um / _reg_scale
+            _phase_start = _grid // 5
+            _phase_span = 15
+            _pc0 = int(_reg_origin[0] + (_phase_start - 0.4) * _phase_pitch)
+            _pc1 = int(_reg_origin[0] + (_phase_start + _phase_span + 0.4) * _phase_pitch)
+            _pr0 = int(_reg_origin[1] + (_phase_start - 0.4) * _phase_pitch)
+            _pr1 = int(_reg_origin[1] + (_phase_start + _phase_span + 0.4) * _phase_pitch)
+            _sub = SynthScan(
+                _phase_full.height_raw[_pr0:_pr1, _pc0:_pc1],
+                _phase_full.intensity[_pr0:_pr1, _pc0:_pc1],
+                _reg_scale, _reg_scale, _phase_full.z_um_per_digit)
+            _, _, _, _sv, _sz = scan_feature(_sub)
+            _sp = _register_by_pattern(
+                _sub, _cell, _sz, _sv, x_right_options=(1,), y_up_options=(1,),
+                allow_uniform_phase_only=True)[0]
+            _true_local = (_reg_origin[0] - _pc0, _reg_origin[1] - _pr0)
+
+            def _phase_error(got, truth, period):
+                return abs((got - truth + 0.5 * period) % period - 0.5 * period)
+
+            ck.check(_sp.method == "uniform-phase" and not _sp.absolute_origin
+                     and _sp.ambiguous_axes == "xy",
+                     f"#2 {_name}: interior image returns explicitly ambiguous phase-only lock")
+            ck.check(max(_phase_error(_sp.origin_col, _true_local[0], _phase_pitch),
+                         _phase_error(_sp.origin_row, _true_local[1], _phase_pitch)) <= 0.25,
+                     f"#2 {_name}: subsection lattice phase aligned within 0.25 px")
+            _ss = ArraySample(
+                filename="phase-only", vk4_stem="phase-only", cell_id=1,
+                array_id=_array.array_id, band=_array.band, col=_array.col,
+                passes=1, speed=100.0, nominal_diameter_um=_array.diameter_um,
+                target_diameter_um=_array.diameter_um, nominal_pitch_um=_array.pitch_um,
+                nominal_pitch_x_um=_array.pitch_x_um, nominal_pitch_y_um=_array.pitch_y_um,
+                nx=_array.nx, ny=_array.ny, cx_um=_array.cx_um, cy_um=_array.cy_um)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                _sr = extract_array(_sub, _sp, _array, _ss, make_qc=False)
+            ck.check(abs(_sr.diameter_um - _array.diameter_um) <= 5.0
+                     and abs(_sr.depth_um - 30.0) <= 4.0
+                     and 0 < _sr.n_cells < _array.n_pins
+                     and not _sr.absolute_origin and _sr.ambiguous_axes == "xy",
+                     f"#2 {_name}: visible subset yields accurate diameter/depth only")
+
         # A scan need not include the far side of the 1 cm design.  One *near* termination plus a
         # full pitch of valid floor is enough on an axis, but a periodic interior is not.  These
         # three crops distinguish the cases that the old whole-pattern overlap conflated.
@@ -657,6 +707,14 @@ def main():
             _one_msg = str(_err)
         ck.check("not identifiable along y" in _one_msg,
                  "#2 one-edge crop: resolved X but fails closed on ambiguous Y index")
+        _, _, _, _oev, _oez = scan_feature(_one_edge)
+        _one_phase = _register_by_pattern(
+            _one_edge, _d300, _oez, _oev, x_right_options=(1,), y_up_options=(1,),
+            allow_uniform_phase_only=True)[0]
+        ck.check(_one_phase.method == "uniform-phase"
+                 and _one_phase.ambiguous_axes == "y"
+                 and abs(_one_phase.origin_col - _crop_origin[0]) <= 1.0,
+                 "#2 one-edge phase mode preserves resolved X and labels only Y ambiguous")
 
         _interior = _crop(
             int(_crop_origin[1] + 5 * _crop_pitch),
@@ -670,6 +728,23 @@ def main():
             _interior_msg = str(_err)
         ck.check("not identifiable along x,y" in _interior_msg,
                  "#2 interior crop: pitch-periodic X/Y indices remain explicitly ambiguous")
+        _auto_phase = register_sample(_interior, _d300, mirror_x=False)
+        ck.check(len(_auto_phase) == 1 and _auto_phase[0].method == "uniform-phase"
+                 and not _auto_phase[0].absolute_origin,
+                 "#2 register_sample automatically enables subsection phase-only mode")
+
+        # Minimum supported one-frame geometry: 3x2 complete D300 pins (matching the number of
+        # testable pins in the real 1024x768 VK4 tile after border-clipped pins are excluded).
+        _small_start = 8
+        _small = _crop(
+            int(_crop_origin[1] + (_small_start - 0.6) * _crop_pitch),
+            int(_crop_origin[1] + (_small_start + 1.6) * _crop_pitch),
+            int(_crop_origin[0] + (_small_start - 0.6) * _crop_pitch),
+            int(_crop_origin[0] + (_small_start + 2.6) * _crop_pitch))
+        _small_p = register_sample(_small, _d300, mirror_x=False)
+        ck.check(len(_small_p) == 1 and _small_p[0].method == "uniform-phase"
+                 and _small_p[0].score >= 0.9,
+                 "#2 one 3x2-pin image is sufficient for a high-quality phase-only lock")
 
         _ns_origin = (60.0, 60.0)
         _ns_scan, _ = synth_scan(
