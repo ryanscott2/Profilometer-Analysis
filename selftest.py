@@ -6,7 +6,7 @@ Validates the v2 pipeline that cannot be exercised on the empty ``VK4/`` folder 
   1. Registration recovers a known cell origin (single cell and a tiled 2-cell scan).
   2. Extraction recovers the known diameter / pitch / depth for every array.
   3. The full plot suite renders from a synthetic measurements table.
-  4. Real markerless fabrication DXFs retain their geometry and expose pitch-alias risk.
+  4. Real markerless fabrication DXFs retain their geometry and resolve only with finite-edge proof.
 
 Run:  python selftest.py       (writes previews/plots under Results/selftest/)
 Exit code is non-zero if any check fails, so it can gate CI.
@@ -26,7 +26,7 @@ from register import (RegistrationAmbiguityError, _dealias_origin, _overlap_scor
                       _register_by_pattern, rasterize_cell_pins, register_scan,
                       register_sample, scan_feature)
 from extract import ArraySample, extract_array
-from synth import synth_scan
+from synth import SynthScan, synth_scan
 import report as ra
 
 HERE = Path(__file__).parent
@@ -508,7 +508,7 @@ def main():
         ck.check(False, f"L-marker path raised: {e!r}")
 
     # --------------------------------------------- 15. markerless uniform-array aliasing (#2) #
-    print("\n[15] real markerless DXFs: geometry lock + one-pitch alias regression (#2)")
+    print("\n[15] real markerless DXFs: finite-edge alias elimination (#2)")
     try:
         _fixture_dir = HERE / "tests" / "fixtures" / "markerless"
         _cases = (
@@ -547,7 +547,7 @@ def main():
         _origin = (20.0, 20.0)
         _margin = inspect.signature(_dealias_origin).parameters["margin"].default
         ck.check(_margin == 0.02, "#2: current de-alias decision margin is 2 percentage points")
-        for _name, _cell, _array, _grid in _loaded:
+        for _case_i, (_name, _cell, _array, _grid) in enumerate(_loaded):
             _px = _array.pitch_x_um / _scale
             _py = _array.pitch_y_um / _scale
             _rad = 0.5 * _array.diameter_um / _scale
@@ -587,10 +587,100 @@ def main():
             try:
                 _register_by_pattern(None, _cell, None, None)
             except RegistrationAmbiguityError as _err:
-                _refused = ("one pin pitch" in str(_err)
+                _refused = ("finite-edge evidence" in str(_err)
                             and "alignment fiducial" in str(_err))
             ck.check(_refused,
-                     f"#2 {_name}: production marker-free path fails closed with actionable error")
+                     f"#2 {_name}: missing scan evidence fails closed with actionable error")
+
+            # The production marker-free path now fits lattice phase modulo pitch, enumerates every
+            # finite array-index hypothesis, and uses independent edge nodes to select the absolute
+            # origin.  Exercise a non-axis-aligned pose for all three actual fabrication geometries.
+            _reg_scale = 10.0
+            _reg_origin = (60.0, 60.0)
+            _reg_angle = 1.7
+            _ms, _ = synth_scan(
+                _cell, x_um_per_px=_reg_scale, y_um_per_px=_reg_scale,
+                origin_px=_reg_origin, marker=False, rotation_deg=_reg_angle,
+                seed=820 + _case_i)
+            _, _, _, _mv, _mz = scan_feature(_ms)
+            _mp = _register_by_pattern(
+                _ms, _cell, _mz, _mv, x_right_options=(1,), y_up_options=(1,))
+            ck.check(len(_mp) == 1 and _mp[0].method == "uniform-edge",
+                     f"#2 {_name}: finite-edge production path returns one placement")
+            if _mp:
+                ck.check(max(abs(_mp[0].origin_col - _reg_origin[0]),
+                             abs(_mp[0].origin_row - _reg_origin[1])) <= 1.0,
+                         f"#2 {_name}: absolute origin recovered within 1 px")
+                ck.check(abs(_mp[0].rotation_deg - _reg_angle) <= 0.01,
+                         f"#2 {_name}: markerless rotation recovered within 0.01 deg")
+
+        # A scan need not include the far side of the 1 cm design.  One *near* termination plus a
+        # full pitch of valid floor is enough on an axis, but a periodic interior is not.  These
+        # three crops distinguish the cases that the old whole-pattern overlap conflated.
+        _d300 = next(_cell for _name, _cell, _array, _grid in _loaded
+                     if _name.startswith("D300"))
+        _crop_scale = 10.0
+        _crop_origin = (60.0, 60.0)
+        _crop_scan, _ = synth_scan(
+            _d300, x_um_per_px=_crop_scale, y_um_per_px=_crop_scale,
+            origin_px=_crop_origin, marker=False, seed=899)
+        _crop_pitch = int(round(_d300.arrays[0].pitch_x_um / _crop_scale))
+
+        def _crop(r0, r1, c0, c1):
+            return SynthScan(
+                _crop_scan.height_raw[r0:r1, c0:c1],
+                _crop_scan.intensity[r0:r1, c0:c1],
+                _crop_scan.x_um_per_px, _crop_scan.y_um_per_px,
+                _crop_scan.z_um_per_digit)
+
+        def _try_uniform(cropped):
+            _, _, _, cv, cz = scan_feature(cropped)
+            return _register_by_pattern(
+                cropped, _d300, cz, cv, x_right_options=(1,), y_up_options=(1,))
+
+        _corner = _crop(0, int(_crop_origin[1] + 18 * _crop_pitch),
+                        0, int(_crop_origin[0] + 18 * _crop_pitch))
+        _corner_p = _try_uniform(_corner)
+        ck.check(len(_corner_p) == 1
+                 and max(abs(_corner_p[0].origin_col - _crop_origin[0]),
+                         abs(_corner_p[0].origin_row - _crop_origin[1])) <= 1.0,
+                 "#2 partial corner: two finite terminations resolve both absolute indices")
+
+        _one_edge = _crop(
+            int(_crop_origin[1] + 5 * _crop_pitch),
+            int(_crop_origin[1] + 20 * _crop_pitch),
+            0, int(_crop_origin[0] + 18 * _crop_pitch))
+        try:
+            _try_uniform(_one_edge)
+            _one_msg = ""
+        except RegistrationAmbiguityError as _err:
+            _one_msg = str(_err)
+        ck.check("not identifiable along y" in _one_msg,
+                 "#2 one-edge crop: resolved X but fails closed on ambiguous Y index")
+
+        _interior = _crop(
+            int(_crop_origin[1] + 5 * _crop_pitch),
+            int(_crop_origin[1] + 20 * _crop_pitch),
+            int(_crop_origin[0] + 5 * _crop_pitch),
+            int(_crop_origin[0] + 20 * _crop_pitch))
+        try:
+            _try_uniform(_interior)
+            _interior_msg = ""
+        except RegistrationAmbiguityError as _err:
+            _interior_msg = str(_err)
+        ck.check("not identifiable along x,y" in _interior_msg,
+                 "#2 interior crop: pitch-periodic X/Y indices remain explicitly ambiguous")
+
+        _ns_origin = (60.0, 60.0)
+        _ns_scan, _ = synth_scan(
+            _d300, x_um_per_px=8.0, y_um_per_px=12.0, origin_px=_ns_origin,
+            marker=False, rotation_deg=-2.3, seed=922)
+        _ns_p = _try_uniform(_ns_scan)
+        ck.check(len(_ns_p) == 1
+                 and max(abs(_ns_p[0].origin_col - _ns_origin[0]),
+                         abs(_ns_p[0].origin_row - _ns_origin[1])) <= 1.0
+                 and abs(_ns_p[0].rotation_deg + 2.3) <= 0.01,
+                 "#2 markerless finite-edge path handles non-square pixels and rotation")
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"markerless-DXF alias regression path raised: {e!r}")
 

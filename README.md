@@ -39,10 +39,12 @@ cells. The driver stitches the tiles into one scan (`assemble.py`), finds every 
 - Registration anchors on the **unique marker** plus one global rotation (not the periodic pin
   lattice, whose overlap aliases a pitch away), and uses a pin/floor **height-contrast gate**
   to reject flat un-ablated wafer.
-- Asymmetric L markers and genuinely aperiodic marker-free multi-array patterns search stage
-  rotations from −5° to +5°. A markerless complete uniform lattice is deliberately rejected:
-  origins one pin pitch apart are not uniquely distinguishable, so add an asymmetric fiducial or
-  provide a trusted manual origin instead of accepting a silent pitch alias.
+- Asymmetric L markers and marker-free patterns search stage rotations from −5° to +5°.
+  Aperiodic multi-array layouts use whole-pattern correlation. Complete markerless uniform arrays
+  use a dedicated finite-edge solver: it fits lattice phase modulo pitch, enumerates every integer
+  array-index hypothesis, and accepts an absolute origin only when physical pin terminations resolve
+  **both** axes. Evidence is counted by lattice nodes with a spatial block bootstrap, not by pixels.
+  An interior-only or one-edge crop still fails closed with an actionable ambiguity error.
 - Cells are indexed by **design (row, col) with (1,1) = DXF top-left** (marker-anchored). Laser
   parameters are supplied per cell in `CSV/cell_params.csv` as a plain **grid in that design
   orientation**: line `r` = design row `r` (top first), column `c` = design col `c` (left first),
@@ -105,9 +107,11 @@ every parameter present.
 (an absolute, off-pin-lattice anchor), estimates the tile lattice from the strongest cells, and
 probes every lattice node — so a dense periodic array registers cleanly and spurious marker hits
 are rejected by construction. L-marker detection uses a coarse-to-fine −5° to +5° angle search;
-the deprecated symmetric square retains its proven legacy detector. Marker-free registration is
-allowed only when the DXF pattern itself is aperiodic; a complete single uniform grid fails closed
-with an actionable ambiguity error. Confirm the result from the `design(r,c) → marker x/y, rot, reg`
+the deprecated symmetric square retains its proven legacy detector. Marker-free aperiodic layouts
+use whole-pattern correlation; a complete single uniform grid instead uses finite-array termination
+evidence. It resolves a partial scan only when at least one pin-termination edge plus roughly one
+pitch of valid floor is visible in **each** lattice direction. Otherwise it fails closed rather than
+choosing a pitch-equivalent index. Confirm the result from the `design(r,c) → marker x/y, rot, reg`
 table printed each run (a `rot` near ±180° flags a re-oriented wafer) and the per-cell reports in
 `Results/<sample>/figures/cells/`. Cell (row,col) indices are absolute (a dropped interior
 row/column leaves a hole, not a shift); a `cell_params` entry with no registered cell is warned as
