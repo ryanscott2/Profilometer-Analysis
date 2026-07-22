@@ -51,7 +51,8 @@ DEF_TARGET_UM = 55.0                   # the design target used throughout the c
 DEF_MAX_DEBRIS = 0.6                   # depth-specific: a debris-buried floor gives untrustworthy depth
 PITCH_MATCH_TOL_UM = 1.0               # a row's nominal pitch must equal a band's declared pitch within
                                        # this (design pitches are discrete, so this is effectively exact)
-_MC_SEED = 0                           # inversion prediction-interval Monte-Carlo (seeded = reproducible)
+MIN_PREDICTIVE_R2 = 0.10               # below this, a fit is too weak to drive process inversion
+_MC_SEED = 0                           # inverse-mean confidence Monte-Carlo (seeded = reproducible)
 
 
 # ============================================================ discover + pool == #
@@ -199,7 +200,8 @@ def load_pooled(samples, cell_filters=None):
 
 
 # ================================================================= quality gates == #
-def apply_gates(df, max_debris=DEF_MAX_DEBRIS, drop_shallow=False):
+def apply_gates(df, max_debris=DEF_MAX_DEBRIS, drop_shallow=False,
+                allow_legacy_qc=False):
     """Keep only rows whose depth read is trustworthy for a calibration fit, tracking WHY rows drop.
 
     ``reliable`` already excludes the critical flags (no relief / weak lattice / off-scan / floor
@@ -207,6 +209,16 @@ def apply_gates(df, max_debris=DEF_MAX_DEBRIS, drop_shallow=False):
     depth-specific gates left are a stricter debris cut and (optionally) the ``shallow`` flag.
     ``shallow`` (<3 µm) points are KEPT by default: they are the low-dose anchor of the saturation
     curve's rise and dropping them biases the fit toward the plateau. Returns (kept_df, report)."""
+    missing_qc = [c for c in ("reliable", "debris_fraction") if c not in df.columns]
+    if missing_qc and not allow_legacy_qc:
+        raise ValueError(
+            "pooled measurements lack required quality-control column(s) "
+            f"{missing_qc}; refusing to fit unvetted legacy data. Re-run extraction, or use "
+            "--allow-legacy-qc only after reviewing the older measurements manually."
+        )
+    if missing_qc:
+        print("WARNING: explicit legacy-QC override: missing " + ", ".join(missing_qc))
+
     n0 = len(df)
     rep = {"total": n0, "steps": []}
 
@@ -220,7 +232,10 @@ def apply_gates(df, max_debris=DEF_MAX_DEBRIS, drop_shallow=False):
     # a numpy scalar, and df[scalar] raises a cryptic KeyError instead of skipping. An empty frame is
     # fine (empty masks), so the caller's "no rows survived" check handles the all-failed-reads case.
     if "reliable" in df.columns:
-        step(_truthy(df["reliable"]), "not reliable (critical flag / P=0 / low reg)")
+        reliable = _truthy(df["reliable"])
+        if allow_legacy_qc:
+            reliable = reliable | df["reliable"].isna()
+        step(reliable, "not reliable (critical flag / P=0 / low reg)")
     for col in ("depth_um", "passes", "speed", "dose_ratio"):
         if col not in df.columns:
             print(f"WARNING: column '{col}' absent from pooled data -> cannot gate on it.")
@@ -230,12 +245,62 @@ def apply_gates(df, max_debris=DEF_MAX_DEBRIS, drop_shallow=False):
         step((df["passes"] > 0) & (df["speed"] > 0) & np.isfinite(df["dose_ratio"]),
              "passes/speed/dose not positive-finite")
     if "debris_fraction" in df.columns:
-        # keep NaN debris (unmeasured) -- only drop rows that positively exceed the cut
-        step(~(df["debris_fraction"] > max_debris), f"debris_fraction > {max_debris:g}")
+        debris = pd.to_numeric(df["debris_fraction"], errors="coerce")
+        if allow_legacy_qc:
+            # The explicit compatibility mode preserves unmeasured legacy rows, but it is never
+            # the default because NaN debris has not passed a debris-quality gate.
+            step(debris.isna() | (debris <= max_debris),
+                 f"debris_fraction > {max_debris:g}")
+        else:
+            step(np.isfinite(debris) & (debris <= max_debris),
+                 f"debris_fraction missing or > {max_debris:g}")
     if drop_shallow and "flags" in df.columns:
         step(~df["flags"].astype(str).str.contains("shallow", na=False), "shallow flag (--drop-shallow)")
     rep["kept"] = len(df)
     return df.copy(), rep
+
+
+def aggregate_cell_bands(df, allow_legacy_qc=False):
+    """Collapse array rows to one independent observation per sample/cell/band.
+
+    Arrays cut with the same cell-level laser exposure are technical replicates, not independent
+    process trials. Their median depth and geometry therefore form the unit used by model
+    selection, confidence intervals, mixed models, plots, and inverse recommendations.
+    """
+    d = df.copy()
+    required = {"sample", "band", "passes", "speed", "dose_ratio", "depth_um",
+                "drawn_diameter_um", "nominal_pitch_um"}
+    missing = sorted(required - set(d.columns))
+    if missing:
+        raise ValueError(f"cannot aggregate calibration rows; missing required columns: {missing}")
+    if "cell_id" not in d.columns:
+        if not allow_legacy_qc:
+            raise ValueError(
+                "pooled measurements lack cell_id, so array technical replicates cannot be "
+                "collapsed safely; re-run extraction or use --allow-legacy-qc after review"
+            )
+        print("WARNING: legacy rows have no cell_id; treating each row as its own analysis unit.")
+        d["cell_id"] = [f"legacy-row-{i}" for i in range(len(d))]
+    elif d["cell_id"].isna().any():
+        if not allow_legacy_qc:
+            raise ValueError("cell_id is missing on some rows; refusing pseudo-replicated fitting")
+        missing_id = d["cell_id"].isna()
+        d.loc[missing_id, "cell_id"] = [f"legacy-row-{i}" for i in d.index[missing_id]]
+
+    keys = ["sample", "cell_id", "band", "nominal_pitch_um",
+            "passes", "speed", "dose_ratio"]
+    aggregations = {
+        "depth_um": "median",
+        "drawn_diameter_um": "median",
+    }
+    for col in ("debris_fraction", "cell_row", "cell_col"):
+        if col in d.columns:
+            aggregations[col] = "median"
+    grouped = d.groupby(keys, dropna=False, observed=True)
+    out = grouped.agg(aggregations).reset_index()
+    counts = grouped.size().rename("array_rows").reset_index()
+    out = out.merge(counts, on=keys, how="left", validate="one_to_one")
+    return out
 
 
 def _truthy(series):
@@ -328,6 +393,16 @@ def _sat(dose, a, k):
     return a * (1.0 - np.exp(-k * dose))
 
 
+def _aicc(n, ss_res, k):
+    """Small-sample Akaike information criterion on a common response data set."""
+    n, k = int(n), int(k)
+    if n <= k + 1 or not np.isfinite(ss_res) or ss_res < 0:
+        return float("inf")
+    mse = max(float(ss_res) / n, np.finfo(float).tiny)
+    aic = n * np.log(mse) + 2 * k
+    return float(aic + (2 * k * (k + 1)) / (n - k - 1))
+
+
 def fit_saturating(dose, depth, alpha=0.05):
     """Nonlinear least-squares saturating fit via scipy.  Returns a dict with a, k (+ 95% CI from
     the covariance), R², residual σ, the param covariance (for the inversion MC), n, and ok/msg."""
@@ -355,6 +430,7 @@ def fit_saturating(dose, depth, alpha=0.05):
                    a_ci=(float(beta[0] - tcrit * se[0]), float(beta[0] + tcrit * se[0])),
                    k_ci=(float(beta[1] - tcrit * se[1]), float(beta[1] + tcrit * se[1])),
                    r2=(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan"),
+                   ss_res=ss_res, k_params=2, aicc=_aicc(dose.size, ss_res, 2),
                    resid_sd=float(np.sqrt(ss_res / dof)), cov=pcov, beta=beta, ok=True)
     except Exception as e:                                  # non-convergence / singular cov
         out["msg"] = f"fit did not converge: {e}"
@@ -386,7 +462,9 @@ def fit_log_dose_ols(g, alpha=0.05):
         b0 = beta[0]
         if "drawn_Ø (µm)" in names:
             b0 = beta[0] + beta[names.index("drawn_Ø (µm)")] * float(np.median(g["drawn_diameter_um"]))
+        ss_res = float(np.sum((y - X @ beta) ** 2))
         out.update(names=names, beta=beta, ci=ci, r2=r2, adj_r2=adj, n=int(n), pvalues=pv,
+                   ss_res=ss_res, k_params=X.shape[1], aicc=_aicc(n, ss_res, X.shape[1]),
                    b0_at_med=float(b0), b_logdose=float(beta[1]), ok=True)
     except Exception as e:
         out["msg"] = f"OLS failed: {e}"
@@ -419,7 +497,9 @@ def fit_interaction_ols(g, alpha=0.05):
         return out
     try:
         beta, ci, r2, adj, n, p, pv = _ols_fit(X, y, alpha)
+        ss_res = float(np.sum((y - X @ beta) ** 2))
         out.update(names=names, beta=beta, ci=ci, r2=r2, adj_r2=adj, n=int(n), pvalues=pv,
+                   ss_res=ss_res, k_params=X.shape[1], aicc=_aicc(n, ss_res, X.shape[1]),
                    means=means, ok=True)
     except Exception as e:
         out["msg"] = f"OLS failed: {e}"
@@ -427,23 +507,30 @@ def fit_interaction_ols(g, alpha=0.05):
 
 
 def choose_recommended(sat, logd, inter):
-    """Prefer the physically-motivated saturating form when it converged and its R² is at least as
-    good as the best OLS form's; otherwise the OLS form with the higher adj-R². Returns a key
-    ('saturating' | 'log-dose' | 'interaction' | None) + a one-line rationale."""
-    ols = [(k, f) for k, f in (("log-dose", logd), ("interaction", inter)) if f.get("ok")]
-    best_ols = max(ols, key=lambda kf: kf[1].get("adj_r2", -np.inf)) if ols else None
-    if sat.get("ok") and (best_ols is None or sat.get("r2", -np.inf) >= best_ols[1].get("r2", -np.inf)):
-        return "saturating", "saturating NLS (physical form; R² ≥ OLS forms)"
-    if best_ols is not None:
-        return best_ols[0], f"{best_ols[0]} OLS (higher adj-R²; saturating not preferred/converged)"
-    return None, "no form fit (too few points)"
+    """Choose the smallest finite AICc among fits with meaningful explanatory signal.
+
+    Returning ``None`` deliberately suppresses inversion when every candidate is uninformative.
+    """
+    candidates = []
+    for key, fit in (("saturating", sat), ("log-dose", logd), ("interaction", inter)):
+        if not fit.get("ok") or not np.isfinite(fit.get("aicc", np.inf)):
+            continue
+        quality = fit.get("r2", np.nan) if key == "saturating" else fit.get("adj_r2", np.nan)
+        if not np.isfinite(quality) or quality < MIN_PREDICTIVE_R2:
+            continue
+        candidates.append((float(fit["aicc"]), key))
+    if not candidates:
+        return (None, f"no candidate has finite AICc and predictive R² >= {MIN_PREDICTIVE_R2:.2f}; "
+                "inverse recommendation suppressed")
+    aicc, key = min(candidates)
+    return key, f"lowest AICc among acceptable independent-cell fits ({aicc:.2f})"
 
 
 # ============================================================= cross-sample pooling == #
 def fit_mixedlm(g, alpha=0.05):
     """Pooled CIs across samples: MixedLM depth ~ log(dose) with a random intercept per sample, so
-    the correlation of arrays within a sample (pseudo-replication) is modelled and the fixed-effect
-    CIs are honest. Falls back to OLS with a sample fixed factor if MixedLM will not converge.
+    cross-wafer/sample baseline differences are modelled after array rows have already been
+    collapsed to independent cell-band medians. Falls back to OLS with a sample fixed factor.
     Requires ≥2 samples. Returns a dict with the fixed effects + CI, sample variance, per-sample
     residual summary, and which path was used."""
     out = {"ok": False}
@@ -496,7 +583,7 @@ def invert_target(rec_key, sat, logd, inter, target, alpha=0.05):
 
     Saturating: dose* = −ln(1 − target/a)/k (defined only when target < plateau a); the interval
     comes from a seeded Monte-Carlo over the (a,k) covariance -> percentiles of dose*.
-    Log-dose OLS: dose* = exp((target − b0)/b1) (point estimate; PI needs the saturating fit).
+    Log-dose OLS: dose* = exp((target − b0)/b1) (point estimate; inverse CI unavailable).
     Interaction: depth depends on passes and speed SEPARATELY (not through dose alone), so there is
     no single dose* -> point to the (passes, speed) target contour on the heatmap.
     Returns (dose_star, lo, hi, note)."""
@@ -515,13 +602,13 @@ def invert_target(rec_key, sat, logd, inter, target, alpha=0.05):
         lo, hi = ((float(np.percentile(ds, 100 * alpha / 2)),
                    float(np.percentile(ds, 100 * (1 - alpha / 2)))) if ds.size > 50
                   else (float("nan"), float("nan")))
-        return float(dstar), lo, hi, f"saturating inversion ({ci_pct:g}% PI via param-covariance MC)"
+        return float(dstar), lo, hi, f"saturating inversion ({ci_pct:g}% inverse-mean CI via param-covariance MC)"
     if rec_key == "log-dose" and logd.get("ok"):
         b0, b1 = logd["b0_at_med"], logd["b_logdose"]
         if b1 == 0:
             return float("nan"), float("nan"), float("nan"), "log-dose slope 0 — not invertible"
         dstar = float(np.exp((target - b0) / b1))
-        return dstar, float("nan"), float("nan"), "log-dose inversion (point; PI needs saturating fit)"
+        return dstar, float("nan"), float("nan"), "log-dose inversion (point; inverse CI unavailable)"
     if rec_key == "interaction" and inter.get("ok"):
         return (float("nan"), float("nan"), float("nan"),
                 "interaction model: depth depends on passes & speed separately — read the "
@@ -553,7 +640,8 @@ def _predict(rec_key, sat, logd, inter, dose=None, passes=None, speed=None, draw
 # ======================================================================= driver == #
 def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude=None,
                     targets=(DEF_TARGET_UM,), max_debris=DEF_MAX_DEBRIS, drop_shallow=False,
-                    alpha=0.05, band_defs_path=None, cell_filters=None):
+                    alpha=0.05, band_defs_path=None, cell_filters=None,
+                    allow_legacy_qc=False):
     """Full calibration: discover -> pool -> gate -> (optionally re-bin into user bands) -> per-band
     fits + pooled MixedLM -> write depth_calibration.txt + the three figures. When ``band_defs_path``
     names a band-definitions file, rows are re-binned by drawn Ø into those bands; otherwise the
@@ -571,7 +659,13 @@ def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude
     if not len(df):
         raise SystemExit("No rows loaded from the selected samples' measurements.csv "
                          "(every file was empty or unreadable).")
-    gated, gate_rep = apply_gates(df, max_debris=max_debris, drop_shallow=drop_shallow)
+    try:
+        gated, gate_rep = apply_gates(
+            df, max_debris=max_debris, drop_shallow=drop_shallow,
+            allow_legacy_qc=allow_legacy_qc,
+        )
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
     for ln in _gate_report_lines(gate_rep):
         print(ln)
     if not len(gated):
@@ -588,10 +682,15 @@ def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude
         band_meta, band_lines = None, None
         gated["band"] = gated["band"].astype(int)
 
-    bands = sorted(gated["band"].unique())
+    try:
+        units = aggregate_cell_bands(gated, allow_legacy_qc=allow_legacy_qc)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+    print(f"Independent analysis units: {len(units)} cell-band medians from "
+          f"{len(gated)} array rows.")
+
     per_band = {}
-    for b in bands:
-        g = gated[gated["band"] == b].copy()
+    for b, g in _band_groups(units, band_meta):
         sat = fit_saturating(g["dose_ratio"], g["depth_um"], alpha=alpha)
         logd = fit_log_dose_ols(g, alpha=alpha)
         inter = fit_interaction_ols(g, alpha=alpha)
@@ -601,8 +700,9 @@ def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude
                            rec_why=rec_why, mixed=mixed, label=_fmt_band(b, g, band_meta))
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    write_report(out_dir, samples, gate_rep, gated, per_band, targets, alpha,
-                 max_debris, drop_shallow, band_lines=band_lines, cell_filters=cell_filters)
+    write_report(out_dir, samples, gate_rep, units, per_band, targets, alpha,
+                 max_debris, drop_shallow, band_lines=band_lines, cell_filters=cell_filters,
+                 array_row_count=len(gated), allow_legacy_qc=allow_legacy_qc)
     # The report is the primary deliverable; isolate each figure so one bad panel can't abort the
     # whole run (and the already-written report + other figures survive).
     for fn in (fig_depth_vs_dose, fig_parity, fig_heatmap):
@@ -615,15 +715,38 @@ def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude
 
 
 # ============================================================== report writer == #
+def _band_groups(units, band_meta=None):
+    """Yield calibration families without aliasing local band numbers across designs.
+
+    User band definitions already include a required pitch, so their integer ids are globally
+    meaningful. Without definitions, a DXF's ``band`` is only local to that design: e.g. band 1
+    can mean D50/P100 in one file and D300/P350 in another. The default key therefore includes
+    nominal pitch and keeps those geometries separate.
+    """
+    if band_meta:
+        for b in sorted(units["band"].unique()):
+            yield b, units[units["band"] == b].copy()
+        return
+    keyed = units.assign(_pitch_key=units["nominal_pitch_um"].round(6))
+    for (b, pitch), g in keyed.groupby(["band", "_pitch_key"], sort=True, dropna=False):
+        key = (int(b), float(pitch))
+        yield key, g.drop(columns="_pitch_key").copy()
+
+
 def _fmt_band(b, g, band_meta=None):
+    source_band = b[0] if isinstance(b, tuple) else b
     ds = sorted(g["drawn_diameter_um"].dropna().unique())
     drng = f"{ds[0]:g}–{ds[-1]:g}" if ds else "?"
-    if band_meta and b in band_meta:                     # user-defined band: show declared range/pitch
-        dmin, dmax, pitch = band_meta[b]
-        return (f"band {b} (Ø {dmin:g}–{dmax:g} µm @ {pitch:g} µm pitch; "
+    if band_meta and source_band in band_meta:            # user-defined band: show declared range/pitch
+        dmin, dmax, pitch = band_meta[source_band]
+        return (f"band {source_band} (Ø {dmin:g}–{dmax:g} µm @ {pitch:g} µm pitch; "
                 f"drawn Ø present {drng} µm, n={len(g)})")
     pitch = g["nominal_pitch_um"].dropna().iloc[0] if g["nominal_pitch_um"].notna().any() else float("nan")
-    return f"band {b} (pitch {pitch:g} µm, drawn Ø {drng} µm, n={len(g)})"
+    return f"band {source_band} @ {pitch:g} µm pitch (drawn Ø {drng} µm, n={len(g)})"
+
+
+def _short_band(b):
+    return f"{b[0]}@{b[1]:g}" if isinstance(b, tuple) else str(b)
 
 
 def _coverage_table(g):
@@ -640,7 +763,8 @@ def _coverage_table(g):
 
 
 def write_report(out_dir, samples, gate_rep, gated, per_band, targets, alpha, max_debris,
-                 drop_shallow, band_lines=None, cell_filters=None):
+                 drop_shallow, band_lines=None, cell_filters=None, array_row_count=None,
+                 allow_legacy_qc=False):
     L = []
     ci_lbl = f"{100 * (1 - alpha):g}% CI"                # honour --alpha in every interval label
     L.append("Etch-depth calibration  —  depth = f(passes, speed) conditioned on pin band")
@@ -649,6 +773,8 @@ def write_report(out_dir, samples, gate_rep, gated, per_band, targets, alpha, ma
     L.append("response = etch depth, predictors = laser dose. Pooled across samples because depth")
     L.append("is a LOCAL differential (pin-top − clean-floor) so per-tile Z offset / tilt cancel.")
     L.append("Bands are NOT pooled together (each band is a distinct pitch/diameter family).")
+    L.append("Statistical unit = one sample/cell/band median; array rows within a cell exposure are")
+    L.append("technical replicates and are not counted as independent process trials.")
     L.append("")
     L.append(f"Samples pooled ({len(samples)}): " + ", ".join(n for n, _ in samples))
     _applied = {n: s for n, s in (cell_filters or {}).items()
@@ -661,12 +787,15 @@ def write_report(out_dir, samples, gate_rep, gated, per_band, targets, alpha, ma
     L.append(f"Targets: {', '.join(f'{t:g}' for t in targets)} µm   ·   "
              f"max debris_fraction {max_debris:g}   ·   drop_shallow={drop_shallow}   ·   "
              f"CI level {100*(1-alpha):g}%")
+    L.append(f"QC schema mode: {'LEGACY OVERRIDE (missing QC may pass)' if allow_legacy_qc else 'strict'}")
     L += _gate_report_lines(gate_rep)
+    if array_row_count is not None:
+        L.append(f"Independent units: {len(gated)} cell-band medians from {array_row_count} gated array rows")
     if band_lines:
         L.append("")
         L += band_lines
     else:
-        L.append("Bands: from the measurements 'band' column (no band definitions supplied).")
+        L.append("Bands: measurements 'band' qualified by nominal pitch (no definitions supplied).")
     L.append("")
     L.append("Extrapolation limits — trust the calibration ONLY inside the box the data cover:")
     L.append(f"    passes {gated['passes'].min():g}–{gated['passes'].max():g}   ·   "
@@ -682,19 +811,19 @@ def write_report(out_dir, samples, gate_rep, gated, per_band, targets, alpha, ma
         L.append("")
         # -- the three candidate forms --
         if sat.get("ok"):
-            L.append(f"  [saturating]  {sat['form']}   R²={sat['r2']:.3f}  (n={sat['n']}, resid σ={sat['resid_sd']:.2f} µm)")
+            L.append(f"  [saturating]  {sat['form']}   R²={sat['r2']:.3f}  AICc={sat['aicc']:.2f}  (n={sat['n']}, resid σ={sat['resid_sd']:.2f} µm)")
             L.append(f"      plateau a = {sat['a']:8.2f} µm   [{ci_lbl} {sat['a_ci'][0]:.2f}, {sat['a_ci'][1]:.2f}]")
             L.append(f"      rate    k = {sat['k']:8.4g}      [{ci_lbl} {sat['k_ci'][0]:.4g}, {sat['k_ci'][1]:.4g}]  (per dose unit)")
         else:
             L.append(f"  [saturating]  skipped: {sat.get('msg', '?')}")
         if logd.get("ok"):
-            L.append(f"  [log-dose OLS]  {logd['form']}   R²={logd['r2']:.3f}  adj-R²={logd['adj_r2']:.3f}  (n={logd['n']})")
+            L.append(f"  [log-dose OLS]  {logd['form']}   R²={logd['r2']:.3f}  adj-R²={logd['adj_r2']:.3f}  AICc={logd['aicc']:.2f}  (n={logd['n']})")
             for nm, bta, (lo, hi), pv in zip(logd["names"], logd["beta"], logd["ci"], logd["pvalues"]):
                 L.append(f"      {nm:>16} = {bta:+10.3f}   [{ci_lbl} {lo:+.3f}, {hi:+.3f}]   p={pv:.2g}")
         else:
             L.append(f"  [log-dose OLS]  skipped: {logd.get('msg', '?')}")
         if inter.get("ok"):
-            L.append(f"  [interaction OLS]  {inter['form']}   R²={inter['r2']:.3f}  adj-R²={inter['adj_r2']:.3f}  (n={inter['n']})")
+            L.append(f"  [interaction OLS]  {inter['form']}   R²={inter['r2']:.3f}  adj-R²={inter['adj_r2']:.3f}  AICc={inter['aicc']:.2f}  (n={inter['n']})")
             for nm, bta, (lo, hi), pv in zip(inter["names"], inter["beta"], inter["ci"], inter["pvalues"]):
                 L.append(f"      {nm:>16} = {bta:+10.4g}   [{ci_lbl} {lo:+.4g}, {hi:+.4g}]   p={pv:.2g}")
         else:
@@ -731,7 +860,7 @@ def write_report(out_dir, samples, gate_rep, gated, per_band, targets, alpha, ma
         for t in targets:
             dstar, lo, hi, note = invert_target(R["rec_key"], sat, logd, inter, t, alpha)
             if np.isfinite(dstar):
-                pi = f"  [{ci_lbl.replace('CI', 'dose PI')} {lo:.4g}, {hi:.4g}]" if np.isfinite(lo) else ""
+                pi = f"  [dose {ci_lbl} {lo:.4g}, {hi:.4g}]" if np.isfinite(lo) else ""
                 ex = (f"  e.g. at {s_ref:g} mm/s -> {dstar * s_ref:.0f} passes"
                       if np.isfinite(s_ref) else "")
                 L.append(f"      {t:>5g} µm: dose* = {dstar:.4g}{pi}{ex}   ({note})")
@@ -758,19 +887,18 @@ def _grid(n):
 
 
 def fig_depth_vs_dose(out_dir, per_band, targets):
-    """Per-band depth vs dose (log-x), colored by sample, with the recommended saturating curve +
-    a prediction band (mean curve ± 1.96·resid σ) and the target lines."""
+    """Per-band depth vs dose with the recommended dose-only curve and target lines."""
     bands = list(per_band)
     nrows, ncols = _grid(len(bands))
     colors = _sample_colors(per_band)
     fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 4.8 * nrows), squeeze=False)
     for idx, b in enumerate(bands):
         ax = axes[idx // ncols][idx % ncols]
-        R = per_band[b]; g = R["g"]; sat = R["sat"]
+        R = per_band[b]; g = R["g"]; sat = R["sat"]; rk = R["rec_key"]
         for s, gs in g.groupby("sample"):
             ax.plot(gs["dose_ratio"], gs["depth_um"], "o", ms=6, mew=0.5, mec="white",
                     color=colors[s], ls="none", label=str(s), alpha=0.85)
-        if sat.get("ok"):
+        if rk == "saturating" and sat.get("ok"):
             xr = np.linspace(g["dose_ratio"].min(), g["dose_ratio"].max(), 200)
             yc = _sat(xr, sat["a"], sat["k"])
             ax.plot(xr, yc, "k-", lw=1.8, label=f"saturating (R²={sat['r2']:.2f})")
@@ -779,6 +907,11 @@ def fig_depth_vs_dose(out_dir, per_band, targets):
             ax.axhline(sat["a"], color="0.5", ls=":", lw=1)
             ax.text(0.98, 0.06, f"plateau a≈{sat['a']:.0f} µm", transform=ax.transAxes,
                     ha="right", va="bottom", fontsize=8, color="0.35")
+        elif rk == "log-dose" and R["logd"].get("ok"):
+            xr = np.linspace(g["dose_ratio"].min(), g["dose_ratio"].max(), 200)
+            yc = _predict("log-dose", sat, R["logd"], R["inter"], dose=xr)
+            ax.plot(xr, yc, "k-", lw=1.8,
+                    label=f"log-dose (adj-R²={R['logd']['adj_r2']:.2f})")
         for t in targets:
             ax.axhline(t, color="crimson", ls="--", lw=1)
             # x in axes fraction, y in data units -> label sits just inside the left edge (the
@@ -793,7 +926,7 @@ def fig_depth_vs_dose(out_dir, per_band, targets):
         ax.legend(fontsize=7)
     for idx in range(len(bands), nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
-    fig.suptitle("Etch depth vs dose per band (colour = sample; curve = recommended saturating fit)",
+    fig.suptitle("Etch depth vs dose per band (colour = sample; curve = recommended dose-only fit)",
                  y=1.0)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     p = out_dir / "depth_vs_dose.png"
@@ -820,7 +953,7 @@ def fig_parity(out_dir, per_band, targets=None):        # targets unused; accept
             continue
         c = cmap(i % 10)
         axes[0].scatter(pred[m], y[m], s=18, color=c, alpha=0.65, edgecolors="white",
-                        linewidths=0.3, label=f"band {b} ({rk})")
+                        linewidths=0.3, label=f"band {_short_band(b)} ({rk})")
         axes[1].scatter(pred[m], y[m] - pred[m], s=18, color=c, alpha=0.65, edgecolors="white",
                         linewidths=0.3)
         lo_hi += [float(np.min([pred[m].min(), y[m].min()])), float(np.max([pred[m].max(), y[m].max()]))]
@@ -855,7 +988,8 @@ def fig_heatmap(out_dir, per_band, targets):
         else:
             invertible.append(b)
     if skipped:
-        print(f"heatmap: bands {skipped} have a single distinct passes or speed (a P×S heatmap "
+        skipped_label = [_short_band(b) for b in skipped]
+        print(f"heatmap: bands {skipped_label} have a single distinct passes or speed (a P×S heatmap "
               f"needs both swept) -> omitted; see depth_vs_dose.png for their dose response.")
     if not invertible:
         print("No band varies both passes and speed -> skipping heatmap.")
@@ -912,6 +1046,8 @@ def main(argv=None):
                     help="target depth(s) in µm, comma-separated (default 55)")
     ap.add_argument("--max-debris", type=float, default=DEF_MAX_DEBRIS, help="drop rows with debris_fraction above this")
     ap.add_argument("--drop-shallow", action="store_true", help="also drop 'shallow' (<3 µm) rows")
+    ap.add_argument("--allow-legacy-qc", action="store_true",
+                    help="explicitly allow old measurements lacking reliable/debris/cell QC fields")
     ap.add_argument("--alpha", type=float, default=0.05, help="CI significance level (default 0.05 -> 95%%)")
     ap.add_argument("--bands", default=None, help="band-definitions file: each row 'min_Ø, max_Ø, pitch' "
                     "(µm); omit to use the measurements 'band' column")
@@ -930,7 +1066,7 @@ def main(argv=None):
     calibrate_depth(results_dir=args.results, out_dir=args.out, include=args.include,
                     exclude=args.exclude, targets=args.targets, max_debris=args.max_debris,
                     drop_shallow=args.drop_shallow, alpha=args.alpha, band_defs_path=args.bands,
-                    cell_filters=cell_filters)
+                    cell_filters=cell_filters, allow_legacy_qc=args.allow_legacy_qc)
 
 
 if __name__ == "__main__":

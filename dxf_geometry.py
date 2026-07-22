@@ -182,6 +182,52 @@ class DXFDesign:
         return "\n".join(lines)
 
 
+def validate_equivalent_cells(design: DXFDesign, atol_um=1e-3) -> None:
+    """Reject a tiled DXF whose parsed unit cells are not geometrically identical.
+
+    The production analyzer registers repeated copies of one template. Silently selecting
+    ``cells[0]`` for a heterogeneous drawing would measure later cells with the wrong pin geometry.
+    Coordinates are already marker-relative, so a direct tolerance comparison is translation
+    invariant.
+    """
+    if len(design.cells) <= 1:
+        return
+    ref = design.cells[0]
+
+    def fail(cell, detail):
+        raise ValueError(
+            f"{Path(design.path).name}: tiled DXF cells are not geometrically equivalent; "
+            f"cell {ref.cell_id} vs cell {cell.cell_id}: {detail}. Production analysis requires "
+            "one repeated unit-cell geometry; split heterogeneous designs or add per-cell support.")
+
+    for cell in design.cells[1:]:
+        if cell.marker_shape != ref.marker_shape:
+            fail(cell, f"marker shape {ref.marker_shape!r} != {cell.marker_shape!r}")
+        if not np.allclose(cell.size_um, ref.size_um, atol=atol_um, rtol=0.0):
+            fail(cell, f"cell size {ref.size_um} != {cell.size_um}")
+        rp, cp = ref.marker_polygon_um, cell.marker_polygon_um
+        if (rp is None) != (cp is None):
+            fail(cell, "marker polygon presence differs")
+        if rp is not None and (rp.shape != cp.shape
+                               or not np.allclose(rp, cp, atol=atol_um, rtol=0.0)):
+            fail(cell, "marker polygon differs")
+        if len(cell.arrays) != len(ref.arrays) or cell.n_pins != ref.n_pins:
+            fail(cell, f"array/pin counts {(len(ref.arrays), ref.n_pins)} != "
+                 f"{(len(cell.arrays), cell.n_pins)}")
+        for i, (a, b) in enumerate(zip(ref.arrays, cell.arrays), 1):
+            discrete_a = (a.band, a.col, a.nx, a.ny, a.n_pins)
+            discrete_b = (b.band, b.col, b.nx, b.ny, b.n_pins)
+            if discrete_a != discrete_b:
+                fail(cell, f"array {i} topology {discrete_a} != {discrete_b}")
+            numeric_a = (a.diameter_um, a.pitch_x_um, a.pitch_y_um)
+            numeric_b = (b.diameter_um, b.pitch_x_um, b.pitch_y_um)
+            if not np.allclose(numeric_a, numeric_b, atol=atol_um, rtol=0.0):
+                fail(cell, f"array {i} diameter/pitch {numeric_a} != {numeric_b}")
+            if (a.centers_um.shape != b.centers_um.shape
+                    or not np.allclose(a.centers_um, b.centers_um, atol=atol_um, rtol=0.0)):
+                fail(cell, f"array {i} pin centers differ")
+
+
 # ---------------------------------------------------------------- DXF reading #
 def _poly_area(verts):
     """Enclosed (shoelace) area of a closed polygon, given its vertices (N,2). Sign-agnostic."""

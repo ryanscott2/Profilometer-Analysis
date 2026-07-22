@@ -82,6 +82,13 @@ def _safe_name(name):
     return name or "unnamed"
 
 
+def _sample_name_collision(name, existing_names):
+    """Return the existing sample whose Windows output folder collides with ``name``."""
+    target = _safe_name(name).casefold()
+    return next((other for other in existing_names
+                 if other != name and _safe_name(other).casefold() == target), None)
+
+
 def _parse_drop(data: str):
     """Parse a Tk DnD drop payload into paths (handles {braced paths with spaces})."""
     out, buf, brace = [], "", False
@@ -327,6 +334,12 @@ class App:
         self.cal_target = tk.StringVar(value="55")
         ttk.Entry(tgtf, textvariable=self.cal_target, width=16).grid(row=0, column=1, sticky="w", padx=(4, 0))
         ttk.Label(tgtf, text="(comma-sep OK)", foreground="#666").grid(row=0, column=2, sticky="w", padx=(4, 0))
+        self.cal_allow_legacy_qc = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            tgtf,
+            text="allow legacy files missing QC fields (unsafe)",
+            variable=self.cal_allow_legacy_qc,
+        ).grid(row=1, column=0, columnspan=3, sticky="w")
         self.cal_btn = ttk.Button(calf, text="Calibrate depth", command=self._calibrate_depth)
         self.cal_btn.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 0))
 
@@ -413,6 +426,12 @@ class App:
         name = _ask_name(self.root, self.sample_var.get())
         if not name:
             return
+        collision = _sample_name_collision(name, self.samples)
+        if collision:
+            return messagebox.showerror(
+                "Sample name collision",
+                f"'{name}' and existing sample '{collision}' map to the same Windows Results "
+                f"folder ('{_safe_name(name)}'). Choose a distinct name; the run was not saved.")
         self.samples[name] = self._snapshot()
         self._save_samples(); self._refresh_sample_combo(); self.sample_var.set(name)
         self.status.config(text=f"saved '{name}'")
@@ -453,6 +472,11 @@ class App:
             return messagebox.showerror(
                 "Run", "Select a sample in the Samples dropdown first — its name is used for the "
                 "Results subfolder.  Use “Save as…” to name the current setup as a sample.")
+        collision = _sample_name_collision(self.sample_var.get(), self.samples)
+        if collision:
+            return messagebox.showerror(
+                "Run", f"This sample collides with '{collision}' at Results\\{self._dataset_name()}. "
+                "Rename one sample before running so neither result can overwrite the other.")
         if _safe_name(self.sample_var.get()).casefold() == CAL_OUT_NAME.casefold():
             return messagebox.showerror(
                 "Run", f"'{CAL_OUT_NAME}' is reserved for the depth-calibration output folder. "
@@ -659,6 +683,8 @@ class App:
         cmd = [sys.executable, "-u", str(HERE / CAL_SCRIPT),
                "--results", str(DEF_OUT), "--out", str(out_dir),
                "--targets", ",".join(f"{v:g}" for v in vals)]
+        if self.cal_allow_legacy_qc.get():
+            cmd.append("--allow-legacy-qc")
         # a strict subset -> --include those; all/none selected -> omit so it pools everything.
         # Pass each name as its own token (calibrate_depth --include is nargs='*'), so names with
         # spaces or commas survive intact.
@@ -858,8 +884,8 @@ def _ask_name(root, initial=""):
         dlg.destroy()
 
     ttk.Button(dlg, text="OK", command=ok).grid(row=1, column=0, columnspan=2, pady=(0, 8))
-    e.bind("<Return>", lambda ev: ok())
-    e.bind("<Escape>", lambda ev: dlg.destroy())
+    e.bind("<Return>", lambda _event: ok())
+    e.bind("<Escape>", lambda _event: dlg.destroy())
     root.wait_window(dlg)
     return res["v"]
 
