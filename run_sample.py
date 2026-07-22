@@ -40,7 +40,7 @@ from matplotlib.lines import Line2D
 sys.path.insert(0, str(Path(__file__).parent))
 from dxf_geometry import read_design
 from assemble import assemble_tiles
-from register import register_sample
+from register import RegistrationAmbiguityError, register_sample
 from extract import ArraySample, extract_array
 from laser_params import load_cell_params, CELL_CSV_NAME
 import report as ra          # shared measurement-row builder + legacy plot suite
@@ -181,7 +181,10 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
     print(design.summary())
 
     scan = assemble_tiles(vk4_dir)
-    placements = register_sample(scan, template)
+    try:
+        placements = register_sample(scan, template)
+    except RegistrationAmbiguityError as e:
+        raise SystemExit(str(e)) from None
     if not placements:
         raise SystemExit("No unit cells could be registered in the assembled sample.")
     params = load_cell_params(cell_csv)

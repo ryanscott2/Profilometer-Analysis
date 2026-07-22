@@ -13,8 +13,8 @@ Pipeline:
    (50 µm-wide arms) inset from the origin (its offset is derived from the cell boundary, so pins
    stay in true design coordinates). Pins are grouped into arrays (contiguous blocks of one
    diameter on a regular grid) with per-array diameter, pitch, `nx×ny`, and coordinates **relative
-   to the cell origin**. (DXF-side L support is in place; the scan-side L matcher is pending a real
-   L-marker scan — square-marker samples are fully supported.)
+   to the cell origin**. The asymmetric L is the preferred marker; legacy square-marker samples
+   remain supported through their established small-angle registration path.
 2. **Register** (`register.py`) — a VK4 scan may contain several tiled copies of the unit
    cell. Each is located by detecting its 200 µm marker (matched-filter on the scan's edge
    map, polarity-agnostic), then snapping to the pin lattice. Tiled cells are ordered
@@ -39,6 +39,10 @@ cells. The driver stitches the tiles into one scan (`assemble.py`), finds every 
 - Registration anchors on the **unique marker** plus one global rotation (not the periodic pin
   lattice, whose overlap aliases a pitch away), and uses a pin/floor **height-contrast gate**
   to reject flat un-ablated wafer.
+- Asymmetric L markers and genuinely aperiodic marker-free multi-array patterns search stage
+  rotations from −5° to +5°. A markerless complete uniform lattice is deliberately rejected:
+  origins one pin pitch apart are not uniquely distinguishable, so add an asymmetric fiducial or
+  provide a trusted manual origin instead of accepting a silent pitch alias.
 - Cells are indexed by **design (row, col) with (1,1) = DXF top-left** (marker-anchored). Laser
   parameters are supplied per cell in `CSV/cell_params.csv` as a plain **grid in that design
   orientation**: line `r` = design row `r` (top first), column `c` = design col `c` (left first),
@@ -63,7 +67,7 @@ python dxf_geometry.py                 # prints arrays / bands / pitches / diame
 Validate the whole pipeline on synthetic data (no VK4 files needed):
 
 ```bash
-python selftest.py                     # registration + extraction + plots, with assertions
+python selftest.py                     # synthetic pipeline + real-DXF alias regressions
 python synth.py                        # writes Results/synth_preview.png
 ```
 
@@ -100,7 +104,10 @@ every parameter present.
 `register_sample` locates every unit cell automatically: it detects each cell's alignment marker
 (an absolute, off-pin-lattice anchor), estimates the tile lattice from the strongest cells, and
 probes every lattice node — so a dense periodic array registers cleanly and spurious marker hits
-are rejected by construction. Confirm the result from the `design(r,c) → marker x/y, rot, reg`
+are rejected by construction. L-marker detection uses a coarse-to-fine −5° to +5° angle search;
+the deprecated symmetric square retains its proven legacy detector. Marker-free registration is
+allowed only when the DXF pattern itself is aperiodic; a complete single uniform grid fails closed
+with an actionable ambiguity error. Confirm the result from the `design(r,c) → marker x/y, rot, reg`
 table printed each run (a `rot` near ±180° flags a re-oriented wafer) and the per-cell reports in
 `Results/<sample>/figures/cells/`. Cell (row,col) indices are absolute (a dropped interior
 row/column leaves a hole, not a shift); a `cell_params` entry with no registered cell is warned as

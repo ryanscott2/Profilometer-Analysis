@@ -6,6 +6,7 @@ Validates the v2 pipeline that cannot be exercised on the empty ``VK4/`` folder 
   1. Registration recovers a known cell origin (single cell and a tiled 2-cell scan).
   2. Extraction recovers the known diameter / pitch / depth for every array.
   3. The full plot suite renders from a synthetic measurements table.
+  4. Real markerless fabrication DXFs retain their geometry and expose pitch-alias risk.
 
 Run:  python selftest.py       (writes previews/plots under Results/selftest/)
 Exit code is non-zero if any check fails, so it can gate CI.
@@ -13,13 +14,17 @@ Exit code is non-zero if any check fails, so it can gate CI.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from dxf_geometry import read_design
-from register import register_scan, register_sample
+from register import (RegistrationAmbiguityError, _dealias_origin, _overlap_score,
+                      _register_by_pattern, rasterize_cell_pins, register_scan,
+                      register_sample, scan_feature)
 from extract import ArraySample, extract_array
 from synth import synth_scan
 import report as ra
@@ -55,7 +60,11 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     ck = Checker()
 
-    dxf = next((HERE / "DXF").glob("*.dxf"))
+    # Versioned real fixture keeps the gate portable; fall back to a user's local DXF for older
+    # checkouts that predate the fixture directory.
+    dxf = HERE / "tests" / "fixtures" / "registration" / "071826_UVPFLM_D300.dxf"
+    if not dxf.is_file():
+        dxf = next((HERE / "DXF").glob("*.dxf"))
     design = read_design(dxf)
     template = design.cells[0]
     print(f"DXF: {template.n_arrays} arrays / {template.n_pins} pins, "
@@ -432,7 +441,8 @@ def main():
     # ---------------------------------------- 14. L-fiducial detection + tiled-grid recovery (#20, #16) #
     print("\n[14] L-marker detection + register_sample tiled-grid recovery (production path)")
     try:
-        _cands = list((HERE / "DXF").glob("*.dxf"))
+        _cands = list((HERE / "tests" / "fixtures" / "registration").glob("*.dxf"))
+        _cands += list((HERE / "DXF").glob("*.dxf"))
         if (HERE / "Results").is_dir():
             _cands += list((HERE / "Results").glob("*/figures/*.dxf"))
         _Ltmpl = None
@@ -449,7 +459,8 @@ def main():
         else:
             _gap = 300.0
             scan_L, _trL = synth_scan(_Ltmpl, x_um_per_px=2.0, y_um_per_px=2.0, origin_px=(110.0, 90.0),
-                                      n_cells=3, cell_gap_um=_gap, depth_um=30.0, floor_um=60.0, seed=21)
+                                      n_cells=3, cell_gap_um=_gap, depth_um=30.0, floor_um=60.0,
+                                      rotation_deg=5.0, seed=21)
             _allcL = _Ltmpl.all_centers_um()
             _pitch = (_allcL[:, 0].max() + _gap, _allcL[:, 1].max() + _gap)
             pls_L = register_sample(scan_L, _Ltmpl, cell_pitch_um=_pitch, mirror_x=False)
@@ -458,7 +469,9 @@ def main():
                      "L: located via the marker branch (L polygon), no square fallback")
             _errs = [min(max(abs(p.origin_col - a), abs(p.origin_row - b)) for a, b in _trL["origins"])
                      for p in pls_L]
-            ck.check(bool(_errs) and max(_errs) <= 6.0, "L: every recovered origin within 6 px of truth")
+            ck.check(bool(_errs) and max(_errs) <= 2.0, "L: every +5 deg origin within 2 px of truth")
+            ck.check(all(abs(p.rotation_deg - 5.0) <= 0.15 for p in pls_L),
+                     "#19: register_sample recovers +5 deg within 0.15 deg")
             # #16: the PRODUCTION register_sample path recovers the design-frame grid indices
             # (row-major: 1=left; a single tiled row -> cols 1,2,3, all row 1) and orientation.
             ck.check(sorted(p.cell_col for p in pls_L) == [1, 2, 3] and all(p.cell_row == 1 for p in pls_L),
@@ -468,6 +481,133 @@ def main():
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"L-marker path raised: {e!r}")
 
+    # --------------------------------------------- 15. markerless uniform-array aliasing (#2) #
+    print("\n[15] real markerless DXFs: geometry lock + one-pitch alias regression (#2)")
+    try:
+        _fixture_dir = HERE / "tests" / "fixtures" / "markerless"
+        _cases = (
+            ("D50_P100_1cm2.dxf", 50.0, 100.0, 100, 10_000,
+             "1d9ab5d1596b6941631507cbff841e4c3b2d65663decd43ce7b730fbfc6f5807"),
+            ("D100_P150_1cm2.dxf", 100.0, 150.0, 66, 4_356,
+             "5a27edf89d15583b904e1eeae53ab6bae05047a85bcc49e20a5f3157d2783d0a"),
+            # The filename says D300, but the actual fabrication circle radius is 0.1475 mm.
+            ("D300_P350_1cm2.dxf", 295.0, 350.0, 28, 784,
+             "ed88e62f24f6d20b427bfb1247c2a2b4ae6762adf58105475e763a6b11626cc3"),
+        )
+        _loaded = []
+        for _name, _dia, _pitch, _grid, _npins, _sha in _cases:
+            _path = _fixture_dir / _name
+            _design = read_design(_path)
+            _cell = _design.cells[0]
+            _array = _cell.arrays[0]
+            ck.check(hashlib.sha256(_path.read_bytes()).hexdigest() == _sha,
+                     f"#2 {_name}: original fixture SHA-256 is unchanged")
+            ck.check(not _design.is_unit_cell and _design.n_markers == 0
+                     and len(_design.cells) == 1 and _cell.marker_polygon_um is None,
+                     f"#2 {_name}: parsed as one markerless cell")
+            ck.check(len(_cell.arrays) == 1 and _array.nx == _array.ny == _grid
+                     and _array.n_pins == _cell.n_pins == _npins == _grid * _grid,
+                     f"#2 {_name}: complete {_grid}x{_grid} single uniform grid")
+            ck.check(abs(_array.diameter_um - _dia) <= 1e-6
+                     and abs(_array.pitch_x_um - _pitch) <= 1e-6
+                     and abs(_array.pitch_y_um - _pitch) <= 1e-6,
+                     f"#2 {_name}: drawn D{_dia:g}/P{_pitch:g} geometry retained")
+            ck.check(_design.boundary_bbox_mm == (0.0, 0.0, 10.0, 10.0)
+                     and _cell.size_um == (10_000.0, 10_000.0),
+                     f"#2 {_name}: 1 cm2 boundary retained")
+            _loaded.append((_name, _cell, _array, _grid))
+
+        _scale = 25.0
+        _origin = (20.0, 20.0)
+        _margin = inspect.signature(_dealias_origin).parameters["margin"].default
+        ck.check(_margin == 0.02, "#2: current de-alias decision margin is 2 percentage points")
+        for _name, _cell, _array, _grid in _loaded:
+            _px = _array.pitch_x_um / _scale
+            _py = _array.pitch_y_um / _scale
+            _rad = 0.5 * _array.diameter_um / _scale
+            _sx = (_array.x1_um - _array.x0_um) / _scale
+            _sy = (_array.y1_um - _array.y0_um) / _scale
+            _shape = (int(np.ceil(2 * _origin[1] + _sy + _py + 2 * _rad + 3)),
+                      int(np.ceil(2 * _origin[0] + _sx + _px + 2 * _rad + 3)))
+            _truth = rasterize_cell_pins(_cell, _scale, _scale, _shape, _origin)
+            _shift_x = rasterize_cell_pins(
+                _cell, _scale, _scale, _shape, (_origin[0] + _px, _origin[1]))
+            _shift_xy = rasterize_cell_pins(
+                _cell, _scale, _scale, _shape, (_origin[0] + _px, _origin[1] + _py))
+            _score_x = _overlap_score(_truth, _shift_x)
+            _score_xy = _overlap_score(_truth, _shift_xy)
+            _expected_x = (_grid - 1) / _grid
+            _expected_xy = _expected_x ** 2
+            ck.check(abs(_score_x - _expected_x) <= 1e-12 and _score_x > 0.96,
+                     f"#2 {_name}: one-pitch wrong origin still scores {_score_x:.4f}")
+            ck.check(abs(_score_xy - _expected_xy) <= 1e-12 and _score_xy > 0.92,
+                     f"#2 {_name}: diagonal pitch alias still scores {_score_xy:.4f}")
+
+            _aliased = (_origin[0] + _px, _origin[1])
+            _recovered, _ov = _dealias_origin(
+                _truth, _cell, _aliased, _scale, _scale, y_up=1, x_right=1, rot_deg=0.0)
+            _recovered_truth = (abs(_recovered[0] - _origin[0]) <= 1e-6
+                                and abs(_recovered[1] - _origin[1]) <= 1e-6)
+            if _grid in (100, 66):
+                ck.check(1.0 / _grid < _margin,
+                         f"#2 {_name}: edge evidence {1 / _grid:.4f} is below the {_margin:.2f} margin")
+                ck.check(not _recovered_truth,
+                         f"#2 {_name}: overlap de-alias alone is demonstrably insufficient")
+            else:
+                ck.check(_ov > 0.99 and _recovered_truth,
+                         f"#2 {_name}: shorter ideal grid clears the margin and de-aliases")
+
+            _refused = False
+            try:
+                _register_by_pattern(None, _cell, None, None)
+            except RegistrationAmbiguityError as _err:
+                _refused = ("one pin pitch" in str(_err)
+                            and "alignment fiducial" in str(_err))
+            ck.check(_refused,
+                     f"#2 {_name}: production marker-free path fails closed with actionable error")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"markerless-DXF alias regression path raised: {e!r}")
+
+    # ------------------------------------------------ 16. multi-degree rotation recovery (#19) #
+    print("\n[16] real L-fiducial: register_scan + marker-free multi-degree rotation (#19)")
+    try:
+        _lpath = HERE / "tests" / "fixtures" / "registration" / "072026_UVPFLM_D100D50.dxf"
+        ck.check(hashlib.sha256(_lpath.read_bytes()).hexdigest()
+                 == "2c1c655ee9ab507a76386782eee88489e75e9d412663bd1631ea349f40aaf4ae",
+                 "#19: real L-marker fixture SHA-256 is unchanged")
+        _lt = read_design(_lpath).cells[0]
+        ck.check(_lt.marker_shape == "L" and _lt.marker_polygon_um is not None,
+                 "#19: rotation fixture contains the real asymmetric L fiducial")
+        for _angle in (-5.0, 3.0, 5.0):
+            _rs, _rt = synth_scan(
+                _lt, x_um_per_px=2.0, y_um_per_px=2.0, origin_px=(140.0, 140.0),
+                rotation_deg=_angle, depth_um=30.0, seed=300 + int(_angle))
+            _rp = register_scan(_rs, _lt, n_cells=1)[0]
+            _ro = _rt["origins"][0]
+            ck.check(np.isfinite(_rp.origin_col)
+                     and max(abs(_rp.origin_col - _ro[0]), abs(_rp.origin_row - _ro[1])) <= 2.0,
+                     f"#19: register_scan {_angle:+g} deg origin within 2 px")
+            ck.check(abs(_rp.rotation_deg - _angle) <= 0.15,
+                     f"#19: register_scan recovers {_angle:+g} deg within 0.15 deg")
+
+        # The two-array pattern is aperiodic enough to register without its marker. This directly
+        # exercises the broadened +/-5 deg marker-free fallback rather than the marker estimator.
+        _ps, _pt = synth_scan(
+            _lt, x_um_per_px=2.0, y_um_per_px=2.0, origin_px=(140.0, 140.0),
+            rotation_deg=3.0, marker=False, depth_um=30.0, seed=319)
+        _, _, _, _pv, _pz0 = scan_feature(_ps)
+        _pp = _register_by_pattern(
+            _ps, _lt, _pz0, _pv, x_right_options=(1,), y_up_options=(1,))
+        ck.check(len(_pp) == 1, "#19: marker-free two-array pattern finds exactly one cell")
+        if _pp:
+            _po = _pt["origins"][0]
+            ck.check(max(abs(_pp[0].origin_col - _po[0]), abs(_pp[0].origin_row - _po[1])) <= 2.0,
+                     "#19: marker-free +3 deg origin within 2 px")
+            ck.check(abs(_pp[0].rotation_deg - 3.0) <= 0.15,
+                     "#19: marker-free fallback recovers +3 deg within 0.15 deg")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"multi-degree rotation regression path raised: {e!r}")
+
     df.to_csv(OUT / "synth_measurements.csv", index=False)
     print(f"\nWrote synthetic measurements + plots to {OUT}")
     print(f"\n{'='*60}\n{ck.n - len(ck.fails)}/{ck.n} checks passed")
@@ -476,7 +616,7 @@ def main():
         for m in ck.fails:
             print("  -", m)
         raise SystemExit(1)
-    print("ALL CHECKS PASSED")
+    print("ALL REQUIRED CHECKS PASSED")
 
 
 if __name__ == "__main__":

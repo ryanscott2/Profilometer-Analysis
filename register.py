@@ -34,6 +34,10 @@ import numpy as np
 
 
 # --------------------------------------------------------------------------- #
+class RegistrationAmbiguityError(RuntimeError):
+    """Automatic registration cannot establish a unique absolute design origin."""
+
+
 @dataclass
 class CellPlacement:
     """Where one DXF unit cell sits in the scan, and how to map CAD um -> scan px."""
@@ -149,7 +153,8 @@ def _phase_shift(a, b):
     Fb = np.fft.rfft2(b)
     R = Fa * np.conj(Fb)
     denom = np.abs(R)
-    R = np.where(denom > 1e-12, R / denom, 0.0)   # phase correlation
+    with np.errstate(divide="ignore", invalid="ignore"):
+        R = np.where(denom > 1e-12, R / denom, 0.0)   # phase correlation
     corr = np.fft.irfft2(R, s=a.shape)
     pk = np.unravel_index(np.argmax(corr), corr.shape)
     drow = pk[0] if pk[0] <= a.shape[0] // 2 else pk[0] - a.shape[0]
@@ -347,6 +352,36 @@ def register_scan(scan, template, n_cells=1, overrides=None, refine=True,
                       marker_px_x + marker_px_y, 40)
 
     n_detect = max(0, n_cells - len(overrides))
+    if (refine and n_detect > 0 and template.marker_shape == "L"
+            and template.marker_polygon_um is not None
+            and len(template.marker_polygon_um) >= 3 and template.arrays):
+        auto = _register_rotated_marker_cells(
+            feat, z0, valid, amask, template, xppx, yppx,
+            ((1, -1) if resolve_xflip else (1,)),
+            ((1, -1) if resolve_yflip else (1,)),
+            min_sep, max_shift, min_overlap, n_detect)
+        if auto:
+            placements = []
+            auto_i = 0
+            for cid in range(1, n_cells + 1):
+                if cid in overrides:
+                    o = overrides[cid]
+                    placements.append(CellPlacement(
+                        cid, float(o["origin_col"]), float(o["origin_row"]), xppx, yppx,
+                        y_up=int(o.get("y_up", 1)), x_right=int(o.get("x_right", 1)),
+                        rotation_deg=float(o.get("rotation_deg", 0.0)),
+                        score=float("nan"), method="manual"))
+                elif auto_i < len(auto):
+                    p = auto[auto_i]
+                    p.cell_id = cid
+                    placements.append(p)
+                    auto_i += 1
+                else:
+                    placements.append(CellPlacement(cid, np.nan, np.nan, xppx, yppx,
+                                                    method="failed"))
+            return _finalize_placements(placements, min_sep, min_overlap,
+                                        template.size_um[1] / yppx)
+
     peaks = detect_markers(edge, marker_px_x, marker_px_y, expect_n=max(1, n_detect),
                            min_sep_px=min_sep) if n_detect > 0 else []
 
@@ -539,6 +574,24 @@ def _assign_grid_indices(cells, Pxpx, Pypx):
 
 
 # ------------------------------------------- marker-free DXF-pattern fallback #
+def _uniform_lattice_alias_reason(template):
+    """Explain why ``template`` has pitch-equivalent origins, or return ``None``.
+
+    A single complete rectangular pin array has no internal absolute-phase feature: translating
+    it by one pitch retains all but one edge row/column.  That is not enough evidence to choose an
+    origin safely when there is no detected marker.  Multi-array or intentionally incomplete
+    patterns may be aperiodic and remain eligible for whole-pattern registration.
+    """
+    if len(template.arrays) != 1:
+        return None
+    a = template.arrays[0]
+    if a.nx < 2 or a.ny < 2 or a.n_pins != a.nx * a.ny:
+        return None
+    return (f"markerless DXF is a complete uniform {a.nx}x{a.ny} lattice "
+            f"(D{a.diameter_um:g} um, pitch {a.pitch_x_um:g}x{a.pitch_y_um:g} um); "
+            "origins separated by one pin pitch are not uniquely distinguishable")
+
+
 def _cell_pin_pattern(template, xppx, yppx, x_right, y_up, rot_deg, ds, margin_px=6):
     """Compact binary image of the WHOLE cell's pin disks at downsample ``ds`` for the given
     reflection/rotation, plus the (col,row) pixel in that image where CAD (0,0) sits and the
@@ -700,14 +753,22 @@ def _register_by_pattern(scan, template, z0, valid, *, cell_pitch_um=None,
     """
     if not template.arrays:
         return []
+    alias_reason = _uniform_lattice_alias_reason(template)
+    if alias_reason:
+        raise RegistrationAmbiguityError(
+            f"Refusing automatic marker-free registration: {alias_reason}. Add/detect an "
+            "asymmetric alignment fiducial or provide a trusted manual origin.")
     xppx, yppx = scan.x_um_per_px, scan.y_um_per_px
     H, W = scan.height_raw.shape
     w_um, h_um = template.size_um                          # cell size from the DXF
     Pxpx = (cell_pitch_um[0] if cell_pitch_um else w_um) / xppx
     Pypx = (cell_pitch_um[1] if cell_pitch_um else h_um) / yppx
     min_sep = 0.5 * min(Pxpx, Pypx)
-    if angles_deg is None:
-        angles_deg = np.arange(-1.0, 1.0001, 0.25)
+    auto_angles = angles_deg is None
+    if auto_angles:
+        # Broad enough for realistic stage placement, but still coarse here; only the winning
+        # reflection/angle gets the second downsampled refinement and full-resolution polish.
+        angles_deg = np.arange(-5.0, 5.0001, 0.5)
     pin_pitch_px = float(np.mean([a.pitch_x_um for a in template.arrays])) / xppx
     pin_mask = _adaptive_pin_mask(z0, valid, pin_pitch_px)   # depth-robust; sees shallow cells
     # the coarse candidate is already accurate to ~one downsample step, so the full-res refine
@@ -733,6 +794,20 @@ def _register_by_pattern(scan, template, z0, valid, *, cell_pitch_um=None,
                     best = (pv, xr, yu, ang, corr, t0c, t0r, Ht, Wt)
     if best is None:
         return []
+    if auto_angles:
+        # Refine only the winning reflection around its coarse angle before extracting peaks.
+        _, best_xr, best_yu, best_ang, *_ = best
+        for ang2 in np.arange(max(-5.0, best_ang - 0.5),
+                              min(5.0, best_ang + 0.5) + 0.0501, 0.1):
+            T, t0c, t0r, Ht, Wt = _cell_pin_pattern(
+                template, xppx, yppx, best_xr, best_yu, float(ang2), ds)
+            if T.sum() < 5:
+                continue
+            corr2 = _pattern_ncc(img, T)
+            pv2 = float(corr2.max())
+            if pv2 > best[0]:
+                best = (pv2, best_xr, best_yu, float(ang2), corr2,
+                        t0c, t0r, Ht, Wt)
     _, xr, yu, ang, corr, t0c, t0r, Ht, Wt = best
 
     # --- coarse: peel off well-separated NCC peaks -> candidate origins. Accept a peak only if
@@ -886,6 +961,77 @@ def _detect_marker_origins(feat, cell, xppx, yppx, x_right, y_up, rot, min_sep,
     return out
 
 
+def _detect_marker_origins_rotated(features, cell, xppx, yppx, x_right, y_up,
+                                   min_sep, max_n=60, span=5.0, coarse_step=1.0,
+                                   fine_step=0.25, thresh=0.2, n_angle_hypotheses=3):
+    """Rotation-aware marker search with a downsampled coarse-to-fine angle sweep.
+
+    Stage rotation is global. The expensive angle sweep runs on a reduced feature map (marker long
+    side ~=20 px), then only a small shortlist (including zero, to protect near-aligned real scans
+    from border-driven maxima) gets full-resolution NCC. Downstream pin-pattern validation chooses
+    among the hypotheses. Returns
+    ``[(origin_col, origin_row, ncc, angle_deg), ...]``.
+    """
+    features = [np.asarray(f, float) for f in features if f is not None]
+    if not features:
+        return []
+    poly = np.asarray(cell.marker_polygon_um, float)
+    marker_span_px = max(np.ptp(poly[:, 0]) / xppx, np.ptp(poly[:, 1]) / yppx)
+    ds = max(1, int(round(marker_span_px / 20.0)))
+    coarse_features = [f[::ds, ::ds] for f in features]
+
+    def _angle_score(angle):
+        T, _, _ = _rasterize_marker(
+            cell, xppx * ds, yppx * ds, x_right, y_up, float(angle))
+        if T.sum() < 3:
+            return -1.0
+        score = -1.0
+        for f in coarse_features:
+            corr = np.abs(_pattern_ncc(f, T))
+            if corr.size:
+                score = max(score, float(np.max(corr)))
+        return score
+
+    coarse_angles = np.arange(-span, span + 0.5 * coarse_step, coarse_step)
+    scored = [(_angle_score(a), float(a)) for a in coarse_angles]
+    if max(scored, key=lambda t: t[0])[0] < thresh:
+        return []
+    centres = []
+    for score, angle in sorted(scored, reverse=True):
+        if score >= thresh and not any(abs(angle - a) < 0.75 * coarse_step for a in centres):
+            centres.append(angle)
+        if len(centres) >= max(1, n_angle_hypotheses - 1):
+            break
+    if not any(abs(a) < 0.5 * coarse_step for a in centres):
+        centres.append(0.0)
+
+    angles = []
+    for centre in centres[:n_angle_hypotheses]:
+        best_score, best_angle = _angle_score(centre), float(centre)
+        fine_lo = max(-span, centre - coarse_step)
+        fine_hi = min(span, centre + coarse_step)
+        for angle in np.arange(fine_lo, fine_hi + 0.5 * fine_step, fine_step):
+            score = _angle_score(angle)
+            if score > best_score:
+                best_score, best_angle = score, float(angle)
+        if not any(abs(best_angle - a) < 0.5 * fine_step for a in angles):
+            angles.append(best_angle)
+
+    # Keep feature channels *and angle hypotheses* independent until pin-overlap refinement.  On the
+    # real 72026 scan, a slightly stronger -1-degree marker NCC lies within one marker-width of the
+    # genuine zero-degree candidate, while a height false peak similarly crowds an intensity marker.
+    # Deduplicating either dimension here discards the right absolute anchor before the pin lattice
+    # gets a vote.  ``_detect_marker_origins`` already bounds and peels each feature/angle search, so
+    # this remains bounded by max_n * n_features * n_angle_hypotheses.
+    out = []
+    for angle in angles:
+        for f in features:
+            out.extend((*hit, angle) for hit in _detect_marker_origins(
+                f, cell, xppx, yppx, x_right, y_up, angle, min_sep,
+                max_n=max_n, thresh=thresh))
+    return out
+
+
 def _lattice_step_candidates(cells, cell_w, cell_h, ntop=3):
     """Candidate primitive tile-step vectors (dcol, drow) along each axis, smallest magnitude
     first. ``cells`` = list of (origin_col, origin_row, overlap). A horizontal-ish offset between
@@ -947,6 +1093,79 @@ def _global_rotation(amask, template, origin, xppx, yppx, y_up, x_right, max_shi
             if ov > best_ov:
                 best_ov, best_a = ov, float(a)
     return best_a
+
+
+def _register_rotated_marker_cells(feat, z0, valid, amask, template, xppx, yppx,
+                                   x_right_options, y_up_options, min_sep, max_shift,
+                                   min_overlap, max_n):
+    """Rotation-aware marker registration shared by ``register_scan``'s auto path.
+
+    Every reflection option gets its own L-marker angle search and pin-overlap polish. The winning
+    option must explain the requested number of cells, then wins on marker and pin evidence.
+    Returns only finite marker-anchored placements.
+    """
+    poly = np.asarray(template.marker_polygon_um, float)
+    marker_span = max(np.ptp(poly[:, 0]) / xppx, np.ptp(poly[:, 1]) / yppx)
+    marker_sep = max(0.6 * marker_span, 20.0)
+    mean_pitch_px = float(np.mean([a.pitch_x_um for a in template.arrays])) / xppx
+    mfeat = _marker_feature(z0, valid, mean_pitch_px)
+    options = []
+
+    for xr in x_right_options:
+        for yu in y_up_options:
+            markers = _detect_marker_origins_rotated(
+                (mfeat, feat), template, xppx, yppx, xr, yu, marker_sep,
+                max_n=max(8, 2 * max_n))
+            if not markers:
+                continue
+
+            cand = []
+            for oc, orow, marker_sc, marker_rot in markers:
+                o, ov = _refine_origin(
+                    amask, template, (oc, orow), xppx, yppx, yu, xr, marker_rot,
+                    search_px=int(max_shift) + 6, max_shift_px=max_shift)
+                if np.isfinite(ov) and ov >= min_overlap:
+                    cand.append((float(o[0]), float(o[1]), float(ov), float(marker_sc),
+                                 float(marker_rot)))
+            if not cand:
+                continue
+            # Pin-pattern overlap is the registration score and the most stable discriminator;
+            # marker NCC breaks ties but must not pull a good origin toward a nearby visual peak.
+            cand.sort(key=lambda t: (-t[2], -t[3]))
+            dedup = []
+            for c in cand:
+                if not any((c[0] - k[0]) ** 2 + (c[1] - k[1]) ** 2 < min_sep ** 2
+                           for k in dedup):
+                    dedup.append(c)
+            if not dedup:
+                continue
+
+            prelim = dedup[:max_n]
+            mean_ov = float(np.mean([c[2] for c in prelim]))
+            marker_top = prelim[0][3]
+            quality = (len(prelim), marker_top + 2.0 * mean_ov, mean_ov)
+            options.append((quality, xr, yu, prelim))
+
+    if not options:
+        return []
+    _, xr, yu, chosen = max(options, key=lambda t: t[0])
+    anchor = max(chosen, key=lambda t: (t[2], t[3]))
+    rot = _global_rotation(
+        amask, template, (anchor[0], anchor[1]), xppx, yppx, yu, xr, max_shift)
+    angle_consistent = [c for c in chosen if abs(c[4] - rot) <= 0.6]
+    if angle_consistent:
+        chosen = angle_consistent
+    polished = []
+    for c in chosen:
+        o, ov = _refine_origin(
+            amask, template, (c[0], c[1]), xppx, yppx, yu, xr, rot,
+            search_px=int(max_shift) + 6, max_shift_px=max_shift)
+        if np.isfinite(ov) and ov >= min_overlap:
+            polished.append((float(o[0]), float(o[1]), float(ov), c[3]))
+    polished.sort(key=lambda t: (-t[3], -t[2]))
+    return [CellPlacement(
+        0, c[0], c[1], xppx, yppx, y_up=yu, x_right=xr,
+        rotation_deg=rot, score=c[2], method="marker+lattice") for c in polished[:max_n]]
 
 
 def _grid_nodes(O0, col_vec, row_vec, W, H, cell_w, cell_h):
@@ -1095,28 +1314,40 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
         # scale -- a cell-scale sep merged adjacent cells' markers and lost them.
         mfeat = _marker_feature(z0, valid, mean_pitch_px)
         marker_sep = max(0.6 * max(np.ptp(poly[:, 0]) / xppx, np.ptp(poly[:, 1]) / yppx), 20.0)
-        markers = (_detect_marker_origins(mfeat, template, xppx, yppx, x_right, y_up, 0.0, marker_sep, max_n=ex)
-                   + _detect_marker_origins(feat, template, xppx, yppx, x_right, y_up, 0.0, marker_sep, max_n=ex))
+        markers = _detect_marker_origins_rotated(
+            (mfeat, feat), template, xppx, yppx, x_right, y_up, marker_sep, max_n=ex)
     else:
-        # deprecated SQUARE marker: the original filled-square-on-intensity detector, mapping the
-        # detected marker CENTRE to the cell origin (the square sits ON the origin).
+        # Deprecated square marker: preserve the proven filled-square intensity detector exactly.
+        # A square carries no orientation evidence, and rotating its outline changed the established
+        # 718 small-angle phase. Multi-degree automatic recovery is supported by asymmetric L
+        # fiducials (and aperiodic marker-free patterns), not by this legacy symmetric marker.
         marker_um = template.marker_size_um if np.isfinite(template.marker_size_um) else 200.0
         mx, my = marker_um / xppx, marker_um / yppx
         marker_px = 0.5 * (mx + my)
-        centres = _solid_square_ncc_markers(feat, marker_px, max(0.6 * marker_px, 20), max_n=ex)
-        markers = [(mc - x_right * 0.5 * mx, mr - y_up * 0.5 * my, sc) for (mc, mr, sc) in centres]
+        centres = _solid_square_ncc_markers(
+            feat, marker_px, max(0.6 * marker_px, 20), max_n=ex)
+        markers = [(mc - x_right * 0.5 * mx, mr - y_up * 0.5 * my, sc, 0.0)
+                   for (mc, mr, sc) in centres]
     if not markers:
         return _fallback("no alignment marker detected")
 
     cand = []
-    for (oc, orow, _sc) in markers:
+    for (oc, orow, marker_sc, marker_rot) in markers:
         # Each detection is already a CELL ORIGIN. A phase-clamped refine (<half a pin pitch) polishes
         # it against the pin lattice without aliasing; off-by-one is resolved later, per lattice node.
-        o, ov = _refine_origin(amask, template, (oc, orow), xppx, yppx, y_up, x_right, 0.0,
+        o, ov = _refine_origin(amask, template, (oc, orow), xppx, yppx, y_up, x_right, marker_rot,
                                search_px=int(max_shift) + 6, max_shift_px=max_shift)
         if np.isfinite(ov) and ov >= min_overlap:
-            cand.append((float(o[0]), float(o[1]), float(ov)))
-    cand.sort(key=lambda t: -t[2])
+            cand.append((float(o[0]), float(o[1]), float(ov), float(marker_sc),
+                         float(marker_rot)))
+    # Joint evidence is essential: marker NCC supplies absolute phase while pin overlap rejects
+    # borders and round pins that resemble the fiducial.  Feature channels and angle hypotheses
+    # have deliberately not been deduplicated yet, so a strong false marker cannot crowd out the
+    # correct lower-NCC channel before this combined score is available.
+    if template.marker_shape == "L":
+        cand.sort(key=lambda t: -(t[2] + 0.5 * t[3]))
+    else:
+        cand.sort(key=lambda t: -t[2])
     dedup = []
     for c in cand:
         if not any((c[0] - k[0]) ** 2 + (c[1] - k[1]) ** 2 < min_sep ** 2 for k in dedup):
@@ -1127,6 +1358,17 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
     O0 = dedup[0]                                        # highest overlap = surest phase anchor
     rot = _global_rotation(amask, template, (O0[0], O0[1]), xppx, yppx, y_up, x_right, max_shift)
 
+    # The sample has one physical stage angle.  Candidate marker hypotheses far from the recovered
+    # pin-pattern angle are visual false positives; letting them vote on the cell-to-cell step can
+    # create a pitch-aliased lattice even though the absolute marker anchors are correct.  The
+    # 0.6-degree window is deliberately wider than the 0.25-degree marker and 0.1-degree pin-angle
+    # refinements, while separating adjacent coarse hypotheses on the real 72026 scan.
+    angle_consistent = [c for c in dedup if abs(c[4] - rot) <= 0.6]
+    if angle_consistent:
+        dedup = angle_consistent
+    O0 = (max(dedup, key=lambda t: t[2] + 0.5 * t[3])
+          if template.marker_shape == "L" else max(dedup, key=lambda t: t[2]))
+
     # --- 2. tile step vectors: prefer high-overlap anchors, fall back to all cells per axis ---
     top = O0[2]
     anchors = [c for c in dedup if c[2] >= max(min_overlap, anchor_frac * top)]
@@ -1136,6 +1378,33 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
     row_vecs = row_vecs or row_all
 
     if not col_vecs or not row_vecs:                     # no 2-D lattice (single cell/row/col)
+        # A several-degree marker sweep leaves a small angle-dependent origin error.  Polish the
+        # surviving one-dimensional anchors at the recovered global angle before returning them.
+        # The 2-D path deliberately keeps its original marker seeds for step estimation (that is
+        # what preserves the established 72026 phase), then its lattice probe performs the polish.
+        polished = []
+        for c in dedup:
+            o, ov = _refine_origin(
+                amask, template, (c[0], c[1]), xppx, yppx, y_up, x_right, rot,
+                search_px=int(max_shift) + 6, max_shift_px=max_shift)
+            if np.isfinite(ov) and ov >= min_overlap:
+                polished.append((float(o[0]), float(o[1]), float(ov), c[3], c[4]))
+        if polished:
+            dedup = polished
+        # Pitch-valid false origins can form a parallel row on a periodic design. Choose the
+        # longest collinear family; joint marker+pin evidence breaks equal-length ties.  Ranking
+        # mean evidence first lets a single excellent false origin beat a complete tiled row.
+        families = []
+        for vals, tol in (([c[1] for c in dedup], 0.30 * cell_h),
+                          ([c[0] for c in dedup], 0.30 * cell_w)):
+            for group in _cluster_1d(vals, max(tol, 1.0)):
+                families.append([dedup[i] for i, _ in group])
+        if families:
+            def _family_evidence(fam):
+                return float(np.mean([
+                    c[2] + (0.5 * c[3] if template.marker_shape == "L" else 0.0)
+                    for c in fam]))
+            dedup = max(families, key=lambda fam: (len(fam), _family_evidence(fam)))
         kept = [CellPlacement(0, c[0], c[1], xppx, yppx, y_up=y_up, x_right=x_right,
                               rotation_deg=rot, score=c[2], method="marker") for c in dedup]
         _assign_grid_indices(kept, cell_w, cell_h)
