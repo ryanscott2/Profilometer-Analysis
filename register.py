@@ -580,12 +580,13 @@ def _assign_grid_indices(cells, Pxpx, Pypx):
 
 # ------------------------------------------- marker-free DXF-pattern fallback #
 def _uniform_lattice_alias_reason(template):
-    """Explain why ``template`` has pitch-equivalent origins, or return ``None``.
+    """Describe a complete uniform lattice that needs finite-edge registration.
 
     A single complete rectangular pin array has no internal absolute-phase feature: translating
-    it by one pitch retains all but one edge row/column.  That is not enough evidence to choose an
-    origin safely when there is no detected marker.  Multi-array or intentionally incomplete
-    patterns may be aperiodic and remain eligible for whole-pattern registration.
+    it by one pitch retains the same interior.  Such arrays bypass the generic whole-pattern
+    matcher and are registered by :func:`_register_uniform_lattice`, which accepts an absolute
+    origin only when observed pin terminations identify both finite array indices.  Multi-array or
+    intentionally incomplete patterns are aperiodic and remain eligible for whole-pattern NCC.
     """
     if len(template.arrays) != 1:
         return None
@@ -594,7 +595,7 @@ def _uniform_lattice_alias_reason(template):
         return None
     return (f"markerless DXF is a complete uniform {a.nx}x{a.ny} lattice "
             f"(D{a.diameter_um:g} um, pitch {a.pitch_x_um:g}x{a.pitch_y_um:g} um); "
-            "origins separated by one pin pitch are not uniquely distinguishable")
+            "its interior has pitch-equivalent origins")
 
 
 def _cell_pin_pattern(template, xppx, yppx, x_right, y_up, rot_deg, ds, margin_px=6):
@@ -649,6 +650,306 @@ def _adaptive_pin_mask(z0, valid, pitch_px, min_prom_um=2.0):
     bg = (uniform_filter(zf, size=k, mode="nearest")
           / np.maximum(uniform_filter(vf, size=k, mode="nearest"), 1e-6))
     return valid & ((z0 - bg) > min_prom_um)
+
+
+def _uniform_component_centers(pin_mask, array, xppx, yppx):
+    """Return physical ``(x,y)`` centroids of plausible individual pins.
+
+    Connected components are used only to estimate lattice angle and phase.  Final finite-array
+    scoring samples every expected lattice node directly, so a damaged or bridged component cannot
+    by itself create edge evidence.  The broad area window deliberately retains partial/eroded pin
+    tops while rejecting the many one-pixel prominence speckles seen in real VK4 height maps.
+    """
+    from scipy.ndimage import center_of_mass, label
+
+    labels, n_labels = label(pin_mask)
+    if n_labels == 0:
+        return np.empty((0, 2), float)
+    areas = np.bincount(labels.ravel())[1:]
+    expected = np.pi * (0.5 * array.diameter_um / xppx) * (0.5 * array.diameter_um / yppx)
+    keep = np.flatnonzero((areas >= max(3.0, 0.04 * expected))
+                          & (areas <= 1.6 * expected)) + 1
+    if keep.size == 0:
+        return np.empty((0, 2), float)
+    rc = np.asarray(center_of_mass(pin_mask, labels, keep), float)
+    return np.column_stack([rc[:, 1] * xppx, rc[:, 0] * yppx])
+
+
+def _fit_uniform_lattice(centers_xy_um, pitch_um, angle_limits=(-5.0, 5.0)):
+    """Fit square-lattice angle and phase, robustly, without assigning absolute indices.
+
+    Circular coherence supplies exactly the information a periodic crop contains: orientation and
+    phase modulo one pitch.  Absolute integer indices are intentionally left to finite-edge scoring.
+    Returns ``(angle_deg, phase_u_um, phase_v_um, inlier_centers)``.
+    """
+    from scipy.optimize import minimize_scalar
+
+    xy = np.asarray(centers_xy_um, float)
+    if len(xy) < 9:
+        raise RegistrationAmbiguityError(
+            f"Only {len(xy)} isolated pin components were found; at least 9 are required to fit "
+            "a markerless lattice reliably.")
+    lo, hi = map(float, angle_limits)
+    if not np.isfinite(lo + hi) or hi <= lo:
+        raise ValueError("uniform-lattice angle limits must be finite and increasing")
+
+    def _coherence(angle_deg, points=xy):
+        th = np.deg2rad(angle_deg); c, s = np.cos(th), np.sin(th)
+        u = c * points[:, 0] + s * points[:, 1]
+        v = -s * points[:, 0] + c * points[:, 1]
+        zu = np.mean(np.exp(2j * np.pi * u / pitch_um))
+        zv = np.mean(np.exp(2j * np.pi * v / pitch_um))
+        return 0.5 * (abs(zu) + abs(zv))
+
+    coarse = np.linspace(lo, hi, max(41, int(np.ceil((hi - lo) / 0.05)) + 1))
+    coarse_score = np.asarray([_coherence(a) for a in coarse])
+    a0 = float(coarse[int(np.argmax(coarse_score))])
+    half = max(0.06, 1.5 * (coarse[1] - coarse[0]))
+    bounds = (max(lo, a0 - half), min(hi, a0 + half))
+    opt = minimize_scalar(lambda a: -_coherence(float(a)), bounds=bounds,
+                          method="bounded", options={"xatol": 1e-5})
+    angle = float(opt.x)
+
+    def _phase_and_residual(points, angle_deg):
+        th = np.deg2rad(angle_deg); c, s = np.cos(th), np.sin(th)
+        u = c * points[:, 0] + s * points[:, 1]
+        v = -s * points[:, 0] + c * points[:, 1]
+        zu = np.mean(np.exp(2j * np.pi * u / pitch_um))
+        zv = np.mean(np.exp(2j * np.pi * v / pitch_um))
+        pu = float(np.angle(zu) * pitch_um / (2 * np.pi)) % pitch_um
+        pv = float(np.angle(zv) * pitch_um / (2 * np.pi)) % pitch_um
+        ru = (u - pu + 0.5 * pitch_um) % pitch_um - 0.5 * pitch_um
+        rv = (v - pv + 0.5 * pitch_um) % pitch_um - 0.5 * pitch_um
+        return pu, pv, np.hypot(ru, rv), 0.5 * (abs(zu) + abs(zv))
+
+    pu, pv, residual, coherence = _phase_and_residual(xy, angle)
+    inlier = residual <= 0.24 * pitch_um
+    if inlier.sum() < 9 or inlier.mean() < 0.55 or coherence < 0.55:
+        raise RegistrationAmbiguityError(
+            f"Pin components do not support one reliable {pitch_um:g} um lattice "
+            f"({int(inlier.sum())}/{len(xy)} inliers, coherence {coherence:.2f}). Check the DXF "
+            "pitch, tile stitching, and whether the scan contains more than one lattice phase.")
+
+    # One robust refit after removing debris/partial-component centroids.
+    pts = xy[inlier]
+    opt = minimize_scalar(lambda a: -_coherence(float(a), pts), bounds=bounds,
+                          method="bounded", options={"xatol": 1e-6})
+    angle = float(opt.x)
+    pu, pv, residual, coherence = _phase_and_residual(pts, angle)
+    pts = pts[residual <= 0.18 * pitch_um]
+    if len(pts) < 9 or coherence < 0.70:
+        raise RegistrationAmbiguityError(
+            f"Lattice phase remained unstable after robust fitting ({len(pts)} inliers, "
+            f"coherence {coherence:.2f}).")
+    pu, pv, _residual, _coherence = _phase_and_residual(pts, angle)
+    return angle, pu, pv, pts
+
+
+def _uniform_node_grid(pin_mask, valid, array, xppx, yppx, angle_deg, phase_u, phase_v):
+    """Sample observed presence/absence at every testable anonymous lattice node.
+
+    Rows/columns in the returned matrices are global *phase* indices, not DXF indices.  A node is
+    testable only when the full nominal pin neighbourhood is valid and in frame.  Pin presence is
+    a nine-point inner-disk vote, which remains usable when neighbouring prominence components are
+    bridged and avoids treating every image pixel as independent evidence.
+    """
+    H, W = pin_mask.shape
+    th = np.deg2rad(angle_deg); c, s = np.cos(th), np.sin(th)
+    corners = np.array([[0.0, 0.0], [W * xppx, 0.0],
+                        [0.0, H * yppx], [W * xppx, H * yppx]])
+    cu = c * corners[:, 0] + s * corners[:, 1]
+    cv = -s * corners[:, 0] + c * corners[:, 1]
+    p = float(array.pitch_x_um)
+    qu = np.arange(int(np.floor((cu.min() - phase_u) / p)) - 1,
+                   int(np.ceil((cu.max() - phase_u) / p)) + 2)
+    qv = np.arange(int(np.floor((cv.min() - phase_v) / p)) - 1,
+                   int(np.ceil((cv.max() - phase_v) / p)) + 2)
+    Q_u, Q_v = np.meshgrid(qu, qv)
+    U = phase_u + Q_u * p; V = phase_v + Q_v * p
+    X = c * U - s * V; Y = s * U + c * V
+    col = X / xppx; row = Y / yppx
+
+    radius = 0.5 * float(array.diameter_um)
+    # Full-neighbourhood validity: centre plus an outer physical ring.
+    outer = radius * np.array([[0.0, 0.0], [1.05, 0.0], [-1.05, 0.0],
+                               [0.0, 1.05], [0.0, -1.05], [0.74, 0.74],
+                               [0.74, -0.74], [-0.74, 0.74], [-0.74, -0.74]])
+    testable = np.ones(Q_u.shape, bool)
+    for dx, dy in outer:
+        cc = np.rint(col + dx / xppx).astype(int)
+        rr = np.rint(row + dy / yppx).astype(int)
+        inside = (cc >= 0) & (cc < W) & (rr >= 0) & (rr < H)
+        sample = np.zeros(Q_u.shape, bool)
+        sample[inside] = valid[rr[inside], cc[inside]]
+        testable &= sample
+
+    # Inner-disk votes classify the anonymous lattice node as pin or floor.
+    inner = radius * np.array([[0.0, 0.0], [0.48, 0.0], [-0.48, 0.0],
+                               [0.0, 0.48], [0.0, -0.48], [0.34, 0.34],
+                               [0.34, -0.34], [-0.34, 0.34], [-0.34, -0.34]])
+    votes = np.zeros(Q_u.shape, np.int16)
+    for dx, dy in inner:
+        cc = np.rint(col + dx / xppx).astype(int)
+        rr = np.rint(row + dy / yppx).astype(int)
+        inside = (cc >= 0) & (cc < W) & (rr >= 0) & (rr < H)
+        hit = np.zeros(Q_u.shape, bool)
+        hit[inside] = pin_mask[rr[inside], cc[inside]]
+        votes += hit
+    present = testable & (votes >= 5)
+    return qu, qv, testable, present
+
+
+def _rect_count(prefix, u0, u1, v0, v1, qu, qv):
+    """Integral-image count over inclusive global-index rectangle, clipped to the node grid."""
+    iu0 = max(0, int(u0 - qu[0])); iu1 = min(len(qu) - 1, int(u1 - qu[0]))
+    iv0 = max(0, int(v0 - qv[0])); iv1 = min(len(qv) - 1, int(v1 - qv[0]))
+    if iu1 < iu0 or iv1 < iv0:
+        return 0
+    return int(prefix[iv1 + 1, iu1 + 1] - prefix[iv0, iu1 + 1]
+               - prefix[iv1 + 1, iu0] + prefix[iv0, iu0])
+
+
+def _uniform_prediction(qu, qv, testable, lo_u, lo_v, nx, ny):
+    """Testable-node mask predicted to contain pins for one finite-index hypothesis."""
+    return (testable & (qu[None, :] >= lo_u) & (qu[None, :] < lo_u + nx)
+            & (qv[:, None] >= lo_v) & (qv[:, None] < lo_v + ny))
+
+
+def _block_bootstrap_margin(present, testable, best_pred, alt_pred, *, seed=20260722,
+                            block=3, n_boot=2000):
+    """One-percent lower bound for alternative-minus-best node loss.
+
+    Adjacent 3x3 lattice nodes are resampled as blocks, limiting false confidence from spatially
+    correlated threshold/dropout errors.  Pixels are never treated as independent observations.
+    """
+    diff = ((present != alt_pred).astype(np.int16)
+            - (present != best_pred).astype(np.int16))
+    vals = []
+    H, W = diff.shape
+    for r0 in range(0, H, block):
+        for c0 in range(0, W, block):
+            t = testable[r0:r0 + block, c0:c0 + block]
+            if t.any():
+                vals.append(int(diff[r0:r0 + block, c0:c0 + block][t].sum()))
+    if not vals:
+        return float("-inf")
+    vals = np.asarray(vals, np.int16)
+    rng = np.random.default_rng(seed)
+    margins = vals[rng.integers(0, len(vals), size=(n_boot, len(vals)))].sum(axis=1)
+    return float(np.percentile(margins, 1.0))
+
+
+def _register_uniform_lattice(scan, template, z0, valid, *, x_right_options=(-1, 1),
+                              y_up_options=(1, -1), angles_deg=None):
+    """Register one finite, markerless uniform array using termination evidence.
+
+    The lattice fit determines rotation and phase only modulo pitch.  Every finite integer-index
+    hypothesis is then scored on independent lattice nodes, including valid floor nodes where a
+    shifted hypothesis predicts a nonexistent edge pin.  Both axes must beat their nearest alias by
+    a block-bootstrap lower bound greater than zero; otherwise registration fails closed.
+    """
+    a = template.arrays[0]
+    if not np.isclose(a.pitch_x_um, a.pitch_y_um, rtol=1e-6, atol=1e-6):
+        raise RegistrationAmbiguityError(
+            "Finite-edge markerless registration currently requires equal X/Y lattice pitch.")
+    xr_options = tuple(x_right_options)
+    yu_options = tuple(y_up_options)
+    if not xr_options or not yu_options:
+        raise ValueError("uniform-lattice registration requires at least one X and Y orientation")
+    xppx, yppx = float(scan.x_um_per_px), float(scan.y_um_per_px)
+    pitch_px = 0.5 * (a.pitch_x_um / xppx + a.pitch_y_um / yppx)
+    pin_mask = _adaptive_pin_mask(z0, valid, pitch_px)
+    centers = _uniform_component_centers(pin_mask, a, xppx, yppx)
+    if angles_deg is None:
+        limits = (-5.0, 5.0)
+    else:
+        av = np.asarray(tuple(angles_deg), float)
+        if av.size < 2:
+            centre = float(av[0]) if av.size else 0.0
+            limits = (centre - 0.1, centre + 0.1)
+        else:
+            limits = (float(av.min()), float(av.max()))
+    angle, phase_u, phase_v, _inliers = _fit_uniform_lattice(
+        centers, float(a.pitch_x_um), limits)
+    qu, qv, testable, present = _uniform_node_grid(
+        pin_mask, valid, a, xppx, yppx, angle, phase_u, phase_v)
+    n_present = int(present.sum())
+    present_u = np.flatnonzero(present.any(axis=0))
+    present_v = np.flatnonzero(present.any(axis=1))
+    if n_present < 9 or len(present_u) < 3 or len(present_v) < 3:
+        raise RegistrationAmbiguityError(
+            f"Only {n_present} testable pins spanning {len(present_u)}x{len(present_v)} lattice "
+            "lines were found; finite-edge registration needs at least a 3x3 observed patch.")
+
+    test_prefix = np.pad(testable.astype(np.int32), ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    pres_prefix = np.pad(present.astype(np.int32), ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    candidates = []
+    for lo_u in range(int(qu[0]) - a.nx + 1, int(qu[-1]) + 1):
+        for lo_v in range(int(qv[0]) - a.ny + 1, int(qv[-1]) + 1):
+            total = _rect_count(test_prefix, lo_u, lo_u + a.nx - 1,
+                                lo_v, lo_v + a.ny - 1, qu, qv)
+            matched = _rect_count(pres_prefix, lo_u, lo_u + a.nx - 1,
+                                  lo_v, lo_v + a.ny - 1, qu, qv)
+            missing = total - matched
+            extra = n_present - matched
+            candidates.append((missing + extra, -matched, lo_u, lo_v,
+                               total, matched, missing, extra))
+    candidates.sort()
+    best = candidates[0]
+    _err, _negmatch, best_u, best_v, total, matched, missing, extra = best
+    recall = matched / max(1, n_present)
+    precision = matched / max(1, total)
+    if matched < 9 or recall < 0.75 or precision < 0.70:
+        raise RegistrationAmbiguityError(
+            f"The best finite-array hypothesis explains only {matched}/{n_present} observed and "
+            f"{matched}/{total} predicted testable pins (recall {recall:.2f}, precision "
+            f"{precision:.2f}); the scan does not support this DXF reliably.")
+
+    best_pred = _uniform_prediction(qu, qv, testable, best_u, best_v, a.nx, a.ny)
+    evidence = {}
+    for axis, pos in (("x", 2), ("y", 3)):
+        alt = next((cnd for cnd in candidates if cnd[pos] != best[pos]), None)
+        if alt is None:
+            evidence[axis] = (float("inf"), float("inf"), None)
+            continue
+        alt_pred = _uniform_prediction(qu, qv, testable, alt[2], alt[3], a.nx, a.ny)
+        raw_margin = float(alt[0] - best[0])
+        boot_margin = _block_bootstrap_margin(
+            present, testable, best_pred, alt_pred,
+            seed=20260722 + (0 if axis == "x" else 1))
+        evidence[axis] = (raw_margin, boot_margin, alt)
+
+    # A one-pitch alias of a large N x N array differs along O(N) edge nodes while the interior
+    # contains O(N^2) matches, so a fraction-of-all-pins threshold would perversely get stricter as
+    # the array grows.  One percent plus the block-bootstrap guard retains ample independent edge
+    # support for the 100x100 fabrication grid without rejecting its mathematically expected ~2N
+    # margin after rotated-frame clipping.
+    min_raw = max(5, int(np.ceil(0.01 * matched)))
+    ambiguous = [axis for axis, (raw, boot, _alt) in evidence.items()
+                 if raw < min_raw or boot <= 0.0]
+    if ambiguous:
+        detail = ", ".join(
+            f"{axis}: next alias +{evidence[axis][0]:g} node loss, "
+            f"bootstrap 1% bound {evidence[axis][1]:g}"
+            for axis in ambiguous)
+        raise RegistrationAmbiguityError(
+            "Uniform markerless lattice phase was found, but the finite array index is not "
+            f"identifiable along {','.join(ambiguous)} ({detail}). Capture at least one physical "
+            "pin-termination edge plus roughly one pitch of valid floor in both lattice directions, "
+            "or provide a trusted manual origin.")
+
+    xr = int(xr_options[0]); yu = int(yu_options[0])
+    origin_qu = best_u if xr > 0 else best_u + a.nx - 1
+    origin_qv = best_v if yu > 0 else best_v + a.ny - 1
+    ou = phase_u + origin_qu * a.pitch_x_um
+    ov = phase_v + origin_qv * a.pitch_y_um
+    th = np.deg2rad(angle); c, s = np.cos(th), np.sin(th)
+    origin_x = c * ou - s * ov; origin_y = s * ou + c * ov
+    score = 2.0 * matched / max(1, total + n_present)
+    return [CellPlacement(
+        1, float(origin_x / xppx), float(origin_y / yppx), xppx, yppx,
+        y_up=yu, x_right=xr, rotation_deg=float(angle), score=float(score),
+        method="uniform-edge", cell_row=1, cell_col=1)]
 
 
 def _marker_feature(z0, valid, pitch_px):
@@ -760,9 +1061,14 @@ def _register_by_pattern(scan, template, z0, valid, *, cell_pitch_um=None,
         return []
     alias_reason = _uniform_lattice_alias_reason(template)
     if alias_reason:
-        raise RegistrationAmbiguityError(
-            f"Refusing automatic marker-free registration: {alias_reason}. Add/detect an "
-            "asymmetric alignment fiducial or provide a trusted manual origin.")
+        if scan is None or z0 is None or valid is None:
+            raise RegistrationAmbiguityError(
+                f"Cannot test finite-edge evidence: {alias_reason}. Supply scan data that includes "
+                "physical pin terminations in both directions, add/detect an asymmetric alignment "
+                "fiducial, or provide a trusted manual origin.")
+        return _register_uniform_lattice(
+            scan, template, z0, valid, x_right_options=x_right_options,
+            y_up_options=y_up_options, angles_deg=angles_deg)
     xppx, yppx = scan.x_um_per_px, scan.y_um_per_px
     H, W = scan.height_raw.shape
     w_um, h_um = template.size_um                          # cell size from the DXF
@@ -1270,18 +1576,17 @@ def register_sample(scan, template, cell_pitch_um=None, min_overlap=0.6,
 
     The reflection is the known Keyence X-mirror (``mirror_x`` -> x_right=-1) so the array is never
     flipped; survivors are indexed in the DESIGN frame ((1,1) = DXF top-left) by
-    ``_assign_grid_indices``. Falls back to :func:`_register_by_pattern` (marker-free pin-pattern
-    correlation) when no marker polygon is present or none anchors a cell -- note a marker-less
-    single uniform periodic array is genuinely off-by-one ambiguous, so a corner marker (ideally an
-    asymmetric fiducial) is required for that geometry.
+    ``_assign_grid_indices``. Falls back to :func:`_register_by_pattern` when no marker polygon is
+    present or none anchors a cell. Aperiodic layouts use pin-pattern correlation; a markerless
+    complete uniform array uses finite pin-termination evidence and fails closed if both absolute
+    lattice indices are not identifiable.
     """
     xppx, yppx = scan.x_um_per_px, scan.y_um_per_px   # x_right/y_up are resolved from the marker below
     H, W = scan.height_raw.shape
     feat, edge, pin_mask, valid, z0 = scan_feature(scan)
 
     def _fallback(reason):
-        print(f"register_sample: {reason}; falling back to marker-free DXF-pattern "
-              f"coarse-to-fine phase correlation.")
+        print(f"register_sample: {reason}; falling back to marker-free registration.")
         return _register_by_pattern(scan, template, z0, valid,
                                     cell_pitch_um=cell_pitch_um, min_inbounds=min_inbounds,
                                     min_contrast_um=min_contrast_um,
