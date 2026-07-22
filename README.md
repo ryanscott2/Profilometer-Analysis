@@ -76,6 +76,12 @@ python selftest.py                     # synthetic pipeline + real-DXF alias reg
 python synth.py                        # writes Results/synth_preview.png
 ```
 
+When the Stanford OneDrive environment is available, `selftest.py` opens its original DXFs directly
+from that data tree (read-only). Set `PFLM_DXF_DIR` to prefer another flat DXF directory. GitHub
+Actions and other machines automatically fall back to the committed test fixtures. Integrity checks
+ignore LF-versus-CRLF line endings but still detect any geometry/content change, and `.gitattributes`
+prevents Git from rewriting DXF bytes during checkout.
+
 ## Folders
 
 | folder | contents |

@@ -1,0 +1,2 @@
+# DXF fabrication layouts are provenance inputs; preserve their exact bytes on every checkout.
+*.dxf -text
