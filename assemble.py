@@ -92,27 +92,46 @@ def _best_shift(A, B, drange, axis, perp=30):
     return best
 
 
-def _estimate_step(tiles, ys, xs, tile_hw, ds=4, max_pairs=6):
-    """Median tile step (step_col, step_row) in px, from several adjacent pairs."""
+def _dominant(shifts, tol):
+    """The step the plurality of pairs agree on: the median of the LARGEST cluster of values within
+    ``tol`` px. Robust to periodic-pin aliasing -- an NCC over a regular pin lattice can lock one
+    pin pitch off on *some* adjacent pairs, but those aliased shifts are inconsistent while the true
+    (fixed-raster) step recurs across pairs, so the dominant cluster is the true step. Returns None
+    for no input."""
+    if not shifts:
+        return None
+    best = []
+    for s in shifts:
+        c = [t for t in shifts if abs(t - s) <= tol]
+        if len(c) > len(best):
+            best = c
+    return int(round(np.median(best)))
+
+
+def _estimate_step(tiles, ys, xs, tile_hw, ds=4):
+    """Global tile step (step_col, step_row) in px, from the CONSENSUS of EVERY adjacent pair.
+
+    Using all pairs + a dominant-cluster vote (not a few-pair plain median) is what makes this
+    alias-safe on periodic-pin samples: the earlier code sampled ~6 pairs and took the median, so
+    when a minority of pairs aliased by one pin pitch (large pins on a tight pitch, e.g. D300) the
+    median could land on the aliased step and compress the whole mosaic (cells then overlap)."""
     th, tw = tile_hw
+    tol = max(3 * ds, 8)                                 # group near-identical shifts; keeps pin-pitch aliases apart
     dxs, dys = [], []
-    # horizontal pairs
-    hpairs = [(y, x) for y in ys for x in xs[:-1] if (y, x) in tiles and (y, x + 1) in tiles]
-    for (y, x) in hpairs[:: max(1, len(hpairs) // max_pairs)][:max_pairs]:
+    for (y, x) in [(y, x) for y in ys for x in xs[:-1] if (y, x) in tiles and (y, x + 1) in tiles]:
         A = _feat(tiles[(y, x)])[::ds, ::ds]; B = _feat(tiles[(y, x + 1)])[::ds, ::ds]
         W = A.shape[1]
         d, _p, ncc = _best_shift(A, B, range(int(0.5 * W), int(0.98 * W)), "x")
         if ncc > 0.3:
             dxs.append(d * ds)
-    vpairs = [(y, x) for y in ys[:-1] for x in xs if (y, x) in tiles and (y + 1, x) in tiles]
-    for (y, x) in vpairs[:: max(1, len(vpairs) // max_pairs)][:max_pairs]:
+    for (y, x) in [(y, x) for y in ys[:-1] for x in xs if (y, x) in tiles and (y + 1, x) in tiles]:
         A = _feat(tiles[(y, x)])[::ds, ::ds]; B = _feat(tiles[(y + 1, x)])[::ds, ::ds]
         H = A.shape[0]
         d, _p, ncc = _best_shift(A, B, range(int(0.5 * H), int(0.98 * H)), "y")
         if ncc > 0.3:
             dys.append(d * ds)
-    step_col = int(np.median(dxs)) if dxs else tw
-    step_row = int(np.median(dys)) if dys else th
+    step_col = _dominant(dxs, tol) or tw
+    step_row = _dominant(dys, tol) or th
     return step_col, step_row
 
 
