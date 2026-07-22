@@ -108,6 +108,7 @@ class App:
         root.geometry("1520x900")
         self.proc = None
         self.cal_proc = None                # depth-calibration subprocess (separate from a run)
+        self.cal_cell_specs = {}            # sample folder name -> inline cell-id filter spec ("" = all cells)
         self.q = queue.Queue()
         self.samples = self._load_samples()
         self.cur = {"dxf": "", "vk4_dir": ""}
@@ -291,14 +292,24 @@ class App:
         calf.columnconfigure(0, weight=1)
         clf = ttk.Frame(calf); clf.grid(row=0, column=0, columnspan=2, sticky="nsew")
         clf.columnconfigure(0, weight=1); clf.rowconfigure(0, weight=1)
-        # exportselection=False keeps the multi-selection when focus moves to another text widget
-        self.cal_list = tk.Listbox(clf, height=5, selectmode="extended", activestyle="none",
-                                   exportselection=False)
+        # Two-column table: sample name + an inline per-sample cell filter. Native extended
+        # selection (Ctrl/Shift-click) still picks which samples to pool (as the old listbox did);
+        # double-clicking a row's "cells" column edits that sample's cell_id selection in place.
+        self.cal_list = ttk.Treeview(clf, height=5, columns=("cells",), selectmode="extended",
+                                     show="tree headings")
+        self.cal_list.heading("#0", text="sample")
+        self.cal_list.heading("cells", text="cells")
+        self.cal_list.column("#0", width=180, minwidth=90, anchor="w", stretch=True)
+        self.cal_list.column("cells", width=96, minwidth=60, anchor="w", stretch=False)
         self.cal_list.grid(row=0, column=0, sticky="nsew")
         cls = ttk.Scrollbar(clf, orient="vertical", command=self.cal_list.yview)
         cls.grid(row=0, column=1, sticky="ns"); self.cal_list.config(yscrollcommand=cls.set)
+        self.cal_list.bind("<Double-1>", self._edit_cal_cells)
+        self._cal_cell_editor = None            # active inline Entry over the 'cells' column, if any
         ttk.Label(calf, text="samples to include (Ctrl/Shift-click for multi; none selected = all "
-                             "discovered)", foreground="#666", wraplength=280).grid(
+                             "discovered).  double-click a row's ‘cells’ to pick cell_ids, e.g. "
+                             "1-5, 8, 12-16  (prefix ! to exclude; blank = all)",
+                  foreground="#666", wraplength=280).grid(
             row=1, column=0, columnspan=2, sticky="w", pady=(2, 2))
         ttk.Label(calf, text="bands — one per line: min Ø, max Ø, pitch (µm)  (a pin joins a band "
                              "only if its Ø is in range AND its pitch matches).  blank = use CSV "
@@ -442,6 +453,12 @@ class App:
             return messagebox.showerror(
                 "Run", "Select a sample in the Samples dropdown first — its name is used for the "
                 "Results subfolder.  Use “Save as…” to name the current setup as a sample.")
+        if _safe_name(self.sample_var.get()).casefold() == CAL_OUT_NAME.casefold():
+            return messagebox.showerror(
+                "Run", f"'{CAL_OUT_NAME}' is reserved for the depth-calibration output folder. "
+                f"Rename this sample (e.g. add a date/label) so its Results\\ folder does not collide "
+                f"with Results\\{CAL_OUT_NAME} — a collision hides it from calibration and its run "
+                f"would overwrite the calibration report.")
         dxf, vk4 = self.cur["dxf"], self.cur["vk4_dir"]
         if not (dxf and Path(dxf).exists()):
             return messagebox.showerror("Run", "Select a DXF file first.")
@@ -498,21 +515,124 @@ class App:
         return out
 
     def _refresh_cal_samples(self):
-        """Repopulate the depth-calibration sample list, preserving the current selection. On the
-        first populate select all (default = pool everything). A brand-new sample (e.g. one just
-        run) is auto-selected ONLY when everything was already selected, so an untouched 'all'
-        selection stays 'all' after a new run — while an explicit user subset is left as-is."""
-        prev_names = [self.cal_list.get(i) for i in range(self.cal_list.size())]
-        prev_sel = {self.cal_list.get(i) for i in self.cal_list.curselection()}
+        """Repopulate the depth-calibration sample table, preserving the current selection AND each
+        sample's inline cell filter. On the first populate select all (default = pool everything). A
+        brand-new sample (e.g. one just run) is auto-selected ONLY when everything was already
+        selected, so an untouched 'all' selection stays 'all' after a new run — while an explicit
+        user subset is left as-is."""
+        children = self.cal_list.get_children()
+        prev_names = [self.cal_list.item(i, "text") for i in children]
+        prev_sel = {self.cal_list.item(i, "text") for i in self.cal_list.selection()}
         all_were_selected = bool(prev_names) and prev_sel == set(prev_names)
         first = not prev_names
         names = self._discover_samples()
-        self.cal_list.delete(0, tk.END)
+        # forget cell specs for samples that no longer exist under Results/
+        self.cal_cell_specs = {n: s for n, s in self.cal_cell_specs.items() if n in names}
+        # tear down any in-flight inline editor before the rows it sat on are deleted
+        if self._cal_cell_editor is not None:
+            try:
+                self._cal_cell_editor.destroy()
+            except tk.TclError:
+                pass
+            self._cal_cell_editor = None
+        self.cal_list.delete(*children)
+        prev_set, to_select = set(prev_names), []
         for n in names:
-            self.cal_list.insert(tk.END, n)
-        for i, n in enumerate(names):
-            if first or n in prev_sel or (all_were_selected and n not in set(prev_names)):
-                self.cal_list.selection_set(i)
+            spec = self.cal_cell_specs.get(n, "")
+            iid = self.cal_list.insert("", "end", text=n, values=(spec if spec else "(all)",))
+            if first or n in prev_sel or (all_were_selected and n not in prev_set):
+                to_select.append(iid)
+        if to_select:
+            self.cal_list.selection_set(to_select)
+
+    @staticmethod
+    def _validate_cell_spec(spec):
+        """(ok, message) for a cell-filter spec. Uses calibrate_depth.parse_cell_spec when
+        importable (single source of truth for the grammar); if its heavier deps aren't installed
+        on a UI-only box, accept the text and let the calibrate subprocess validate it."""
+        if not spec.strip():
+            return True, ""
+        try:
+            from calibrate_depth import parse_cell_spec
+        except Exception:                                   # pragma: no cover - UI-only machine
+            return True, ""
+        try:
+            parse_cell_spec(spec)
+            return True, ""
+        except ValueError as e:
+            return False, str(e)
+
+    def _edit_cal_cells(self, event):
+        """Double-click handler: open an inline Entry over the 'cells' column to edit that sample's
+        cell filter. Commits on Return / focus-out (only if valid), cancels on Escape."""
+        if self.cal_list.identify_region(event.x, event.y) != "cell":
+            return
+        if self.cal_list.identify_column(event.x) != "#1":     # only the 'cells' data column
+            return
+        iid = self.cal_list.identify_row(event.y)
+        if not iid:
+            return
+        bbox = self.cal_list.bbox(iid, "cells")
+        if not bbox:                                           # row scrolled out of view
+            return
+        x, y, w, h = bbox
+        name = self.cal_list.item(iid, "text")
+        if self._cal_cell_editor is not None:
+            try:
+                self._cal_cell_editor.destroy()
+            except tk.TclError:
+                pass
+        var = tk.StringVar(value=self.cal_cell_specs.get(name, ""))
+        ent = tk.Entry(self.cal_list, textvariable=var)
+        ent.place(x=x, y=y, width=w, height=h)
+        ent.focus_set(); ent.icursor("end")
+        self._cal_cell_editor = ent
+        state = {"closed": False}
+
+        def close():
+            if state["closed"]:
+                return
+            state["closed"] = True
+            if self._cal_cell_editor is ent:
+                self._cal_cell_editor = None
+            try:
+                ent.destroy()
+            except tk.TclError:
+                pass
+
+        def commit():
+            raw = var.get().strip()
+            ok, msg = self._validate_cell_spec(raw)
+            if not ok:
+                self.status.config(text=f"cell filter '{raw}': {msg}")
+                try:
+                    ent.configure(foreground="#b00020")
+                except tk.TclError:
+                    pass
+                return False
+            if raw:
+                self.cal_cell_specs[name] = raw
+            else:
+                self.cal_cell_specs.pop(name, None)
+            self.cal_list.set(iid, "cells", raw if raw else "(all)")
+            return True
+
+        def on_return(_e):
+            if commit():                                       # keep editor open if invalid
+                close()
+            return "break"
+
+        def on_focusout(_e):
+            if state["closed"]:
+                return
+            commit()                                           # save if valid; else discard edit
+            close()
+
+        ent.bind("<Return>", on_return)
+        ent.bind("<KP_Enter>", on_return)
+        ent.bind("<FocusOut>", on_focusout)
+        ent.bind("<Escape>", lambda _e: (close(), "break")[1])
+        return "break"
 
     def _calibrate_depth(self):
         if self.cal_proc and self.cal_proc.poll() is None:
@@ -534,7 +654,7 @@ class App:
             return messagebox.showerror(
                 "Depth calibration",
                 f"Target depth must be a number or comma-separated numbers (got '{raw}').")
-        selected = [self.cal_list.get(i) for i in self.cal_list.curselection()]
+        selected = [self.cal_list.item(i, "text") for i in self.cal_list.selection()]
         out_dir = DEF_OUT / CAL_OUT_NAME
         cmd = [sys.executable, "-u", str(HERE / CAL_SCRIPT),
                "--results", str(DEF_OUT), "--out", str(out_dir),
@@ -542,8 +662,19 @@ class App:
         # a strict subset -> --include those; all/none selected -> omit so it pools everything.
         # Pass each name as its own token (calibrate_depth --include is nargs='*'), so names with
         # spaces or commas survive intact.
-        if selected and len(selected) < len(names):
+        subset = bool(selected) and len(selected) < len(names)
+        if subset:
             cmd += ["--include", *selected]
+        # per-sample cell filters -> workspace JSON + --cell-filters, only for the samples that are
+        # actually pooled (the selected subset, or every discovered sample when not subsetting).
+        pooled = selected if subset else names
+        cell_filters = {n: self.cal_cell_specs[n] for n in pooled
+                        if self.cal_cell_specs.get(n, "").strip()}
+        if cell_filters:
+            WORKSPACE.mkdir(exist_ok=True)
+            cf_path = WORKSPACE / "cell_filters.json"
+            cf_path.write_text(json.dumps(cell_filters, indent=2), encoding="utf-8")
+            cmd += ["--cell-filters", str(cf_path)]
         # band definitions -> workspace CSV + --bands, but only if there is a real band row
         # (a blank / comments-only box means "use the measurements 'band' column")
         bands_text = self.cal_bands_text.get("1.0", "end-1c")

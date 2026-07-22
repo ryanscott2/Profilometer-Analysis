@@ -153,11 +153,19 @@ each sample's `legacy/measurements.csv`.
 ```
 python calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
                           [--results Results] [--out "Results/etch depth"] \
-                          [--bands band_defs.csv] [--max-debris 0.6] [--drop-shallow]
+                          [--bands band_defs.csv] [--cell-filters cells.json] \
+                          [--max-debris 0.6] [--drop-shallow]
 ```
 
 - **Discovers** the samples (folders under `Results/` with a `legacy/measurements.csv`), injects a
   `sample` column, pools them; `--include`/`--exclude` select the set (default = all).
+- **Per-sample cell selection** — `--cell-filters` names a JSON file mapping a sample folder name to
+  a `cell_id` spec, applied **before** pooling so a single bad cell can be dropped without discarding
+  the whole sample. A spec lists the cells to **keep** (`"1-5, 8, 12-16"`); a leading `!` **excludes**
+  them (`"!3, 7"`); blank/omitted = all cells. `cell_id` is the 1-based unit-cell index (row-major:
+  row 1 = top, col 1 = left). The applied filters are echoed to the console and recorded in
+  `depth_calibration.txt` for provenance. A sample whose CSV lacks a `cell_id` column is skipped
+  (fail-closed) rather than pooled unfiltered.
 - **Gates** for a trustworthy depth read (`reliable`, finite depth, a stricter debris cut) and
   prints the retained/total counts and *why* rows dropped. `shallow` (<3 µm) points are kept by
   default — they anchor the low-dose rise — but `--drop-shallow` removes them.
@@ -179,10 +187,13 @@ python calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
   heatmap with the target-depth contour — read off which (P, S) hits the target).
 
 **From the UI:** the *Depth calibration* panel (right column) lists the discovered samples
-(multi-select; none selected = all), a **band-definitions** box (one `min_Ø, max_Ø, pitch` per line;
-number of rows = number of bands; blank = use the CSV `band` column), and a target depth (default
-`55`, comma-separated allowed). It runs the tool on the selection — output streams to the console
-and the results land in `Results/etch depth/` (browsable at left).
+(multi-select; none selected = all) in a two-column table — the sample name and an inline **cells**
+column. Double-click a row's *cells* to include/exclude specific `cell_id`s for that sample
+(`1-5, 8, 12-16`; prefix `!` to exclude; blank = all); the panel also has a **band-definitions** box
+(one `min_Ø, max_Ø, pitch` per line; number of rows = number of bands; blank = use the CSV `band`
+column) and a target depth (default `55`, comma-separated allowed). It runs the tool on the
+selection — output streams to the console and the results land in `Results/etch depth/` (browsable
+at left).
 
 ## Modules
 

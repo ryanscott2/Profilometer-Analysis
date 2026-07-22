@@ -20,6 +20,7 @@ Usage:
     python calibrate_depth.py                                  # all samples, target 55 µm
     python calibrate_depth.py --include A,B --targets 45,55,65
     python calibrate_depth.py --results Results --out Results/_depth_calibration --exclude bad_run
+    python calibrate_depth.py --cell-filters cells.json        # keep/drop cell_ids per sample
 
 Deliverables (under --out):  depth_calibration.txt, depth_vs_dose.png, depth_parity.png,
 depth_heatmap.png.
@@ -27,6 +28,7 @@ depth_heatmap.png.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -80,10 +82,93 @@ def discover_samples(results_dir, out_dir, include=None, exclude=None):
     return found
 
 
-def load_pooled(samples):
+def parse_cell_spec(spec):
+    """Parse a per-sample cell-selection spec into ``(mode, ids)``.
+
+    Grammar (matches the UI's inline 'cells' field):
+        "1-5, 8, 12-16"  -> ('include', {1,2,3,4,5,8,12,13,14,15,16})  keep ONLY these cell_ids
+        "!3, 7-9"        -> ('exclude', {3,7,8,9})                     drop these cell_ids
+        "" / None        -> ('include', None)                         no filter (keep all)
+
+    ``cell_id`` is the 1-based unit-cell index written by register/run_sample (row-major: row 1 =
+    top, col 1 = left; see register._assign_grid_indices). Whitespace around tokens is ignored.
+    Raises ValueError on a malformed token, an out-of-range (< 1) id, an inverted range (low >
+    high), or a non-empty spec that resolves to zero cells."""
+    if spec is None:
+        return "include", None
+    s = str(spec).strip()
+    if not s:
+        return "include", None
+    mode = "include"
+    if s[0] == "!":
+        mode, s = "exclude", s[1:].strip()
+    ids = set()
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "-" in tok:
+            lo_s, _, hi_s = tok.partition("-")
+            lo_s, hi_s = lo_s.strip(), hi_s.strip()
+            if not (lo_s.isdigit() and hi_s.isdigit()):
+                raise ValueError(f"bad cell range '{tok}' (use e.g. 12-16)")
+            lo, hi = int(lo_s), int(hi_s)
+            if lo < 1 or hi < 1:
+                raise ValueError(f"cell ids are 1-based; '{tok}' is out of range")
+            if lo > hi:
+                raise ValueError(f"inverted cell range '{tok}' (low > high)")
+            ids.update(range(lo, hi + 1))
+        elif tok.isdigit():
+            v = int(tok)
+            if v < 1:
+                raise ValueError(f"cell ids are 1-based; '{tok}' is out of range")
+            ids.add(v)
+        else:
+            raise ValueError(f"bad cell token '{tok}' (expected a number or a range like 12-16)")
+    if not ids:
+        raise ValueError("cell filter selects no cells")
+    return mode, ids
+
+
+def _apply_cell_filter(df, name, spec):
+    """Restrict ``df`` to the cell_ids named by ``spec`` (see :func:`parse_cell_spec`).
+
+    Returns the frame unchanged when the spec is empty. Returns ``None`` -- signalling the caller to
+    DROP the whole sample (fail-closed) -- when the spec is non-trivial but the frame has no
+    'cell_id' column, so an un-applicable filter never silently pools the full sample against the
+    user's stated intent. Prints one line summarising what was kept/dropped (provenance in console)."""
+    mode, ids = parse_cell_spec(spec)                    # raises ValueError on a malformed spec
+    if ids is None:
+        return df
+    if "cell_id" not in df.columns:
+        print(f"WARNING: sample '{name}' has no 'cell_id' column -> cannot apply cell filter "
+              f"'{spec}'; SKIPPING this sample (fail-closed).")
+        return None
+    cid = pd.to_numeric(df["cell_id"], errors="coerce")
+    present = {int(v) for v in cid.dropna().unique()}
+    if mode == "include":
+        keep = cid.isin(ids)
+        used, missing = sorted(ids & present), sorted(ids - present)
+        note = f"; requested but absent: {missing}" if missing else ""
+        print(f"Cell filter [{name}]: INCLUDE {sorted(ids)} -> kept {int(keep.sum())}/{len(df)} rows "
+              f"(cell_ids {used}{note}).")
+    else:
+        keep = ~cid.isin(ids)
+        removed = sorted(ids & present)
+        print(f"Cell filter [{name}]: EXCLUDE {sorted(ids)} -> dropped {int((~keep).sum())}/{len(df)} "
+              f"rows (cell_ids {removed}).")
+    return df[keep].copy()
+
+
+def load_pooled(samples, cell_filters=None):
     """Read each (name, csv) and concat into one frame, injecting the ``sample`` column (the folder
     name -- the one field measurements.csv does not already carry). Missing optional columns are
-    back-filled with NaN so a mix of old/new CSV schemas still concatenates."""
+    back-filled with NaN so a mix of old/new CSV schemas still concatenates.
+
+    ``cell_filters`` (optional) maps a sample folder name -> a cell-selection spec (see
+    :func:`parse_cell_spec`); a sample's rows are restricted to those cells BEFORE pooling. A sample
+    whose filter cannot be applied (no 'cell_id' column) is dropped rather than pooled unfiltered."""
+    cell_filters = cell_filters or {}
     frames = []
     for name, csv in samples:
         try:
@@ -92,6 +177,11 @@ def load_pooled(samples):
             print(f"WARNING: could not read {csv}: {e} -> skipping {name}")
             continue
         df["sample"] = name
+        spec = cell_filters.get(name)
+        if spec:
+            df = _apply_cell_filter(df, name, spec)
+            if df is None:                               # filter un-applicable -> skip whole sample
+                continue
         frames.append(df)
     if not frames:
         return pd.DataFrame()
@@ -463,7 +553,7 @@ def _predict(rec_key, sat, logd, inter, dose=None, passes=None, speed=None, draw
 # ======================================================================= driver == #
 def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude=None,
                     targets=(DEF_TARGET_UM,), max_debris=DEF_MAX_DEBRIS, drop_shallow=False,
-                    alpha=0.05, band_defs_path=None):
+                    alpha=0.05, band_defs_path=None, cell_filters=None):
     """Full calibration: discover -> pool -> gate -> (optionally re-bin into user bands) -> per-band
     fits + pooled MixedLM -> write depth_calibration.txt + the three figures. When ``band_defs_path``
     names a band-definitions file, rows are re-binned by drawn Ø into those bands; otherwise the
@@ -477,7 +567,7 @@ def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude
         raise SystemExit(f"No samples with {MEAS_REL} found under {results_dir} "
                          f"(include={include}, exclude={exclude}).")
     print(f"Pooling {len(samples)} sample(s): {', '.join(n for n, _ in samples)}")
-    df = load_pooled(samples)
+    df = load_pooled(samples, cell_filters=cell_filters)
     if not len(df):
         raise SystemExit("No rows loaded from the selected samples' measurements.csv "
                          "(every file was empty or unreadable).")
@@ -512,7 +602,7 @@ def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude
 
     out_dir.mkdir(parents=True, exist_ok=True)
     write_report(out_dir, samples, gate_rep, gated, per_band, targets, alpha,
-                 max_debris, drop_shallow, band_lines=band_lines)
+                 max_debris, drop_shallow, band_lines=band_lines, cell_filters=cell_filters)
     # The report is the primary deliverable; isolate each figure so one bad panel can't abort the
     # whole run (and the already-written report + other figures survive).
     for fn in (fig_depth_vs_dose, fig_parity, fig_heatmap):
@@ -550,7 +640,7 @@ def _coverage_table(g):
 
 
 def write_report(out_dir, samples, gate_rep, gated, per_band, targets, alpha, max_debris,
-                 drop_shallow, band_lines=None):
+                 drop_shallow, band_lines=None, cell_filters=None):
     L = []
     ci_lbl = f"{100 * (1 - alpha):g}% CI"                # honour --alpha in every interval label
     L.append("Etch-depth calibration  —  depth = f(passes, speed) conditioned on pin band")
@@ -561,6 +651,13 @@ def write_report(out_dir, samples, gate_rep, gated, per_band, targets, alpha, ma
     L.append("Bands are NOT pooled together (each band is a distinct pitch/diameter family).")
     L.append("")
     L.append(f"Samples pooled ({len(samples)}): " + ", ".join(n for n, _ in samples))
+    _applied = {n: s for n, s in (cell_filters or {}).items()
+                if s and n in {nm for nm, _ in samples}}
+    if _applied:
+        L.append("Per-sample cell filters (cell_id selection applied BEFORE pooling; "
+                 "'!' = exclude):")
+        for n in sorted(_applied):
+            L.append(f"    {n}:  {_applied[n]}")
     L.append(f"Targets: {', '.join(f'{t:g}' for t in targets)} µm   ·   "
              f"max debris_fraction {max_debris:g}   ·   drop_shallow={drop_shallow}   ·   "
              f"CI level {100*(1-alpha):g}%")
@@ -704,7 +801,7 @@ def fig_depth_vs_dose(out_dir, per_band, targets):
     print(f"Wrote {p}")
 
 
-def fig_parity(out_dir, per_band):
+def fig_parity(out_dir, per_band, targets=None):        # targets unused; accepted for a uniform call loop
     """Measured-vs-predicted parity + residuals (reuses the make_diameter_model two-panel layout),
     coloured by band, using each band's recommended model."""
     fig, axes = plt.subplots(1, 2, figsize=(13, 6))
@@ -797,6 +894,12 @@ def _csv_list(s):
 
 
 def main(argv=None):
+    # The report lines contain µ/Ø/× -> force UTF-8 so a cp1252 Windows console can't crash on print.
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     ap = argparse.ArgumentParser(description="Cross-sample etch-depth calibration (depth = f(passes, speed | band)).")
     ap.add_argument("--results", default=str(DEF_RESULTS), help="Results root holding <sample>/legacy/measurements.csv")
     ap.add_argument("--out", default=None, help=f"output folder (default: <results>/'{OUT_NAME}')")
@@ -812,10 +915,22 @@ def main(argv=None):
     ap.add_argument("--alpha", type=float, default=0.05, help="CI significance level (default 0.05 -> 95%%)")
     ap.add_argument("--bands", default=None, help="band-definitions file: each row 'min_Ø, max_Ø, pitch' "
                     "(µm); omit to use the measurements 'band' column")
+    ap.add_argument("--cell-filters", default=None, help="JSON file mapping sample folder name -> "
+                    "cell-id spec. A spec lists cell_ids to KEEP (e.g. '1-5, 8, 12-16'); a leading "
+                    "'!' EXCLUDES them (e.g. '!3, 7'). Omit to use every cell of every sample.")
     args = ap.parse_args(argv)
+    cell_filters = None
+    if args.cell_filters:
+        try:                                             # utf-8-sig tolerates a BOM (hand-edited files)
+            cell_filters = json.loads(Path(args.cell_filters).read_text(encoding="utf-8-sig"))
+        except Exception as e:
+            raise SystemExit(f"Could not read --cell-filters JSON '{args.cell_filters}': {e}")
+        if not isinstance(cell_filters, dict):
+            raise SystemExit('--cell-filters JSON must be an object, e.g. {"sample name": "1-5, 8"}.')
     calibrate_depth(results_dir=args.results, out_dir=args.out, include=args.include,
                     exclude=args.exclude, targets=args.targets, max_debris=args.max_debris,
-                    drop_shallow=args.drop_shallow, alpha=args.alpha, band_defs_path=args.bands)
+                    drop_shallow=args.drop_shallow, alpha=args.alpha, band_defs_path=args.bands,
+                    cell_filters=cell_filters)
 
 
 if __name__ == "__main__":

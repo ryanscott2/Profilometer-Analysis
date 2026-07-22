@@ -473,6 +473,14 @@ def read_design(path: str | Path) -> DXFDesign:
     to_um = MM_TO_UM if units in ("mm",) else {
         "cm": 1e4, "m": 1e6, "in": 25400.0, "um": 1.0, "unitless": MM_TO_UM,
     }.get(units, MM_TO_UM)
+    # The cell-size / tile-pitch fields below are stored in the file's NATIVE unit but consumed as
+    # millimetres (UnitCell.size_um multiplies by MM_TO_UM; register.py multiplies pitch by 1000).
+    # That holds only for a mm (or unitless->mm) DXF; a non-mm DXF would silently mis-scale cell size
+    # and pitch (a 1000x-too-large size blows up register's min_sep and drops every cell). Pin
+    # coordinates ARE unit-correct via to_um, but fail loudly rather than register on a bad cell size.
+    if to_um != MM_TO_UM:
+        raise ValueError(f"DXF uses '{units}' units; only millimetre DXFs are supported. Re-export "
+                         f"in mm ($INSUNITS=4) -- cell-size / tile-pitch handling assumes mm.")
 
     if len(pins_mm) == 0:
         raise ValueError(f"{path.name}: no CIRCLE entities (pins) found in DXF")

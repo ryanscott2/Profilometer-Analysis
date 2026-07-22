@@ -64,7 +64,7 @@ def synth_scan(template, *, x_um_per_px=2.0, y_um_per_px=2.0,
                origin_px=(120.0, 90.0), n_cells=1, cell_gap_um=300.0,
                depth_um=30.0, floor_um=60.0, taper_frac=0.0,
                noise_um=0.4, tilt=(0.0015, -0.0008), debris_frac=0.0,
-               marker=True, y_up=1, rotation_deg=0.0, seed=0):
+               marker=True, y_up=1, x_right=1, rotation_deg=0.0, seed=0):
     """Build a synthetic scan of ``n_cells`` copies of ``template``.
 
     ``rotation_deg`` rotates each cell's pins about its marker origin (to exercise the
@@ -87,7 +87,7 @@ def synth_scan(template, *, x_um_per_px=2.0, y_um_per_px=2.0,
 
     oc0, orow0 = origin_px
     pad = 60
-    W = int(oc0 + (n_cells - 1) * tile_dx_px + cell_w_px + pad)
+    W = int(oc0 + (n_cells - 1) * tile_dx_px + cell_w_px + pad + (cell_w_px if x_right < 0 else 0))
     H = int(orow0 + cell_h_px + pad + (abs(span_y_um) / yppx if y_up < 0 else 0))
     W = max(W, 64); H = max(H, 64)
 
@@ -104,19 +104,40 @@ def synth_scan(template, *, x_um_per_px=2.0, y_um_per_px=2.0,
         orow = orow0
         truth_origins.append((float(oc), float(orow)))
 
-        # alignment marker: raised square ring at the marker footprint (bottom-left)
-        if marker and np.isfinite(template.marker_size_um):
+        # alignment marker: the ACTUAL fiducial shape at the cell origin (CAD (0,0) -> (oc,orow)),
+        # under the same x_right/y_up reflection as the pins. The L polygon exercises the PRIMARY
+        # production detector (register_sample's marker branch); the square ring is the legacy
+        # fallback for square-marker templates (which register_scan resolves).
+        _mshape = getattr(template, "marker_shape", "")
+        _mpoly = getattr(template, "marker_polygon_um", None)
+        if marker and _mshape == "L" and _mpoly is not None and len(_mpoly) >= 3:
+            from matplotlib.path import Path as _MplPath          # fill the true L polygon (proud)
+            poly = np.asarray(_mpoly, float)
+            _pxr = cth * poly[:, 0] - sth * poly[:, 1]           # rotate the marker about the origin,
+            _pyr = sth * poly[:, 0] + cth * poly[:, 1]           # consistent with the pins (real stage rot)
+            vc = oc + x_right * _pxr / xppx
+            vr = orow + y_up * _pyr / yppx
+            gc0, gc1 = int(np.floor(vc.min())), int(np.ceil(vc.max()))
+            gr0, gr1 = int(np.floor(vr.min())), int(np.ceil(vr.max()))
+            gx, gy = np.meshgrid(np.arange(max(0, gc0), min(W, gc1 + 1)),
+                                 np.arange(max(0, gr0), min(H, gr1 + 1)))
+            if gx.size:
+                inside = _MplPath(np.column_stack([vc, vr])).contains_points(
+                    np.column_stack([gx.ravel(), gy.ravel()])).reshape(gx.shape)
+                z[gy[inside], gx[inside]] = floor_um + depth_um
+                inten[gy[inside], gx[inside]] = 55000.0
+        elif marker and np.isfinite(template.marker_size_um):    # legacy raised square ring
             ms_px_x = template.marker_size_um / xppx
             ms_px_y = template.marker_size_um / yppx
-            th = max(3, int(round(16.0 / xppx)))    # ~16 um ring thickness
+            thick = max(3, int(round(16.0 / xppx)))              # ~16 um ring thickness
             c0 = int(round(oc)); r0 = int(round(orow))
-            c1 = int(round(oc + ms_px_x)); r1 = int(round(orow + y_up * ms_px_y))
+            c1 = int(round(oc + x_right * ms_px_x)); r1 = int(round(orow + y_up * ms_px_y))
             rr0, rr1 = min(r0, r1), max(r0, r1)
             cc0, cc1 = min(c0, c1), max(c0, c1)
-            for (a0, a1, b0, b1) in [(rr0, rr0 + th, cc0, cc1),        # bottom edge
-                                     (rr1 - th, rr1, cc0, cc1),        # top edge
-                                     (rr0, rr1, cc0, cc0 + th),        # left edge
-                                     (rr0, rr1, cc1 - th, cc1)]:       # right edge
+            for (a0, a1, b0, b1) in [(rr0, rr0 + thick, cc0, cc1),        # bottom edge
+                                     (rr1 - thick, rr1, cc0, cc1),        # top edge
+                                     (rr0, rr1, cc0, cc0 + thick),        # left edge
+                                     (rr0, rr1, cc1 - thick, cc1)]:       # right edge
                 a0c, a1c = max(0, a0), min(H, a1)
                 b0c, b1c = max(0, b0), min(W, b1)
                 z[a0c:a1c, b0c:b1c] = floor_um + depth_um
@@ -128,7 +149,7 @@ def synth_scan(template, *, x_um_per_px=2.0, y_um_per_px=2.0,
             for (x_um, y_um) in a.centers_um:
                 xr = cth * x_um - sth * y_um            # rotate about the marker origin
                 yr = sth * x_um + cth * y_um
-                cx = oc + xr / xppx
+                cx = oc + x_right * (xr / xppx)
                 cy = orow + y_up * (yr / yppx)
                 rx, ry = 0.5 * a.diameter_um / xppx, 0.5 * a.diameter_um / yppx
                 _stamp_disk(z, cx, cy, rx, floor_um + depth_um, "set", ry=ry)
@@ -141,7 +162,7 @@ def synth_scan(template, *, x_um_per_px=2.0, y_um_per_px=2.0,
         if debris_frac > 0:
             n_deb = int(debris_frac * (cell_w_px * cell_h_px) / 50)
             for _ in range(n_deb):
-                dc = oc + rng.uniform(0, cell_w_px)
+                dc = oc + x_right * rng.uniform(0, cell_w_px)
                 dr = orow + y_up * rng.uniform(0, cell_h_px)
                 _stamp_disk(z, dc, dr, rng.uniform(2, 5),
                             floor_um + rng.uniform(3, depth_um * 0.9), "set")
@@ -152,7 +173,8 @@ def synth_scan(template, *, x_um_per_px=2.0, y_um_per_px=2.0,
     inten = np.clip(inten, 0, 65535).astype(np.uint16)
     scan = SynthScan(raw, inten, xppx, yppx, z_um_per_digit)
     truth = dict(origins=truth_origins, depth_um=depth_um, floor_um=floor_um,
-                 x_um_per_px=xppx, y_um_per_px=yppx, y_up=y_up, rotation_deg=rotation_deg)
+                 x_um_per_px=xppx, y_um_per_px=yppx, y_up=y_up, x_right=x_right,
+                 rotation_deg=rotation_deg)
     return scan, truth
 
 

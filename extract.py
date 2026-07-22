@@ -149,10 +149,28 @@ class PinFinResult:
 
 
 # ================================ core maths (ported from v1 extract.py) ==== #
-def _level_floor(z, valid):
+def _level_floor(z, valid, centers_local=None, pxu=None, pyu=None, r_pin_um=None):
+    """Fit and subtract a tilt plane so the trench floor sits near 0.
+
+    Prefer fitting to the KNOWN clean floor -- pixels far from every registered pin centre -- which is
+    unbiased by pin sidewalls. On a dense (>60% pin) array the old 'lowest 40% of heights' fit set
+    necessarily includes sidewall pixels; with any real stage tilt that biases the fitted SLOPE, which
+    inflates the reported floor flatness and under-counts debris (and can flip floor_reliable). Fall
+    back to the 40th-percentile set when the geometry isn't supplied or the floor region is too small."""
     zz = np.where(valid, z, np.nan)
-    lo = np.nanpercentile(zz, 40.0)
-    fp = valid & (z <= lo)
+    fp = None
+    if centers_local is not None and len(centers_local) and pxu and pyu and r_pin_um:
+        H, W = z.shape
+        yy, xx = np.mgrid[0:H, 0:W]
+        from scipy.spatial import cKDTree                 # same distance-to-nearest-pin as _classify
+        tree = cKDTree(np.asarray(centers_local, float) * np.array([pxu, pyu]))
+        rr = tree.query(np.column_stack([(xx * pxu).ravel(), (yy * pyu).ravel()]))[0].reshape(H, W)
+        floor = valid & (rr >= r_pin_um + max(2.0 * max(pxu, pyu), 0.05 * r_pin_um))
+        if floor.sum() >= 50:
+            fp = floor
+    if fp is None:                                        # no geometry / too little floor -> old path
+        lo = np.nanpercentile(zz, 40.0)
+        fp = valid & (z <= lo)
     ys, xs = np.nonzero(fp)
     if xs.size < 50:
         return z - np.nanmedian(zz)
@@ -284,7 +302,13 @@ def _diameters_from_profile(rc, prof, floor, depth):
     top_level = min(floor + 0.85 * depth, floor + 0.95 * (peak - floor))
     d_base = 2.0 * first_cross(floor + 0.15 * depth)
     d_mid = 2.0 * first_cross(floor + 0.50 * depth)
-    d_top = 2.0 * first_cross(top_level)
+    # The top crossing must sit clearly ABOVE the mid level (floor+0.5*depth). A domed/rounded top,
+    # or a classification depth larger than the folded profile's amplitude, can push top_level down
+    # to/below the mid level -- where the crossing radius EXCEEDS the mid radius and yields a
+    # non-physical top-O >= mid-O (and a near-singular base extrapolation). Require >=5% of depth of
+    # headroom above the mid level, else the top diameter is undefined (NaN).
+    d_top = (2.0 * first_cross(top_level)
+             if (top_level - (floor + 0.50 * depth)) > 0.05 * depth else float("nan"))
     base_extrapolated = False
     if not np.isfinite(d_base) and np.isfinite(d_mid) and np.isfinite(d_top):
         # Base crossing buried (debris/edge). Extrapolate the mid->top radius-vs-LEVEL line down to
@@ -422,7 +446,12 @@ def extract_array(scan, placement, array, sample, *,
     d_nom = sample.nominal_diameter_um
     flags = []
 
-    z0 = _level_floor(z, valid)
+    # Level to the KNOWN clean floor (pixels far from pins), not the lowest 40% of heights, so pin
+    # sidewalls on a dense array cannot bias the tilt fit (which would inflate floor flatness / hide
+    # debris / spuriously mark the floor reliable). r_pin follows _classify_floor_depth's convention.
+    _kpx, _kpy = lattice["px_px"], lattice["py_px"]
+    _r_pin = float(min(0.5 * d_nom, 0.46 * 0.5 * (_kpx * pxu + _kpy * pyu)))
+    z0 = _level_floor(z, valid, lattice["centers_local"], pxu, pyu, _r_pin)
 
     # --- known lattice (primary) vs measured autocorrelation (QC) ---
     known_px, known_py = lattice["px_px"], lattice["py_px"]
@@ -477,13 +506,21 @@ def extract_array(scan, placement, array, sample, *,
         d_base = float("nan"); base_extrapolated = False   # dropped -> no longer an extrapolated value
     if np.isfinite(d_mid) and d_mid > merge_ceiling:
         d_mid = float("nan")
+    # top-O obeys the same merge ceiling AND must be the narrowest width (top <= mid). A top-O above
+    # the pitch, or wider than the mid-O, is an artifact (bad top level / debris bridging), not a
+    # real pin -> drop it so a non-physical or inverted-taper top diameter never reaches the CSV/fit.
+    if np.isfinite(d_top) and (d_top > merge_ceiling
+                               or (np.isfinite(d_mid) and d_top > d_mid)):
+        d_top = float("nan")
 
     pin_sat_frac = float("nan")
     if crop.intensity is not None and np.isfinite(cls.get("r_pin_um", float("nan"))):
         core = (cls["rr"] <= 0.55 * cls["r_pin_um"]) & valid
         if int(core.sum()) > 10:
+            full = (float(np.iinfo(crop.intensity.dtype).max)      # 8-bit -> 255, 16-bit -> 65535, ...
+                    if np.issubdtype(crop.intensity.dtype, np.integer) else 65535.0)
             pin_sat_frac = float(np.mean(
-                crop.intensity[core].astype(np.float64) >= 0.98 * 65535.0))
+                crop.intensity[core].astype(np.float64) >= 0.98 * full))
 
     # --- reliability flags (same policy as v1) ---
     if not np.isfinite(depth) or depth < 1.5:

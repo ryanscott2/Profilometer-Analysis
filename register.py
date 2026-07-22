@@ -505,21 +505,34 @@ def _assign_grid_indices(cells, Pxpx, Pypx):
     colkey = [x_right * c.origin_col for c in cells]
     rowkey = [y_up * c.origin_row for c in cells]
 
-    def _abs_index(groups):
+    def _abs_index(groups, expected):
         reps = [float(np.mean([v for _, v in g])) for g in groups]      # cluster mean, ascending
         gaps = np.diff(reps)
-        # unit = one tile pitch = the SMALLEST adjacent-cluster gap: the closest two present cells
-        # are one pitch apart, and _cluster_1d already merged anything closer than ~half a cell, so
-        # there are no sub-pitch spurious gaps. (Min, not median: for a small grid missing one
-        # interior cell the median gap is ambiguous, but the min is still the true pitch.)
-        unit = float(gaps[gaps > 1e-6].min()) if np.any(gaps > 1e-6) else 1.0
+        pos = gaps[gaps > 1e-6]
+        min_gap = float(pos.min()) if pos.size else 0.0
+        # unit = one tile pitch. Normally the closest two present cells are one pitch apart, so the
+        # SMALLEST adjacent gap is the pitch (robust to a single missing interior cell). BUT under an
+        # alternating / multi-cell dropout (survivors at design cols 1,3,5) NO two survivors are one
+        # pitch apart, so the min gap is 2+ pitches -> using it renumbers 1,3,5 as 1,2,3 and silently
+        # mis-maps every cell's laser params. Fall back to the DESIGN tile pitch (``expected``, in px,
+        # from cell_pitch_um) when the survivors' min gap disagrees with it by more than ~half a pitch.
+        if expected and expected > 1e-6 and (min_gap <= 1e-6 or min_gap > 1.5 * expected):
+            if min_gap > 1.5 * expected:
+                print(f"WARNING: grid indexing: min survivor spacing {min_gap:.0f}px exceeds 1.5x the "
+                      f"design tile pitch {expected:.0f}px (alternating/edge dropout?) -> using the "
+                      f"design pitch so cell numbering / laser-param mapping is not shifted.")
+            unit = float(expected)
+        elif min_gap > 1e-6:
+            unit = min_gap
+        else:
+            unit = float(expected) if (expected and expected > 1e-6) else 1.0
         idx = [1]
         for k in range(1, len(reps)):
             idx.append(idx[-1] + max(1, int(round((reps[k] - reps[k - 1]) / unit))))
         return {mi: idx[gi] for gi, g in enumerate(groups) for mi, _ in g}
 
-    col_idx = _abs_index(_cluster_1d(colkey, 0.5 * Pxpx))
-    row_asc = _abs_index(_cluster_1d(rowkey, 0.5 * Pypx))               # ascending design-y = bottom
+    col_idx = _abs_index(_cluster_1d(colkey, 0.5 * Pxpx), Pxpx)
+    row_asc = _abs_index(_cluster_1d(rowkey, 0.5 * Pypx), Pypx)         # ascending design-y = bottom
     top = max(row_asc.values())                                        # flip so row 1 = top
     for idx, c in enumerate(cells):
         c.cell_col, c.cell_row = col_idx[idx], top - row_asc[idx] + 1
@@ -645,8 +658,11 @@ def _dealias_origin(pin_mask, template, origin, xppx, yppx, y_up, x_right, rot_d
     th = np.deg2rad(rot_deg); c, s = np.cos(th), np.sin(th)
     offs = {(0.0, 0.0)}
     for a in template.arrays:                              # one-pitch scan-space steps per array
-        vx = np.array([c * x_right * a.pitch_x_um / xppx, s * x_right * a.pitch_x_um / xppx])
-        vy = np.array([-s * y_up * a.pitch_y_um / yppx, c * y_up * a.pitch_y_um / yppx])
+        # rotate-in-um-then-scale-PER-AXIS (matches dxf_to_px): the col component divides by xppx and
+        # the row component by yppx. The rotation-coupled term must use the OTHER axis' scale -- on
+        # non-square pixels the old (both-same-axis) form mis-sized the +-1-pitch de-alias probe.
+        vx = np.array([c * x_right * a.pitch_x_um / xppx, s * x_right * a.pitch_x_um / yppx])
+        vy = np.array([-s * y_up * a.pitch_y_um / xppx, c * y_up * a.pitch_y_um / yppx])
         for i in (-1, 0, 1):
             for j in (-1, 0, 1):
                 if i or j:
@@ -902,17 +918,34 @@ def _lattice_step_candidates(cells, cell_w, cell_h, ntop=3):
 
 
 def _global_rotation(amask, template, origin, xppx, yppx, y_up, x_right, max_shift,
-                     span=1.2, step=0.1):
+                     span=5.0, step=0.1, coarse_step=0.25):
     """Best single stage-rotation (deg) for the whole sample, from an overlap sweep on one
-    well-registered anchor cell. Stage rotation is global, so one value serves every cell."""
-    best_a, best_ov = 0.0, -1.0
-    n = int(round(2 * span / step))
-    for k in range(n + 1):
-        a = -span + k * step
+    well-registered anchor cell. Stage rotation is global, so one value serves every cell.
+
+    Coarse-to-fine so a several-degree stage rotation is recoverable without a fine sweep over the
+    whole ±span: a coarse pass (``coarse_step``) finds the ballpark, then a fine pass (``step``)
+    refines within ±coarse_step of it. (The previous flat ±1.2° sweep could not reach a typical
+    multi-degree rotation and clamped to the window edge — see review finding #19.) The final
+    resolution is still ``step``, so small-rotation results match the old behaviour."""
+    def _score(a):
         _, ov = _refine_origin(amask, template, origin, xppx, yppx, y_up, x_right, float(a),
                                search_px=int(max_shift) + 6, max_shift_px=max_shift)
-        if np.isfinite(ov) and ov > best_ov:
-            best_ov, best_a = ov, float(a)
+        return ov if np.isfinite(ov) else -1.0
+
+    best_a, best_ov = 0.0, _score(0.0)
+    nc = int(round(2 * span / coarse_step))                # coarse pass over the full ±span
+    for k in range(nc + 1):
+        ov = _score(-span + k * coarse_step)
+        if ov > best_ov:
+            best_ov, best_a = ov, float(-span + k * coarse_step)
+    nf = int(round(2 * coarse_step / step))                # fine pass within ±coarse_step of the best
+    lo = best_a - coarse_step
+    for k in range(nf + 1):
+        a = lo + k * step
+        if abs(a) <= span:
+            ov = _score(a)
+            if ov > best_ov:
+                best_ov, best_a = ov, float(a)
     return best_a
 
 
