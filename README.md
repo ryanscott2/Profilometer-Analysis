@@ -265,16 +265,20 @@ python calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
   trials.
 - **Fits per band** (never pooling across pitch/diameter families): a saturating NLS
   `depth = a·(1−e^{−k·dose})`, a log-dose OLS (+ drawn-Ø covariate), and a passes×speed interaction
-  OLS — all reported with R²/adj-R²/AICc/95% CI/p. The **recommended** form has the lowest
-  small-sample AICc among fits with meaningful predictive signal (R²/adj-R² at least 0.10);
-  otherwise inverse recommendations are suppressed.
+  OLS — all reported with R²/adj-R²/AICc/95% CI/p. Etch depth does **not** collapse to
+  `dose = passes/speed` (at a fixed ratio, depth spans tens of µm depending on the actual passes and
+  speed), so the **passes×speed interaction** model is recommended whenever it fits with meaningful
+  signal (adj-R² ≥ 0.10); the dose-only forms are a fallback for single-factor sweeps. When nothing
+  is informative, inverse recommendations are suppressed.
 - **Pools CIs across samples** with a `sample` random-intercept MixedLM (falls back to a sample
   fixed factor if it won't converge), and prints a `sample × dose` coverage table so sample↔dose
   confounding is visible.
 - **Writes** to `Results/etch depth/`: `depth_calibration.txt` (fits, pooled model,
   coverage, per-target inversion with an inverse-mean confidence interval, and the extrapolation box),
-  `depth_vs_dose.png`, `depth_parity.png`, and `depth_heatmap.png` (passes×speed predicted-depth
-  heatmap with the target-depth contour — read off which (P, S) hits the target).
+  `depth_vs_passes_speed_3d.png` (per-band 3-D depth = f(passes, speed): measured points + the
+  recommended-model surface + a target-depth plane), `depth_parity.png`, and `depth_heatmap.png`
+  (passes×speed predicted-depth heatmap with the target-depth contour — read off which (P, S) hits
+  the target).
 
 **From the UI:** the *Depth calibration* panel (right column) lists the discovered samples
 (multi-select; none selected = all) in a two-column table — the sample name and an inline **cells**
