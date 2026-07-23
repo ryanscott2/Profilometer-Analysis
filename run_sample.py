@@ -506,13 +506,13 @@ def render_cell_report(scan, placement, template, res_by_array, params, path, bo
                     aspect="equal")
     _overlay_design(ax0, template, res_by_array, box=box)
     plt.colorbar(im, ax=ax0, shrink=0.85, label="height above floor (µm)")
-    ax0.set_title("height (floor = local zero)")
+    ax0.set_title("Height above floor")
     if inten is not None:
         im1 = ax1.imshow(inten, origin="lower", extent=ext, cmap="gray", aspect="equal",
                          vmin=np.nanpercentile(inten, 2), vmax=np.nanpercentile(inten, 98))
         plt.colorbar(im1, ax=ax1, shrink=0.85, label="intensity")   # keeps x-axes aligned
     _overlay_design(ax1, template, res_by_array, box=box)
-    ax1.set_title("intensity — alignment marker (red square, bottom-left)")
+    ax1.set_title("Intensity")
 
     axr = fig.add_subplot(gs[:, 1]); axr.axis("off")
 
@@ -591,8 +591,7 @@ def make_param_summary(df, out_dir):
     axes[0].set_xticks(speeds); axes[0].set_xticklabels([f"{s:g}" for s in speeds])
     axes[1].set_xlabel("scan speed (mm/s, log axis)")
     axes[0].legend(title="passes", fontsize=9)
-    axes[0].set_title("Laser-parameter effect on depth and diameter "
-                      "(each point = one unit cell, labelled P{passes}_S{speed})")
+    axes[0].set_title("Laser-parameter effect on depth and diameter")
     fig.tight_layout()
     p = Path(out_dir) / "figures" / "param_summary.png"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -657,9 +656,7 @@ def make_param_depth_scatter(df, out_dir):
     ax.set_xlabel("scan speed (mm/s, log axis)")
     ax.set_ylabel("etch depth (µm)")
     ax.grid(alpha=0.3)
-    ax.set_title("Etch depth of every pin array vs laser parameters\n"
-                 "(o-line = per-cell median; small markers = individual arrays, "
-                 "◇ D300  □ D100  △ D50)")
+    ax.set_title("Etch depth vs laser parameters")
 
     passes_leg = ax.legend(title="passes", fontsize=9, loc="upper right")
     ax.add_artist(passes_leg)
@@ -786,8 +783,7 @@ def make_radial_overlays(template, placements, params, res_by_cell, out_dir, set
                        label=f"drawn radius {a.diameter_um/2:g} µm")
             ax.set_xlabel("radius from pin centre (µm)")
             ax.set_ylabel("mean height above clean floor (µm)")
-            ax.set_title(f"Radial-average pin profile — drawn Ø {a.diameter_um:g} µm, "
-                         f"pitch {a.pitch_um:g} µm\nband {a.band} col {a.col}  ·  {set_name}")
+            ax.set_title(f"Radial pin profile — Ø {a.diameter_um:g} µm, pitch {a.pitch_um:g} µm")
             ax.grid(alpha=0.3)
             ax.legend(fontsize=7, ncol=2 if n_lines > 8 else 1)
             fig.tight_layout()
@@ -810,7 +806,7 @@ def save_sample_heightmap(scan, path, ds=4):
     fig, ax = plt.subplots(figsize=(11, 12))
     im = ax.imshow(z, origin="lower", cmap="viridis",
                    vmin=np.nanpercentile(z, 2), vmax=np.nanpercentile(z, 98))
-    ax.set_title("Assembled sample height (design orientation)")
+    ax.set_title("Assembled sample height")
     ax.set_xticks([]); ax.set_yticks([])
     plt.colorbar(im, ax=ax, shrink=0.85, label="height (µm)")
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -838,7 +834,7 @@ def save_sample_overview(scan, template, placements, path, ds=6):
         cx, cy = p.dxf_to_px(ccx, ccy)
         ax.text((W - 1 - cx) / ds, cy / ds, f"({p.cell_row},{p.cell_col})",
                 color="yellow", ha="center", va="center", fontsize=11, weight="bold")
-    ax.set_title(f"{len(placements)} unit cells — design (row,col), design orientation")
+    ax.set_title(f"{len(placements)} unit cells")
     ax.set_xticks([]); ax.set_yticks([])
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=170); plt.close(fig)

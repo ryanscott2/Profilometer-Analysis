@@ -612,8 +612,7 @@ def _qc(crop, z0, valid, cell_c, rc, prof, lattice, px_px, py_px, res, qc_path, 
     plt.colorbar(im0, ax=ax[0, 0], shrink=0.8, label="height above clean floor (µm)")
     cl = lattice["centers_local"]
     ax[0, 0].plot(cl[:, 0], cl[:, 1], "r+", ms=9, mew=1.2)
-    ax[0, 0].set_title(f"{res.filename}\nknown pins (pitch {res.pitch_um:.1f} µm, "
-                       f"reg {res.reg_method} {res.reg_score:.2f})")
+    ax[0, 0].set_title(f"{res.filename} — known pins")
     ax[0, 0].set_xlabel("px"); ax[0, 0].set_ylabel("px")
 
     # (0,1) mean pin
@@ -628,12 +627,10 @@ def _qc(crop, z0, valid, cell_c, rc, prof, lattice, px_px, py_px, res, qc_path, 
                                   color="orange", lw=1.5, ls="--"))
         ax[0, 1].add_patch(Circle((cx, cy), res.top_diameter_um / 2, fill=False,
                                   color="r", lw=1.5))
-        ax[0, 1].set_title(f"mean pin (~{res.n_cells:.0f})  base={res.base_diameter_um:.0f}"
-                           f" / top={res.top_diameter_um:.0f} µm "
-                           f"(drawn {res.nominal_diameter_um:g}, white)")
+        ax[0, 1].set_title(f"mean pin — base {res.base_diameter_um:.0f} / "
+                           f"top {res.top_diameter_um:.0f} µm")
     else:
-        ax[0, 1].set_title(f"mean pin (~{res.n_cells:.0f})  drawn Ø={res.nominal_diameter_um:g}"
-                           f" (white)\ndiameter unreliable")
+        ax[0, 1].set_title("mean pin — diameter unreliable")
     ax[0, 1].set_xlabel("µm"); ax[0, 1].set_ylabel("µm")
 
     # (1,0) classification
@@ -668,7 +665,7 @@ def _qc(crop, z0, valid, cell_c, rc, prof, lattice, px_px, py_px, res, qc_path, 
     ax[1, 1].legend(fontsize=7)
     sat = f" · pin-sat {100*res.pin_sat_frac:.0f}%" if np.isfinite(res.pin_sat_frac) else ""
     ax[1, 1].set_title(f"radial profile  meas-latt={res.lattice_strength:.2f}{sat}"
-                       + (f"\nFLAGS: {res.flags}" if res.flags else ""))
+                       + (f"  ·  {res.flags}" if res.flags else ""))
 
     plt.tight_layout()
     if qc_path is None:
