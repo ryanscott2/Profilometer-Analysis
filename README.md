@@ -207,7 +207,8 @@ Clean outputs live under `figures/`; the v1 plot set, `measurements.csv` and per
 | file | contents |
 |------|----------|
 | `legacy/measurements.csv` | one row per array per cell: base·mid·top Ø (`base_extrapolated` flag when the base crossing was buried), depth, **design** pitch (`pitch_*`) + scan-**measured** pitch (`meas_pitch_*`), drawn Ø, laser params, registration quality, `absolute_origin` / `ambiguous_axes`, reliability flags |
-| `figures/cell_overview.png`, `figures/sample_heightmap.png` | labelled cell map + full-sample height map (design orientation) |
+| `figures/intensity_map.png`, `figures/sample_heightmap.png` | intensity/cell map + full-sample height map (design orientation) |
+| `figures/3D height map/[cell_x*_y*/]array*.png` | true-aspect 3D height surface of the centre 5×5 pins of each array (per unit cell for a tiled sample), with a passes/speed info box |
 | `figures/cells/cell_x*_y*.png` | per-cell report: height/intensity with pin overlay + measured-vs-drawn table |
 | `figures/param_summary.png`, `figures/param_depth_scatter.png` | depth & mid-Ø oversizing vs laser passes/speed (reliable arrays; ◇ D300 □ D100 △ D50) |
 | `figures/radial_overlays/<set>/a*.png` | mean-pin radial profiles overlaid across a laser-parameter set |

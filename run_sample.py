@@ -402,10 +402,10 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False, jobs=
                            cells_dir / f"cell_x{pl.cell_col}_y{pl.cell_row}.png")
     print(f"Wrote {len(placements)} per-cell reports -> {cells_dir}")
 
-    # Clean outputs live in figures/ (cell_overview, sample_heightmap, param_depth_scatter,
+    # Clean outputs live in figures/ (intensity_map, sample_heightmap, param_depth_scatter,
     # radial_overlays/, cells/, diameter_calibration.txt). Legacy outputs (v1 figure set,
     # measurements.csv, qc/) are regenerated under legacy/ ahead of the planned refactor.
-    save_sample_overview(scan, template, placements, out_dir / "figures" / "cell_overview.png")
+    save_sample_overview(scan, template, placements, out_dir / "figures" / "intensity_map.png")
     save_sample_heightmap(scan, out_dir / "figures" / "sample_heightmap.png")
     # 3D centre-5x5 height map per array; repeating cells get per-cell subfolders (all cells).
     _multi = len({(p.cell_row, p.cell_col) for p in placements}) > 1
@@ -541,8 +541,9 @@ def render_cell_report(scan, placement, template, res_by_array, params, path, bo
                        f"{r.meas_pitch_um:.0f}/{a.pitch_um:g}", f"{100*r.debris_fraction:.0f}"])
     col_labels = ["array (D drawn / P)", "depth µm", "Ø top", "Ø nom", "Ø floor",
                   "pitch m/e", "debris%"]
+    _th = min(0.82, 0.09 * (len(rows_t) + 1))            # scale height with #rows (no tall stretch)
     tbl = axr.table(cellText=rows_t, colLabels=col_labels, cellLoc="center",
-                    bbox=[0.0, 0.02, 1.0, 0.80])
+                    bbox=[0.0, 0.80 - _th, 1.0, _th])
     tbl.auto_set_font_size(False); tbl.set_fontsize(8)
     for c in range(len(col_labels)):
         tbl[0, c].set_facecolor("#dddddd"); tbl[0, c].set_text_props(weight="bold")
@@ -806,14 +807,16 @@ def save_sample_heightmap(scan, path, ds=4):
     valid = scan.height_raw != 0
     z = np.where(valid, scan.height_um, np.nan)[::ds, ::ds]
     z = _flip_lr(z)                                       # un-mirror for presentation
-    fig, ax = plt.subplots(figsize=(11, 12))
+    hh, ww = z.shape                                      # size the figure to the image aspect
+    fig_w = 11.0
+    fig, ax = plt.subplots(figsize=(fig_w, max(3.5, fig_w * hh / ww)))
     im = ax.imshow(z, origin="lower", cmap="viridis",
                    vmin=np.nanpercentile(z, 2), vmax=np.nanpercentile(z, 98))
     ax.set_title("Assembled sample height")
     ax.set_xticks([]); ax.set_yticks([])
     plt.colorbar(im, ax=ax, shrink=0.85, label="height (µm)")
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=200); plt.close(fig)
+    fig.savefig(path, dpi=200, bbox_inches="tight"); plt.close(fig)
 
 
 def save_sample_overview(scan, template, placements, path, ds=6):
@@ -826,7 +829,9 @@ def save_sample_overview(scan, template, placements, path, ds=6):
     allc = template.all_centers_um()
     bx0, bx1, by0, by1 = _cell_content_box(template)
     ccx, ccy = 0.5 * (bx0 + bx1), 0.5 * (by0 + by1)     # true cell centre (marker + pins)
-    fig, ax = plt.subplots(figsize=(12, 13))
+    hh, ww = base.shape                                 # size the figure to the image aspect
+    fig_w = 12.0
+    fig, ax = plt.subplots(figsize=(fig_w, max(4.0, fig_w * hh / ww)))
     ax.imshow(base, origin="lower", cmap="gray",
               vmin=np.nanpercentile(base, 2), vmax=np.nanpercentile(base, 98))
     for p in placements:
@@ -840,7 +845,7 @@ def save_sample_overview(scan, template, placements, path, ds=6):
     ax.set_title(f"{len(placements)} unit cells")
     ax.set_xticks([]); ax.set_yticks([])
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=170); plt.close(fig)
+    fig.savefig(path, dpi=170, bbox_inches="tight"); plt.close(fig)
 
 
 # ============================================================================ #
@@ -996,7 +1001,9 @@ def save_snapshot_heightmap(tiles, template, path, *, res_um=2.0, gutter_px=24, 
         print("No snapshot has a visible in-frame region -> skipping height map.")
         return
     canvas, boxes, vmax = m["canvas"], m["boxes"], m["vmax"]
-    fig, ax = plt.subplots(figsize=(max(8.0, 5.5 * len(boxes)), 8.0))
+    hh, ww = canvas.shape                                 # size the figure to the image aspect so
+    fig_w = max(8.0, 4.8 * len(boxes))                    # the colorbar tracks the plot, not empty space
+    fig, ax = plt.subplots(figsize=(fig_w, max(3.2, fig_w * (1.22 * hh) / ww)))
     im = ax.imshow(canvas, origin="lower", cmap="viridis", vmin=0, vmax=vmax, aspect="equal")
     ax.set_xticks([]); ax.set_yticks([])
     _annotate_snapshot_panels(ax, boxes, canvas.shape[0])
@@ -1009,7 +1016,7 @@ def save_snapshot_heightmap(tiles, template, path, *, res_um=2.0, gutter_px=24, 
 
 def save_snapshot_overview(tiles, template, path, *, res_um=2.0, gutter_px=24, montage=None):
     """INTENSITY overview for the multi-snapshot mode, written under the SAME filename as the
-    single-scan overview (``cell_overview.png``): the same snapshots tiled in the same layout as
+    single-scan overview (``intensity_map.png``): the same snapshots tiled in the same layout as
     the height map, annotated with their snapshot names."""
     m = montage if montage is not None else build_snapshot_montage(
         tiles, template, res_um=res_um, gutter_px=gutter_px)
@@ -1017,7 +1024,9 @@ def save_snapshot_overview(tiles, template, path, *, res_um=2.0, gutter_px=24, m
         print("No snapshot intensity available -> skipping intensity overview.")
         return
     icanvas, boxes = m["intensity"], m["boxes"]
-    fig, ax = plt.subplots(figsize=(max(8.0, 5.5 * len(boxes)), 8.0))
+    hh, ww = icanvas.shape
+    fig_w = max(8.0, 4.8 * len(boxes))
+    fig, ax = plt.subplots(figsize=(fig_w, max(3.2, fig_w * (1.22 * hh) / ww)))
     imi = ax.imshow(icanvas, origin="lower", cmap="gray",
                     vmin=m["ivmin"], vmax=m["ivmax"], aspect="equal")
     ax.set_xticks([]); ax.set_yticks([])
@@ -1077,7 +1086,7 @@ def save_3d_pin_map(scan, placement, template, array, path, *, res_um=2.0, block
     zf = np.nan_to_num(z, nan=0.0)                        # scan-edge gaps drop to the floor
     vmax = np.nanpercentile(z, 99.5)
     vmax = float(vmax) if np.isfinite(vmax) and vmax > 0 else 1.0
-    fig = plt.figure(figsize=(9, 7))
+    fig = plt.figure(figsize=(9, 6))
     ax = fig.add_subplot(111, projection="3d")
     surf = ax.plot_surface(xx, yy, zf, cmap="viridis", vmin=0, vmax=vmax,
                            rcount=160, ccount=160, linewidth=0, antialiased=True)
@@ -1087,7 +1096,7 @@ def save_3d_pin_map(scan, placement, template, array, path, *, res_um=2.0, block
     ax.zaxis.set_major_locator(plt.MaxNLocator(5))        # avoid z-ticks crowding the colorbar
     dz = max(1e-6, float(np.nanmax(zf) - np.nanmin(zf)))
     ax.set_box_aspect((x1 - x0, y1 - y0, dz))             # TRUE physical aspect (1 µm == 1 µm on z)
-    fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.12)       # height also on the z-axis; no dup label
+    fig.colorbar(surf, ax=ax, shrink=0.5, pad=0.08)       # height also on the z-axis; no dup label
     if param_label:                                       # laser-parameter info box, bottom-left
         ax.text2D(0.02, 0.02, param_label, transform=ax.transAxes, fontsize=11, va="bottom",
                   ha="left", bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="0.5", alpha=0.9))
@@ -1240,7 +1249,7 @@ def analyze_multi_snapshot(snapshots, out_dir, dxf_path, *, passes=0, speed=floa
 
     # Tiled figures under the SAME filenames as the single-scan pipeline (no new figure names):
     # the snapshots tiled side by side and annotated by name -- sample_heightmap.png = tiled height,
-    # cell_overview.png = tiled intensity (identical layout). One montage build feeds both.
+    # intensity_map.png = tiled intensity (identical layout). One montage build feeds both.
     montage = build_snapshot_montage(tiles, template)
     save_snapshot_heightmap(tiles, template, out_dir / "figures" / "sample_heightmap.png",
                             montage=montage)
