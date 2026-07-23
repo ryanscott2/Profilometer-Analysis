@@ -43,8 +43,7 @@ MEAS_REL = Path("legacy") / "measurements.csv"
 # Prefilled band definitions (one band per line: min_Ø, max_Ø, pitch in µm). Matches the provided
 # 4x4 single-cell DXF: Ø 50–67.5 µm @100 µm pitch and Ø 100–125 µm @150 µm pitch. Editable; blank
 # (or comments only) tells calibrate_depth.py to fall back to the measurements' own 'band' column.
-DEFAULT_BAND_DEFS = ("# min_Ø, max_Ø, pitch (µm) — one band per line; blank = use CSV 'band' column\n"
-                     "50, 67.5, 100\n"
+DEFAULT_BAND_DEFS = ("50, 67.5, 100\n"
                      "100, 125, 150\n")
 
 try:
@@ -112,7 +111,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("PFLM sample tester")
-        root.geometry("1520x900")
+        root.geometry("1920x1080")
+        self._drawer_open = False            # left Inputs drawer starts collapsed (big preview)
         self.proc = None
         self.cal_proc = None                # depth-calibration subprocess (separate from a run)
         self.cal_cell_specs = {}            # sample folder name -> inline cell-id filter spec ("" = all cells)
@@ -167,83 +167,142 @@ class App:
         self.cal_bands_text.insert("1.0", bands.read_text(encoding="utf-8-sig")
                                    if bands.exists() else DEFAULT_BAND_DEFS)
 
+    # ------------------------------------------------------------------ theme #
+    def _apply_theme(self):
+        """Soft-gray dark theme (Claude-Code style). ttk widgets via a 'clam' Style; the tk widgets
+        (Text/Listbox/Canvas) are coloured directly where they are created."""
+        P = self.pal = {
+            "bg": "#1b1b1b", "toolbar": "#232323", "panel": "#212121", "drawer": "#232323",
+            "border": "#2e2e2e", "input": "#191919", "inputborder": "#383838",
+            "text": "#cfccca", "muted": "#8f8c88", "help": "#6f6f6f",
+            "btn": "#2a2a2a", "btnborder": "#3a3a3a", "btnactive": "#333333",
+            "accent": "#4f7ea8", "accent_text": "#0c2334", "accent_active": "#5b8cb6",
+            "sel_bg": "#26323c", "sel_fg": "#cfe0ea", "scrim": "#0f0f0f",
+            "preview_bg": "#151515", "console_bg": "#141414", "console_fg": "#8fae8f",
+            "status_fg": "#7a9a7a",
+        }
+        st = ttk.Style(self.root)
+        try:
+            st.theme_use("clam")
+        except tk.TclError:
+            pass
+        st.configure(".", background=P["bg"], foreground=P["text"], fieldbackground=P["input"],
+                     bordercolor=P["border"], lightcolor=P["border"], darkcolor=P["border"],
+                     insertcolor=P["text"], font=("Segoe UI", 9))
+        st.configure("TFrame", background=P["bg"])
+        st.configure("Card.TFrame", background=P["panel"])
+        st.configure("Drawer.TFrame", background=P["drawer"])
+        st.configure("Toolbar.TFrame", background=P["toolbar"])
+        st.configure("TLabel", background=P["bg"], foreground=P["text"])
+        st.configure("Card.TLabel", background=P["panel"], foreground=P["text"])
+        st.configure("Help.TLabel", background=P["panel"], foreground=P["help"], font=("Segoe UI", 8))
+        st.configure("Drawer.TLabel", background=P["drawer"], foreground=P["muted"])
+        st.configure("Brand.TLabel", background=P["toolbar"], foreground=P["muted"],
+                     font=("Segoe UI", 11))
+        st.configure("Status.TLabel", background=P["input"], foreground=P["status_fg"],
+                     padding=(10, 4))
+        st.configure("Card.TLabelframe", background=P["panel"], bordercolor=P["border"],
+                     relief="solid", borderwidth=1)
+        st.configure("Card.TLabelframe.Label", background=P["panel"], foreground=P["muted"],
+                     font=("Segoe UI", 9))
+        for name in ("TButton", "Tool.TButton"):
+            st.configure(name, background=P["btn"], foreground=P["text"], bordercolor=P["btnborder"],
+                         relief="flat", padding=(10, 6), focuscolor=P["btn"])
+            st.map(name, background=[("active", P["btnactive"]), ("disabled", P["panel"])],
+                   foreground=[("disabled", P["help"])])
+        st.configure("Accent.TButton", background=P["accent"], foreground=P["accent_text"],
+                     bordercolor=P["accent"], relief="flat", padding=(16, 6),
+                     font=("Segoe UI", 9, "bold"), focuscolor=P["accent"])
+        st.map("Accent.TButton", background=[("active", P["accent_active"])])
+        st.configure("TCombobox", fieldbackground=P["input"], background=P["btn"],
+                     foreground=P["text"], arrowcolor=P["muted"], bordercolor=P["inputborder"],
+                     padding=(6, 4))
+        st.map("TCombobox", fieldbackground=[("readonly", P["input"])],
+               foreground=[("readonly", P["text"])], background=[("readonly", P["btn"])])
+        st.configure("TEntry", fieldbackground=P["input"], foreground=P["text"],
+                     bordercolor=P["inputborder"], padding=(4, 3))
+        st.configure("TCheckbutton", background=P["panel"], foreground=P["text"])
+        st.map("TCheckbutton", background=[("active", P["panel"])])
+        st.configure("Treeview", background=P["input"], fieldbackground=P["input"],
+                     foreground=P["text"], bordercolor=P["border"], borderwidth=0)
+        st.map("Treeview", background=[("selected", P["sel_bg"])],
+               foreground=[("selected", P["sel_fg"])])
+        st.configure("Treeview.Heading", background=P["panel"], foreground=P["muted"],
+                     relief="flat", bordercolor=P["border"])
+        st.map("Treeview.Heading", background=[("active", P["btn"])])
+        for sb in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            st.configure(sb, background=P["btn"], troughcolor=P["bg"], bordercolor=P["border"],
+                         arrowcolor=P["muted"])
+            st.map(sb, background=[("active", P["btnactive"])])
+        self.root.option_add("*TCombobox*Listbox.background", P["input"])
+        self.root.option_add("*TCombobox*Listbox.foreground", P["text"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", P["sel_bg"])
+        self.root.option_add("*TCombobox*Listbox.selectForeground", P["sel_fg"])
+
+    def _mono_text(self, parent, **kw):
+        """A dark-themed tk.Text with the shared input colouring (helper for the many editors)."""
+        P = self.pal
+        opts = dict(background=P["input"], foreground=P["text"], insertbackground=P["text"],
+                    relief="flat", borderwidth=0, highlightthickness=1,
+                    highlightbackground=P["inputborder"], highlightcolor=P["inputborder"])
+        opts.update(kw)
+        return tk.Text(parent, **opts)
+
     # ------------------------------------------------------------------ layout #
     def _build(self):
         root = self.root
-        # Keep the two control columns compact and give all surplus width to
-        # the preview.  Widgets inside the side columns also use bounded
-        # requested widths below so long paths/text cannot squeeze this column.
-        root.columnconfigure(0, weight=0, minsize=350)
-        root.columnconfigure(1, weight=1, minsize=480)
-        root.columnconfigure(2, weight=0, minsize=300)
-        root.rowconfigure(0, weight=1)
+        self._apply_theme()
+        P = self.pal
+        root.configure(bg=P["bg"])
+        root.rowconfigure(1, weight=1)
+        root.columnconfigure(0, weight=1)
 
-        left = ttk.Frame(root, padding=6); left.grid(row=0, column=0, sticky="nsew")
-        mid = ttk.Frame(root, padding=6); mid.grid(row=0, column=1, sticky="nsew")
-        right = ttk.Frame(root, padding=6); right.grid(row=0, column=2, sticky="nsew")
-
-        # ---------- LEFT: sample library + inputs ----------
-        left.columnconfigure(0, weight=1)
-        lib = ttk.LabelFrame(left, text="Samples", padding=6)
-        lib.grid(row=0, column=0, sticky="ew", pady=(0, 6)); lib.columnconfigure((0, 1, 2), weight=1)
+        # ---------- TOP TOOLBAR: sample switch + primary actions (always reachable) ----------
+        tbar = ttk.Frame(root, style="Toolbar.TFrame", padding=(10, 7))
+        tbar.grid(row=0, column=0, sticky="ew")
+        self.drawer_btn = ttk.Button(tbar, text="☰  Inputs", width=11, style="Tool.TButton",
+                                     command=self._toggle_drawer)
+        self.drawer_btn.pack(side="left")
+        ttk.Label(tbar, text="PFLM", style="Brand.TLabel").pack(side="left", padx=(12, 14))
         self.sample_var = tk.StringVar()
-        self.sample_combo = ttk.Combobox(lib, textvariable=self.sample_var, state="readonly")
-        self.sample_combo.grid(row=0, column=0, columnspan=3, sticky="ew")
+        self.sample_combo = ttk.Combobox(tbar, textvariable=self.sample_var, state="readonly",
+                                         width=32)
+        self.sample_combo.pack(side="left")
         self.sample_combo.bind("<<ComboboxSelected>>",
                                lambda e: self._load_sample(self.sample_var.get()))
-        ttk.Button(lib, text="Save as…", command=self._save_as).grid(row=1, column=0, sticky="ew", pady=4, padx=1)
-        ttk.Button(lib, text="Update", command=self._update_sample).grid(row=1, column=1, sticky="ew", pady=4, padx=1)
-        ttk.Button(lib, text="Delete", command=self._delete_sample).grid(row=1, column=2, sticky="ew", pady=4, padx=1)
+        self.run_btn = ttk.Button(tbar, text="▶  Run", style="Accent.TButton",
+                                  command=self._toggle_run)
+        self.run_btn.pack(side="right")
+        ttk.Button(tbar, text="Export .zip", style="Tool.TButton",
+                   command=self._export_zip).pack(side="right", padx=(0, 8))
+        self.status = ttk.Label(tbar, text="idle", style="Status.TLabel", anchor="w")
+        self.status.pack(side="right", padx=(0, 10))
 
-        dxff = ttk.LabelFrame(left, text="DXF file (drag/drop)", padding=6)
-        dxff.grid(row=1, column=0, sticky="ew", pady=(0, 6)); dxff.columnconfigure(0, weight=1)
-        self.dxf_lbl = ttk.Label(dxff, text="(none)", relief="sunken", anchor="w",
-                                 padding=4, width=1)
-        self.dxf_lbl.grid(row=0, column=0, sticky="ew")
-        ttk.Button(dxff, text="Browse…", command=self._browse_dxf).grid(row=1, column=0, sticky="ew", pady=(4, 0))
-        self._make_drop(self.dxf_lbl, self._on_drop_dxf)
+        # ---------- BODY: workspace (preview + console)  |  right rail ----------
+        body = ttk.Frame(root, style="TFrame", padding=(10, 8))
+        body.grid(row=1, column=0, sticky="nsew")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=0, minsize=400)
 
-        vk4f = ttk.LabelFrame(left, text="VK4 files (drag/drop folder or files)", padding=6)
-        vk4f.grid(row=2, column=0, sticky="nsew", pady=(0, 6)); left.rowconfigure(2, weight=1)
-        vk4f.columnconfigure(0, weight=1); vk4f.rowconfigure(1, weight=1)
-        self.vk4_dir_lbl = ttk.Label(vk4f, text="(no folder)", relief="sunken", anchor="w",
-                                     padding=4, width=1)
-        self.vk4_dir_lbl.grid(row=0, column=0, sticky="ew")
-        lbf = ttk.Frame(vk4f); lbf.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
-        lbf.columnconfigure(0, weight=1); lbf.rowconfigure(0, weight=1)
-        self.vk4_list = tk.Listbox(lbf, height=6, activestyle="none")
-        self.vk4_list.grid(row=0, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(lbf, orient="vertical", command=self.vk4_list.yview)
-        sb.grid(row=0, column=1, sticky="ns"); self.vk4_list.config(yscrollcommand=sb.set)
-        ttk.Button(vk4f, text="Browse folder…", command=self._browse_vk4).grid(row=2, column=0, sticky="ew", pady=(4, 0))
-        self._make_drop(self.vk4_list, self._on_drop_vk4)
-
-        lpf = ttk.LabelFrame(left, text="Laser parameters (cell_params grid — edit freely)", padding=6)
-        lpf.grid(row=3, column=0, sticky="nsew"); left.rowconfigure(3, weight=1)
-        lpf.columnconfigure(0, weight=1); lpf.rowconfigure(0, weight=1)
-        self.csv_text = tk.Text(lpf, height=6, width=34, wrap="none", font=("Consolas", 10),
-                                undo=True)
-        self.csv_text.grid(row=0, column=0, sticky="nsew")
-        cs = ttk.Scrollbar(lpf, orient="vertical", command=self.csv_text.yview)
-        cs.grid(row=0, column=1, sticky="ns"); self.csv_text.config(yscrollcommand=cs.set)
-        ttk.Label(lpf, text="grid = design orientation (DXF top-left = line 1, col 1); "
-                            "each cell 'P{passes}_S{speed}'",
-                  foreground="#666", wraplength=320).grid(row=1, column=0, sticky="w", pady=(2, 0))
-
-        # ---------- MIDDLE: preview (locked 16:9) + console ----------
+        mid = ttk.Frame(body, style="TFrame")
+        mid.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         mid.columnconfigure(0, weight=1); mid.rowconfigure(0, weight=3); mid.rowconfigure(1, weight=1)
-        prevf = ttk.LabelFrame(mid, text="Preview (select a file in the Results browser →)", padding=4)
-        prevf.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
+        self._mid = mid
+
+        prevf = ttk.LabelFrame(mid, text=" Preview ", style="Card.TLabelframe", padding=6)
+        prevf.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
         prevf.bind("<Configure>", self._fit_preview_169)
         # host kept at 16:9 (letterboxed, centred in prevf); canvas + text overlay it
-        self.prev_host = tk.Frame(prevf, background="#202020")
+        self.prev_host = tk.Frame(prevf, background=P["preview_bg"])
         self.prev_host.place(relx=0.5, rely=0.5, anchor="center", width=320, height=180)
-        self.preview = tk.Canvas(self.prev_host, background="#202020", highlightthickness=0)
+        self.preview = tk.Canvas(self.prev_host, background=P["preview_bg"], highlightthickness=0)
         self.preview.pack(fill="both", expand=True)
         self.preview.bind("<Configure>", lambda e: self._reshow_image())
-        self.text_frame = tk.Frame(self.prev_host)          # shown for txt/csv, with H+V scrollbars
+        self.text_frame = tk.Frame(self.prev_host, background=P["preview_bg"])
         self.text_frame.columnconfigure(0, weight=1); self.text_frame.rowconfigure(0, weight=1)
-        self.preview_text = tk.Text(self.text_frame, wrap="none", font=("Consolas", 10))
+        self.preview_text = self._mono_text(self.text_frame, wrap="none", font=("Consolas", 10),
+                                            background=P["console_bg"], highlightthickness=0)
         self.preview_text.grid(row=0, column=0, sticky="nsew")
         tvs = ttk.Scrollbar(self.text_frame, orient="vertical", command=self.preview_text.yview)
         tvs.grid(row=0, column=1, sticky="ns")
@@ -251,11 +310,12 @@ class App:
         ths.grid(row=1, column=0, sticky="ew")
         self.preview_text.config(yscrollcommand=tvs.set, xscrollcommand=ths.set)
 
-        consf = ttk.LabelFrame(mid, text="Console", padding=4)
+        consf = ttk.LabelFrame(mid, text=" Console ", style="Card.TLabelframe", padding=6)
         consf.grid(row=1, column=0, sticky="nsew")
         consf.columnconfigure(0, weight=1); consf.rowconfigure(0, weight=1)
-        self.console = tk.Text(consf, wrap="none", background="#111", foreground="#ddd",
-                               font=("Consolas", 9), height=8)
+        self.console = self._mono_text(consf, wrap="none", background=P["console_bg"],
+                                       foreground=P["console_fg"], font=("Consolas", 9), height=8,
+                                       highlightthickness=0)
         self.console.grid(row=0, column=0, sticky="nsew")
         kv = ttk.Scrollbar(consf, orient="vertical", command=self.console.yview)
         kv.grid(row=0, column=1, sticky="ns")
@@ -263,10 +323,13 @@ class App:
         kh.grid(row=1, column=0, sticky="ew")
         self.console.config(yscrollcommand=kv.set, xscrollcommand=kh.set)
 
-        # ---------- RIGHT: results browser + radial-average sets + actions ----------
+        # ---------- RIGHT RAIL: results browser + radial sets + depth calibration ----------
+        right = ttk.Frame(body, style="TFrame")
+        right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1); right.rowconfigure(0, weight=1)
-        resf = ttk.LabelFrame(right, text="Results folder", padding=4)
-        resf.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
+
+        resf = ttk.LabelFrame(right, text=" Results folder ", style="Card.TLabelframe", padding=6)
+        resf.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
         resf.columnconfigure(0, weight=1); resf.rowconfigure(0, weight=1)
         self.tree = ttk.Treeview(resf, show="tree")
         self.tree.grid(row=0, column=0, sticky="nsew")
@@ -276,28 +339,28 @@ class App:
         thb.grid(row=1, column=0, sticky="ew")
         self.tree.config(yscrollcommand=tb.set, xscrollcommand=thb.set)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
-        ttk.Button(resf, text="Refresh", command=self._refresh_results).grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(resf, text="Refresh", style="Tool.TButton",
+                   command=self._refresh_results).grid(row=2, column=0, sticky="ew", pady=(6, 0))
 
-        radf = ttk.LabelFrame(right, text="Radial-average sets  (one set per line)", padding=4)
-        radf.grid(row=1, column=0, sticky="nsew", pady=(0, 6))
+        radf = ttk.LabelFrame(right, text=" Radial-average sets ", style="Card.TLabelframe", padding=6)
+        radf.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
         radf.columnconfigure(0, weight=1); radf.rowconfigure(0, weight=1)
-        self.radial_text = tk.Text(radf, height=5, width=32, wrap="none",
-                                   font=("Consolas", 9), undo=True)
+        self.radial_text = self._mono_text(radf, height=5, width=32, wrap="none",
+                                           font=("Consolas", 9), undo=True)
         self.radial_text.grid(row=0, column=0, sticky="nsew")
         rvs = ttk.Scrollbar(radf, orient="vertical", command=self.radial_text.yview)
         rvs.grid(row=0, column=1, sticky="ns"); self.radial_text.config(yscrollcommand=rvs.set)
-        ttk.Label(radf, text="each line = one overlay set, e.g. P30_S400,P40_S400,P50_S400 · "
-                             "empty = overlay every parameter present",
-                  foreground="#666", wraplength=280).grid(row=1, column=0, columnspan=2, sticky="w")
+        ttk.Label(radf, text="one overlay set per line · blank = all parameters",
+                  style="Help.TLabel", wraplength=350).grid(row=1, column=0, columnspan=2, sticky="w",
+                                                            pady=(4, 0))
 
-        # ---------- RIGHT: depth calibration (pool completed samples, post-hoc) ----------
+        # ---------- depth calibration (pool completed samples, post-hoc) ----------
         # Shells out to calibrate_depth.py on the samples selected here; output streams to the
-        # console and the report/figures land under Results/_depth_calibration (browsable at left).
-        calf = ttk.LabelFrame(right, text="Depth calibration  (pool samples → depth = f(passes, speed))",
-                              padding=4)
-        calf.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        # console and the report/figures land under Results/_depth_calibration (browsable above).
+        calf = ttk.LabelFrame(right, text=" Depth calibration ", style="Card.TLabelframe", padding=6)
+        calf.grid(row=2, column=0, sticky="ew")
         calf.columnconfigure(0, weight=1)
-        clf = ttk.Frame(calf); clf.grid(row=0, column=0, columnspan=2, sticky="nsew")
+        clf = ttk.Frame(calf, style="Card.TFrame"); clf.grid(row=0, column=0, columnspan=2, sticky="nsew")
         clf.columnconfigure(0, weight=1); clf.rowconfigure(0, weight=1)
         # Two-column table: sample name + an inline per-sample cell filter. Native extended
         # selection (Ctrl/Shift-click) still picks which samples to pool (as the old listbox did);
@@ -306,49 +369,131 @@ class App:
                                      show="tree headings")
         self.cal_list.heading("#0", text="sample")
         self.cal_list.heading("cells", text="cells")
-        self.cal_list.column("#0", width=180, minwidth=90, anchor="w", stretch=True)
+        self.cal_list.column("#0", width=200, minwidth=90, anchor="w", stretch=True)
         self.cal_list.column("cells", width=96, minwidth=60, anchor="w", stretch=False)
         self.cal_list.grid(row=0, column=0, sticky="nsew")
         cls = ttk.Scrollbar(clf, orient="vertical", command=self.cal_list.yview)
         cls.grid(row=0, column=1, sticky="ns"); self.cal_list.config(yscrollcommand=cls.set)
         self.cal_list.bind("<Double-1>", self._edit_cal_cells)
         self._cal_cell_editor = None            # active inline Entry over the 'cells' column, if any
-        ttk.Label(calf, text="samples to include (Ctrl/Shift-click for multi; none selected = all "
-                             "discovered).  double-click a row's ‘cells’ to pick cell_ids, e.g. "
-                             "1-5, 8, 12-16  (prefix ! to exclude; blank = all)",
-                  foreground="#666", wraplength=280).grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(2, 2))
-        ttk.Label(calf, text="bands — one per line: min Ø, max Ø, pitch (µm)  (a pin joins a band "
-                             "only if its Ø is in range AND its pitch matches).  blank = use CSV "
-                             "'band' column", foreground="#666", wraplength=280).grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
-        bdf = ttk.Frame(calf); bdf.grid(row=3, column=0, columnspan=2, sticky="ew")
+        ttk.Label(calf, text="Ctrl/Shift-click to subset · double-click ‘cells’ to filter",
+                  style="Help.TLabel", wraplength=360).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(4, 2))
+        ttk.Label(calf, text="one band per line: min Ø, max Ø, pitch (µm)",
+                  style="Help.TLabel", wraplength=360).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(2, 2))
+        bdf = ttk.Frame(calf, style="Card.TFrame"); bdf.grid(row=3, column=0, columnspan=2, sticky="ew")
         bdf.columnconfigure(0, weight=1)
-        self.cal_bands_text = tk.Text(bdf, height=3, width=30, wrap="none", font=("Consolas", 9),
-                                      undo=True)
+        self.cal_bands_text = self._mono_text(bdf, height=3, width=30, wrap="none",
+                                              font=("Consolas", 9), undo=True)
         self.cal_bands_text.grid(row=0, column=0, sticky="nsew")
         bds = ttk.Scrollbar(bdf, orient="vertical", command=self.cal_bands_text.yview)
         bds.grid(row=0, column=1, sticky="ns"); self.cal_bands_text.config(yscrollcommand=bds.set)
-        tgtf = ttk.Frame(calf); tgtf.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(2, 2))
-        ttk.Label(tgtf, text="target depth (µm):").grid(row=0, column=0, sticky="w")
+        tgtf = ttk.Frame(calf, style="Card.TFrame"); tgtf.grid(row=4, column=0, columnspan=2,
+                                                               sticky="ew", pady=(6, 2))
+        ttk.Label(tgtf, text="target depth (µm):", style="Card.TLabel").grid(row=0, column=0, sticky="w")
         self.cal_target = tk.StringVar(value="55")
-        ttk.Entry(tgtf, textvariable=self.cal_target, width=16).grid(row=0, column=1, sticky="w", padx=(4, 0))
-        ttk.Label(tgtf, text="(comma-sep OK)", foreground="#666").grid(row=0, column=2, sticky="w", padx=(4, 0))
+        ttk.Entry(tgtf, textvariable=self.cal_target, width=16).grid(row=0, column=1, sticky="w", padx=(6, 0))
+        ttk.Label(tgtf, text="(comma-sep OK)", style="Help.TLabel").grid(row=0, column=2, sticky="w", padx=(6, 0))
         self.cal_allow_legacy_qc = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             tgtf,
             text="allow legacy files missing QC fields (unsafe)",
             variable=self.cal_allow_legacy_qc,
-        ).grid(row=1, column=0, columnspan=3, sticky="w")
-        self.cal_btn = ttk.Button(calf, text="Calibrate depth", command=self._calibrate_depth)
-        self.cal_btn.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.cal_btn = ttk.Button(calf, text="Calibrate depth", style="Tool.TButton",
+                                  command=self._calibrate_depth)
+        self.cal_btn.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
-        act = ttk.Frame(right); act.grid(row=3, column=0, sticky="ew"); act.columnconfigure(0, weight=1)
-        self.run_btn = ttk.Button(act, text="▶  Run", command=self._toggle_run)
-        self.run_btn.grid(row=0, column=0, sticky="ew", pady=2)
-        ttk.Button(act, text="Export figures .zip", command=self._export_zip).grid(row=1, column=0, sticky="ew", pady=2)
-        self.status = ttk.Label(act, text="idle", anchor="w", relief="groove", padding=3)
-        self.status.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        self._build_drawer(mid)                 # left Inputs drawer (overlays the preview/console)
+
+    # -------------------------------------------------------- left Inputs drawer #
+    def _build_drawer(self, mid):
+        """Build the collapsible Inputs drawer + its soft-dim scrim as overlay children of ``mid``
+        (the preview/console column), so opening it never covers the right rail. Placed via
+        ``_place_drawer`` / hidden via ``_toggle_drawer``; starts collapsed."""
+        P = self.pal
+        self._scrim = tk.Frame(mid, background=P["scrim"])
+        self._scrim.bind("<Button-1>", lambda e: self._toggle_drawer())   # click-away closes it
+        dr = self._drawer = tk.Frame(mid, background=P["drawer"], highlightthickness=1,
+                                     highlightbackground=P["btnborder"])
+        dr.columnconfigure(0, weight=1)
+
+        hdr = ttk.Frame(dr, style="Drawer.TFrame"); hdr.grid(row=0, column=0, sticky="ew",
+                                                             padx=10, pady=(9, 4))
+        hdr.columnconfigure(0, weight=1)
+        ttk.Label(hdr, text="Inputs", style="Drawer.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(hdr, text="◀", width=3, style="Tool.TButton",
+                   command=self._toggle_drawer).grid(row=0, column=1, sticky="e")
+
+        lib = ttk.LabelFrame(dr, text=" Samples ", style="Card.TLabelframe", padding=6)
+        lib.grid(row=1, column=0, sticky="ew", padx=10, pady=(4, 6))
+        lib.columnconfigure((0, 1, 2), weight=1)
+        ttk.Button(lib, text="Save as…", style="Tool.TButton",
+                   command=self._save_as).grid(row=0, column=0, sticky="ew", padx=1)
+        ttk.Button(lib, text="Update", style="Tool.TButton",
+                   command=self._update_sample).grid(row=0, column=1, sticky="ew", padx=1)
+        ttk.Button(lib, text="Delete", style="Tool.TButton",
+                   command=self._delete_sample).grid(row=0, column=2, sticky="ew", padx=1)
+
+        dxff = ttk.LabelFrame(dr, text=" DXF file  ·  drag/drop ", style="Card.TLabelframe", padding=6)
+        dxff.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 6)); dxff.columnconfigure(0, weight=1)
+        self.dxf_lbl = tk.Label(dxff, text="(none)", anchor="w", background=P["input"],
+                                foreground=P["text"], relief="flat", padx=6, pady=4,
+                                highlightthickness=1, highlightbackground=P["inputborder"])
+        self.dxf_lbl.grid(row=0, column=0, sticky="ew")
+        ttk.Button(dxff, text="Browse…", style="Tool.TButton",
+                   command=self._browse_dxf).grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self._make_drop(self.dxf_lbl, self._on_drop_dxf)
+
+        vk4f = ttk.LabelFrame(dr, text=" VK4 tiles  ·  drop folder or files ",
+                              style="Card.TLabelframe", padding=6)
+        vk4f.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 6)); dr.rowconfigure(3, weight=1)
+        vk4f.columnconfigure(0, weight=1); vk4f.rowconfigure(1, weight=1)
+        self.vk4_dir_lbl = tk.Label(vk4f, text="(no folder)", anchor="w", background=P["input"],
+                                    foreground=P["text"], relief="flat", padx=6, pady=4,
+                                    highlightthickness=1, highlightbackground=P["inputborder"])
+        self.vk4_dir_lbl.grid(row=0, column=0, sticky="ew")
+        lbf = ttk.Frame(vk4f, style="Card.TFrame"); lbf.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        lbf.columnconfigure(0, weight=1); lbf.rowconfigure(0, weight=1)
+        self.vk4_list = tk.Listbox(lbf, height=6, activestyle="none", background=P["input"],
+                                   foreground=P["text"], relief="flat", borderwidth=0,
+                                   highlightthickness=1, highlightbackground=P["inputborder"],
+                                   selectbackground=P["sel_bg"], selectforeground=P["sel_fg"])
+        self.vk4_list.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(lbf, orient="vertical", command=self.vk4_list.yview)
+        sb.grid(row=0, column=1, sticky="ns"); self.vk4_list.config(yscrollcommand=sb.set)
+        ttk.Button(vk4f, text="Browse folder…", style="Tool.TButton",
+                   command=self._browse_vk4).grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self._make_drop(self.vk4_list, self._on_drop_vk4)
+
+        lpf = ttk.LabelFrame(dr, text=" Laser parameters (cell_params grid) ",
+                             style="Card.TLabelframe", padding=6)
+        lpf.grid(row=4, column=0, sticky="nsew", padx=10, pady=(0, 10)); dr.rowconfigure(4, weight=1)
+        lpf.columnconfigure(0, weight=1); lpf.rowconfigure(0, weight=1)
+        self.csv_text = self._mono_text(lpf, height=6, width=34, wrap="none", font=("Consolas", 10),
+                                        undo=True)
+        self.csv_text.grid(row=0, column=0, sticky="nsew")
+        cs = ttk.Scrollbar(lpf, orient="vertical", command=self.csv_text.yview)
+        cs.grid(row=0, column=1, sticky="ns"); self.csv_text.config(yscrollcommand=cs.set)
+        ttk.Label(lpf, text="grid = design orientation (DXF top-left = line 1, col 1); "
+                            "each cell 'P{passes}_S{speed}'",
+                  style="Help.TLabel", wraplength=290).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+    def _place_drawer(self):
+        self._scrim.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+        self._drawer.place(x=0, y=0, relheight=1.0, width=340)
+        self._scrim.lift(); self._drawer.lift()
+
+    def _toggle_drawer(self):
+        if self._drawer_open:
+            self._drawer.place_forget(); self._scrim.place_forget()
+            self._drawer_open = False
+            self.drawer_btn.config(text="☰  Inputs")
+        else:
+            self._place_drawer()
+            self._drawer_open = True
+            self.drawer_btn.config(text="◀  Inputs")
 
     def _make_drop(self, widget, handler):
         if _DND:
@@ -873,6 +1018,7 @@ class App:
 
 def _ask_name(root, initial=""):
     dlg = tk.Toplevel(root); dlg.title("Sample name"); dlg.transient(root); dlg.grab_set()
+    dlg.configure(bg="#1b1b1b")              # match the app's soft-gray dark theme
     ttk.Label(dlg, text="Name:").grid(row=0, column=0, padx=6, pady=8)
     var = tk.StringVar(value=initial)
     e = ttk.Entry(dlg, textvariable=var, width=26); e.grid(row=0, column=1, padx=6, pady=8)
