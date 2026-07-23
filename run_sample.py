@@ -211,55 +211,58 @@ def _resilient_rmtree(path, *, attempts=30, delay=0.5):
     return False
 
 
-# The transaction's previous-result backup is kept OUTSIDE the Results tree (which is OneDrive-
-# synced) so a cloud-sync client cannot lock it and block cleanup -- that lock was what left
-# ``.previous`` dirs stranded. Documents is on the same drive, so the swap stays a fast, atomic
-# same-volume rename; ``_relocate`` falls back to a (non-atomic) copy only if the backup root ever
-# lands on a different volume.
-BACKUP_ROOT = Path.home() / "Documents" / ".pflm-backups"
-
-
-def _backup_dir(final_dir):
-    return BACKUP_ROOT / f"{Path(final_dir).name}.previous"
-
-
-def _relocate(src, dst):
-    """Move directory ``src`` -> ``dst`` (atomic same-volume rename; copy fallback cross-volume)."""
+def _discard_dir(path):
+    """Remove a directory even while a cloud-sync client (OneDrive) holds handles on files inside it.
+    A directory RENAME succeeds where an in-place ``rmtree`` is blocked, so move the tree into the
+    system temp dir (not OneDrive/Results) and delete it there, where nothing locks it. Falls back to
+    an in-place resilient rmtree only if the temp dir is on a different volume (rename impossible).
+    Returns True on success."""
+    path = Path(path)
+    if not path.exists():
+        return True
     try:
-        os.replace(src, dst)
+        holder = Path(tempfile.mkdtemp(prefix="pflm-trash-"))
+        os.replace(path, holder / path.name)             # dir rename works with locked contents
     except OSError:
-        shutil.move(str(src), str(dst))
+        return _resilient_rmtree(path)
+    _resilient_rmtree(holder)                            # lock-free temp -> succeeds; best-effort
+    return True
 
 
 def _prepare_output_transaction(out_dir, protect=(), results_root=DEF_OUT_DIR):
-    """Create an owned hidden staging sibling while leaving the last good result untouched."""
+    """Create an owned hidden staging sibling while leaving the last good result untouched.
+
+    No ``.previous`` backup is kept -- at commit the completed staging dir is renamed straight onto
+    the final path (after the old result is removed), so no backup pile can accumulate. A stale
+    staging dir left by an interrupted run is inert and GC'd here."""
     final_dir = _validate_output_target(out_dir, protect=protect, results_root=results_root)
     final_dir.parent.mkdir(parents=True, exist_ok=True)
-    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
-    backup = _backup_dir(final_dir)
-    if backup.exists():
-        if final_dir.exists():
-            if not (_sentinel_valid(backup, final_dir, ("complete",))
-                    or _looks_like_legacy_output(backup)):
-                raise SystemExit(f"refusing to remove unowned recovery directory {backup}")
-            if not _resilient_rmtree(backup):
-                raise SystemExit(
-                    f"could not remove the stale recovery directory {backup} (a cloud-sync client "
-                    f"or another process is holding it); close anything using it and re-run.")
-        else:
-            _relocate(backup, final_dir)
-            print(f"Recovered previous completed output after an interrupted swap -> {final_dir}")
-    for stale in final_dir.parent.glob(f".{final_dir.name}.staging-*"):
-        if (stale.is_dir()
-                and _sentinel_valid(stale, final_dir, ("staging",))):
-            _resilient_rmtree(stale)                     # best-effort; a stale staging dir is inert
+    for _held in Path(tempfile.gettempdir()).glob("pflm-trash-*"):
+        shutil.rmtree(_held, ignore_errors=True)         # opportunistic GC of settled discard-holders
+    # Recover / GC any staging orphan from an interrupted run. A 'complete' orphan is a result that
+    # was built but not swapped in: promote it if the final is missing, otherwise it is superseded.
+    for orphan in sorted(final_dir.parent.glob(f".{final_dir.name}.staging-*")):
+        if not orphan.is_dir():
+            continue
+        if _sentinel_valid(orphan, final_dir, ("complete",)) and not final_dir.exists():
+            os.replace(orphan, final_dir)
+            print(f"Recovered a completed-but-unswapped result -> {final_dir}")
+        elif _sentinel_valid(orphan, final_dir, ("staging", "complete")):
+            _discard_dir(orphan)                         # incomplete or superseded -> inert junk
     stage = Path(tempfile.mkdtemp(prefix=f".{final_dir.name}.staging-", dir=final_dir.parent))
     _write_results_sentinel(stage, final_dir, "staging")
     return stage, final_dir
 
 
 def _commit_output_transaction(stage, final_dir):
-    """Validate and swap a staged run into place, restoring the previous run on swap failure."""
+    """Validate the staged run and rename staging onto the final path.
+
+    No ``.previous`` backup pile is kept. ``os.replace`` cannot rename onto a non-empty directory on
+    Windows, so the old result is first moved aside by a fast rename into the SYSTEM temp dir (not
+    OneDrive, not Documents, not Results) -- a rename succeeds even while a cloud-sync client holds
+    handles, and deleting it there is never blocked by a sync lock, so nothing accumulates where the
+    user looks. On any failure the fully-built staging dir remains (``.<name>.staging-*``) so a
+    completed prior result is never left half-swapped."""
     stage, final_dir = Path(stage).resolve(), Path(final_dir).resolve()
     if (stage.parent != final_dir.parent
             or not stage.name.startswith(f".{final_dir.name}.staging-")
@@ -270,26 +273,12 @@ def _commit_output_transaction(stage, final_dir):
     if missing:
         raise RuntimeError(f"staged analysis is incomplete; missing required outputs: {missing}")
     _write_results_sentinel(stage, final_dir, "complete")
-    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
-    backup = _backup_dir(final_dir)
-    if backup.exists():
-        raise RuntimeError(f"recovery directory unexpectedly exists: {backup}")
-    if final_dir.exists():
-        _relocate(final_dir, backup)                     # move the old result OUT to Documents
-    try:
-        os.replace(stage, final_dir)                     # atomic same-dir swap-in of the new result
-    except BaseException:
-        if backup.exists() and not final_dir.exists():
-            _relocate(backup, final_dir)
-        raise
-    # The swap is done and the result is valid; removing the old backup is non-critical cleanup.
-    # If a cloud-sync client is momentarily holding it, warn and leave it -- the next run's
-    # _prepare_output_transaction GC (also resilient) will remove it -- rather than fail a
-    # completed run.
-    if backup.exists() and not _resilient_rmtree(backup):
-        print(f"WARNING: analysis committed successfully, but the previous backup {backup} could "
-              f"not be removed (locked by a cloud-sync client / another process). It is inert and "
-              f"will be cleaned up automatically on the next run.")
+    if final_dir.exists() and not _discard_dir(final_dir):   # move old result out + delete in temp
+        raise RuntimeError(
+            f"could not clear the previous result {final_dir} (a cloud-sync client or another "
+            f"process is holding it); close anything using it and re-run. The new result is fully "
+            f"staged at {stage}.")
+    os.replace(stage, final_dir)                             # atomic same-dir rename of new result
     print(f"Committed complete analysis transaction -> {final_dir}")
 
 
@@ -560,7 +549,7 @@ def render_cell_report(scan, placement, template, res_by_array, params, path, bo
         rows_t.append([f"D{a.diameter_um:g} P{a.pitch_um:g}", _f(r.depth_um),
                        _f(r.top_diameter_um), _f(r.diameter_um), _f(r.base_diameter_um),
                        f"{r.meas_pitch_um:.0f}/{a.pitch_um:g}", f"{100*r.debris_fraction:.0f}"])
-    col_labels = ["array (D drawn / P)", "depth µm", "Ø top", "Ø nom", "Ø floor",
+    col_labels = ["array (D/P)", "depth µm", "Ø top", "Ø nom", "Ø floor",
                   "pitch m/e", "debris%"]
     _th = min(0.82, 0.09 * (len(rows_t) + 1))            # scale height with #rows (no tall stretch)
     tbl = axr.table(cellText=rows_t, colLabels=col_labels, cellLoc="center",
@@ -1112,14 +1101,15 @@ def save_3d_pin_map(scan, placement, template, array, path, *, res_um=2.0, block
     ax = fig.add_subplot(111, projection="3d")
     surf = ax.plot_surface(xx, yy, zf, cmap="viridis", vmin=0, vmax=vmax,
                            rcount=160, ccount=160, linewidth=0, antialiased=True)
-    ax.set_xlabel("x (µm)"); ax.set_ylabel("y (µm)")
+    ax.set_xlabel("x (µm)", labelpad=18); ax.set_ylabel("y (µm)", labelpad=18)  # clear the ticks
     ax.set_zlabel("")                                     # height shown on the colorbar (no overlap)
     ax.set_title(f"3D height — D{array.diameter_um:g} P{array.pitch_um:g}", fontsize=12)
     ax.view_init(elev=28, azim=-55)
-    ax.zaxis.set_major_locator(plt.MaxNLocator(5))
-    dz = max(1e-6, float(np.nanmax(zf) - np.nanmin(zf)))
-    ax.set_box_aspect((x1 - x0, y1 - y0, dz))             # TRUE physical aspect (1 µm == 1 µm on z)
-    fig.colorbar(surf, ax=ax, shrink=0.5, pad=0.16, label="height above floor (µm)")
+    ztop = float(np.nanmax(zf))
+    ax.set_zlim(0, max(1.0, ztop)); ax.set_zticks([0, round(ztop)])  # only 0 + top tick (rest cramp)
+    dz = max(1e-6, ztop - float(np.nanmin(zf)))
+    ax.set_box_aspect((x1 - x0, y1 - y0, dz), zoom=1.25)  # TRUE aspect, zoomed in to fill the frame
+    fig.colorbar(surf, ax=ax, shrink=0.5, pad=0.22, label="height above floor (µm)")
     if param_label:                                       # laser-parameter info box, bottom-left
         ax.text2D(0.02, 0.02, param_label, transform=ax.transAxes, fontsize=11, va="bottom",
                   ha="left", bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="0.5", alpha=0.9))
@@ -1228,7 +1218,7 @@ def render_snapshot_cell_report(tiles, template, avg_by_array, dose_label, path,
         rows_t.append([f"D{a.diameter_um:g} P{a.pitch_um:g}", _f(r.depth_um), _f(r.top_diameter_um),
                        _f(r.diameter_um), _f(r.base_diameter_um),
                        f"{r.meas_pitch_um:.0f}/{a.pitch_um:g}", f"{100 * r.debris_fraction:.0f}"])
-    col_labels = ["array (D drawn / P)", "depth µm", "Ø top", "Ø nom", "Ø floor",
+    col_labels = ["array (D/P)", "depth µm", "Ø top", "Ø nom", "Ø floor",
                   "pitch m/e", "debris%"]
     if rows_t:
         _th = min(0.82, 0.09 * (len(rows_t) + 1))
