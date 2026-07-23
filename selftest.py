@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import accel
 from dxf_geometry import read_design
 from register import (RegistrationAmbiguityError, _dealias_origin, _overlap_score,
                       _register_by_pattern, rasterize_cell_pins, register_scan,
@@ -113,6 +114,7 @@ class Checker:
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
+    accel.set_force_cpu(True)   # the gate must be deterministic: pin the CPU float64 NCC path
     ck = Checker()
 
     # Local runs use the OneDrive fabrication DXF; CI uses the versioned equivalent.
@@ -1120,6 +1122,60 @@ def main():
                  "#P1 rasterize matches loop on exact-half pixel centres (tie-to-even actually hit)")
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"Phase-1 bit-exactness path raised: {e!r}")
+
+    # ---------------------------------------- 19. accel FFT/NCC backend equivalence (Phase 2) #
+    print("\n[19] accel backend: CPU byte-identical, decisive->CPU, GPU/pyfftw agree")
+    try:
+        def _ncc_ref(img, tpl):     # frozen copy of the historical register._pattern_ncc
+            from scipy.signal import fftconvolve
+            t = tpl.astype(np.float64); t0 = t - t.mean()
+            tnorm = float(np.sqrt((t0 * t0).sum())); ones = np.ones_like(t)
+            if tnorm < 1e-9:
+                Hi, Wi = img.shape; Ht, Wt = t.shape
+                return np.zeros((Hi + Ht - 1, Wi + Wt - 1))
+            num = fftconvolve(img, t0[::-1, ::-1], mode="full")
+            s1 = fftconvolve(img, ones[::-1, ::-1], mode="full")
+            s2 = fftconvolve(img * img, ones[::-1, ::-1], mode="full")
+            n = float(t.size)
+            denom = np.sqrt(np.maximum(s2 - s1 * s1 / n, 0.0)) * tnorm
+            with np.errstate(divide="ignore", invalid="ignore"):
+                return np.where(denom > 1e-9, num / denom, 0.0)
+
+        _r19 = np.random.default_rng(7)
+        _img19 = 0.1 * _r19.random((220, 260))
+        _tpl19 = _r19.random((28, 32))
+        _img19[60:88, 90:122] += 3.0 * _tpl19          # plant an unambiguous peak (stable argmax)
+        _ref19 = _ncc_ref(_img19, _tpl19)
+
+        def _argmax2d(a):
+            return np.unravel_index(int(np.argmax(a)), a.shape)
+
+        ck.check(np.array_equal(accel._ncc_scipy(_img19, _tpl19), _ref19),
+                 "#P2 accel CPU (scipy) path is byte-identical to the historical _pattern_ncc")
+        with accel.force_cpu():
+            ck.check(accel.select_backend(decisive=False) == "scipy"
+                     and np.array_equal(accel.pattern_ncc(_img19, _tpl19), _ref19),
+                     "#P2 force_cpu pins the deterministic scipy path")
+        ck.check(accel.select_backend(decisive=True) == "scipy",
+                 "#P2 decisive NCC calls always resolve to CPU float64")
+
+        if accel._have_pyfftw():
+            _pf19 = accel._ncc_pyfftw(_img19, _tpl19)
+            ck.check(float(np.max(np.abs(_pf19 - _ref19))) < 1e-8
+                     and _argmax2d(_pf19) == _argmax2d(_ref19),
+                     "#P2 pyfftw NCC agrees with scipy (<1e-8) and gives the same peak")
+        else:
+            ck.check(True, "#P2 pyfftw not installed (agreement check skipped)")
+
+        if accel._cupy() is not None:
+            _cu19 = accel._ncc_cupy(_img19, _tpl19)
+            ck.check(float(np.max(np.abs(_cu19 - _ref19))) < 5e-3
+                     and _argmax2d(_cu19) == _argmax2d(_ref19),
+                     "#P2 cupy GPU NCC agrees with scipy (float32 tol) and same peak")
+        else:
+            ck.check(True, "#P2 cupy/GPU not available (agreement check skipped)")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"accel backend path raised: {e!r}")
 
     df.to_csv(OUT / "synth_measurements.csv", index=False)
     print(f"\nWrote synthetic measurements + plots to {OUT}")
