@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import accel
 from dxf_geometry import read_design
 from register import (RegistrationAmbiguityError, _dealias_origin, _overlap_score,
                       _register_by_pattern, rasterize_cell_pins, register_scan,
@@ -113,6 +114,7 @@ class Checker:
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
+    accel.set_force_cpu(True)   # the gate must be deterministic: pin the CPU float64 NCC path
     ck = Checker()
 
     # Local runs use the OneDrive fabrication DXF; CI uses the versioned equivalent.
@@ -997,6 +999,327 @@ def main():
                  "diameter model: debris-widened wide-D rows use the clean fit subset")
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"adversarial-review regression path raised: {e!r}")
+
+    # ------------------------------------------ 18. Phase-1 perf refactors are bit-exact (perf) #
+    print("\n[18] Phase-1 optimizations reproduce the reference output bit-for-bit")
+    try:
+        def _rasterize_ref(cell, xppx, yppx, shape, origin, y_up=1, x_right=1, rot_deg=0.0):
+            """The pre-optimization nested-loop rasteriser, kept here as the equivalence oracle."""
+            m = np.zeros(shape, bool); H, W = shape; oc, orow = origin
+            th = np.deg2rad(rot_deg); c, s = np.cos(th), np.sin(th)
+            for a in cell.arrays:
+                rx = 0.5 * a.diameter_um / xppx; ry = 0.5 * a.diameter_um / yppx
+                rrx, rry = int(np.ceil(rx)), int(np.ceil(ry))
+                for (x_um, y_um) in a.centers_um:
+                    xr, yr = x_right * x_um, y_up * y_um
+                    xr, yr = c * xr - s * yr, s * xr + c * yr
+                    ci = int(round(oc + xr / xppx)); ri = int(round(orow + yr / yppx))
+                    for dr in range(-rry, rry + 1):
+                        for dc in range(-rrx, rrx + 1):
+                            if (dc / rx) ** 2 + (dr / ry) ** 2 <= 1.0:
+                                yy, xx = ri + dr, ci + dc
+                                if 0 <= yy < H and 0 <= xx < W:
+                                    m[yy, xx] = True
+            return m
+
+        # Cover square + non-square pixels, rotation, exact-half origins (tie-to-even rounding),
+        # and negative origins that clip many pins off-canvas -- the edge cases where a naive
+        # vectorisation (e.g. truncating round, np.roll) would diverge from the loop.
+        _shape18 = (160, 200)
+        _cfgs18 = [(24.0, 24.0, 0.0, (30.0, 30.0)),
+                   (24.0, 20.0, 0.0, (25.0, 40.0)),
+                   (24.0, 24.0, 3.7, (30.5, 30.5)),
+                   (24.0, 24.0, -2.3, (-12.0, 18.0)),
+                   (28.0, 21.0, 4.9, (-40.5, -8.5))]
+        _rast_ok = all(
+            np.array_equal(
+                rasterize_cell_pins(template, _sx, _sy, _shape18, _org, rot_deg=_rot),
+                _rasterize_ref(template, _sx, _sy, _shape18, _org, rot_deg=_rot))
+            for (_sx, _sy, _rot, _org) in _cfgs18)
+        ck.check(_rast_ok,
+                 "#P1 rasterize_cell_pins vectorised == loop (square/non-square/rot/half/off-canvas)")
+
+        # share-rr: classification must be byte-identical whether rr is recomputed or shared.
+        from extract import _classify_floor_depth, _level_floor, _nearest_pin_um
+
+        def _eqnan(x, y):
+            return np.array_equal(np.asarray(x, float), np.asarray(y, float), equal_nan=True)
+
+        _r18 = np.random.default_rng(1)
+        _H18 = _W18 = 120
+        _yy18, _xx18 = np.mgrid[0:_H18, 0:_W18]
+        _z18 = 0.02 * _xx18 - 0.015 * _yy18 + _r18.normal(0, 0.2, (_H18, _W18))
+        _cen18 = []
+        for _cy in range(12, _H18, 24):
+            for _cx in range(12, _W18, 24):
+                _cen18.append((_cx, _cy))
+                _z18[((_xx18 - _cx) ** 2 + (_yy18 - _cy) ** 2) <= 64] = 8.0
+        _cen18 = np.array(_cen18, float); _val18 = np.ones((_H18, _W18), bool)
+        _pxu18 = _pyu18 = 1.5
+        _shared18 = _nearest_pin_um(_z18.shape, _cen18, _pxu18, _pyu18)
+        _clsA = _classify_floor_depth(_z18, _val18, _cen18, _pxu18, _pyu18, 12.0, 24.0 * _pxu18)
+        _clsB = _classify_floor_depth(_z18, _val18, _cen18, _pxu18, _pyu18, 12.0, 24.0 * _pxu18,
+                                      rr=_shared18)
+        ck.check(np.isfinite(_clsA["depth"]),
+                 "#P1 share-rr test actually exercises a successful classification (finite depth)")
+        ck.check(_eqnan(_clsA["rr"], _clsB["rr"])
+                 and np.array_equal(_clsA["pin_mask"], _clsB["pin_mask"])
+                 and np.array_equal(_clsA["floor_region"], _clsB["floor_region"])
+                 and _eqnan(_clsA["depth"], _clsB["depth"])
+                 and _eqnan(_clsA["clean_floor"], _clsB["clean_floor"])
+                 and _eqnan(_clsA["pin_top"], _clsB["pin_top"]),
+                 "#P1 _classify_floor_depth byte-identical with shared vs recomputed rr")
+
+        # Frozen oracle of the ORIGINAL inline nearest-pin formula so a FUTURE edit to
+        # _nearest_pin_um that diverges from the pre-refactor code is caught (the check above is
+        # self-referential -- both branches call the new helper).  _classify used bare
+        # centers*array; _level_floor used np.asarray(centers,float)*array -- exercise BOTH by
+        # feeding an ndarray and a plain Python list.
+        from scipy.spatial import cKDTree as _ckd
+
+        def _rr_oracle(shape, centers, pxu, pyu, wrap):
+            _H, _W = shape
+            _yo, _xo = np.mgrid[0:_H, 0:_W]
+            _cen = (np.asarray(centers, float) if wrap else centers) * np.array([pxu, pyu])
+            return _ckd(_cen).query(
+                np.column_stack([(_xo * pxu).ravel(), (_yo * pyu).ravel()]))[0].reshape(_H, _W)
+
+        _rr_nd = _nearest_pin_um(_z18.shape, _cen18, _pxu18, _pyu18)
+        _rr_li = _nearest_pin_um(_z18.shape, _cen18.tolist(), _pxu18, _pyu18)
+        ck.check(_eqnan(_rr_nd, _rr_oracle(_z18.shape, _cen18, _pxu18, _pyu18, wrap=False))
+                 and _eqnan(_rr_li, _rr_oracle(_z18.shape, _cen18.tolist(), _pxu18, _pyu18, wrap=True)),
+                 "#P1 _nearest_pin_um matches the original inline cKDTree formula (ndarray + list)")
+
+        # _level_floor's rr path shapes the leveled z0 (hence depth): byte-check it directly.
+        _rpin18 = float(min(0.5 * 12.0, 0.46 * 24.0 * _pxu18))
+        _lfA = _level_floor(_z18, _val18, _cen18, _pxu18, _pyu18, _rpin18)
+        _lfB = _level_floor(_z18, _val18, _cen18, _pxu18, _pyu18, _rpin18, rr=_shared18)
+        ck.check(_eqnan(_lfA, _lfB),
+                 "#P1 _level_floor byte-identical with shared vs recomputed rr")
+
+        # The rr= kwarg must actually be CONSUMED (not silently ignored): a deliberately wrong rr
+        # must change both classification and leveling.
+        _rr_bad = _shared18 + 1000.0
+        _clsW = _classify_floor_depth(_z18, _val18, _cen18, _pxu18, _pyu18, 12.0, 24.0 * _pxu18,
+                                      rr=_rr_bad)
+        _lfW = _level_floor(_z18, _val18, _cen18, _pxu18, _pyu18, _rpin18, rr=_rr_bad)
+        ck.check(not np.array_equal(_clsW["floor_region"], _clsA["floor_region"])
+                 and not _eqnan(_lfA, _lfW),
+                 "#P1 rr= kwarg is consumed by _classify_floor_depth and _level_floor")
+
+        # Exact-half pixel centres (tie-to-even): odd-um centres at 2 um/px land every centre on
+        # X.5, so this genuinely exercises np.rint's round-half-to-even against int(round()).
+        import types
+        _halfcell = types.SimpleNamespace(arrays=[types.SimpleNamespace(
+            diameter_um=6.0,
+            centers_um=np.array([[1.0, 1.0], [3.0, 3.0], [5.0, 1.0], [1.0, 5.0], [7.0, 7.0]],
+                                float))])
+        _cpx = _halfcell.arrays[0].centers_um[:, 0] / 2.0
+        _has_half = bool(np.any(np.abs(_cpx - np.rint(_cpx)) == 0.5))
+        _half_ok = np.array_equal(rasterize_cell_pins(_halfcell, 2.0, 2.0, (24, 24), (0.0, 0.0)),
+                                  _rasterize_ref(_halfcell, 2.0, 2.0, (24, 24), (0.0, 0.0)))
+        ck.check(_has_half and _half_ok,
+                 "#P1 rasterize matches loop on exact-half pixel centres (tie-to-even actually hit)")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"Phase-1 bit-exactness path raised: {e!r}")
+
+    # ---------------------------------------- 19. accel FFT/NCC backend equivalence (Phase 2) #
+    print("\n[19] accel backend: CPU byte-identical, decisive->CPU, GPU/pyfftw agree")
+    try:
+        def _ncc_ref(img, tpl):     # frozen copy of the historical register._pattern_ncc
+            from scipy.signal import fftconvolve
+            t = tpl.astype(np.float64); t0 = t - t.mean()
+            tnorm = float(np.sqrt((t0 * t0).sum())); ones = np.ones_like(t)
+            if tnorm < 1e-9:
+                Hi, Wi = img.shape; Ht, Wt = t.shape
+                return np.zeros((Hi + Ht - 1, Wi + Wt - 1))
+            num = fftconvolve(img, t0[::-1, ::-1], mode="full")
+            s1 = fftconvolve(img, ones[::-1, ::-1], mode="full")
+            s2 = fftconvolve(img * img, ones[::-1, ::-1], mode="full")
+            n = float(t.size)
+            denom = np.sqrt(np.maximum(s2 - s1 * s1 / n, 0.0)) * tnorm
+            with np.errstate(divide="ignore", invalid="ignore"):
+                return np.where(denom > 1e-9, num / denom, 0.0)
+
+        _r19 = np.random.default_rng(7)
+        _img19 = 0.1 * _r19.random((220, 260))
+        _tpl19 = _r19.random((28, 32))
+        _img19[60:88, 90:122] += 3.0 * _tpl19          # plant an unambiguous peak (stable argmax)
+        _ref19 = _ncc_ref(_img19, _tpl19)
+
+        def _argmax2d(a):
+            return np.unravel_index(int(np.argmax(a)), a.shape)
+
+        ck.check(np.array_equal(accel._ncc_scipy(_img19, _tpl19), _ref19),
+                 "#P2 accel CPU (scipy) path is byte-identical to the historical _pattern_ncc")
+        with accel.force_cpu():
+            ck.check(accel.select_backend(decisive=False) == "scipy"
+                     and np.array_equal(accel.pattern_ncc(_img19, _tpl19), _ref19),
+                     "#P2 force_cpu pins the deterministic scipy path")
+        ck.check(accel.select_backend(decisive=True) == "scipy",
+                 "#P2 decisive NCC calls always resolve to CPU float64")
+
+        if accel._have_pyfftw():
+            _pf19 = accel._ncc_pyfftw(_img19, _tpl19)
+            ck.check(float(np.max(np.abs(_pf19 - _ref19))) < 1e-8
+                     and _argmax2d(_pf19) == _argmax2d(_ref19),
+                     "#P2 pyfftw NCC agrees with scipy (<1e-8) and gives the same peak")
+        else:
+            ck.check(True, "#P2 pyfftw not installed (agreement check skipped)")
+
+        if accel._cupy() is not None:
+            _cu19 = accel._ncc_cupy(_img19, _tpl19)
+            ck.check(float(np.max(np.abs(_cu19 - _ref19))) < 5e-3
+                     and _argmax2d(_cu19) == _argmax2d(_ref19),
+                     "#P2 cupy GPU NCC agrees with scipy (float32 tol) and same peak")
+        else:
+            ck.check(True, "#P2 cupy/GPU not available (agreement check skipped)")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"accel backend path raised: {e!r}")
+
+    # ---------------------------------- 20. GPU opt-in cannot change register output (Phase 2b) #
+    print("\n[20] opting into the GPU backend does not change register output (skipped w/o a GPU)")
+    try:
+        if accel._cupy() is None:
+            ck.check(True, "#P2b GPU not available -- GPU-insulation check skipped")
+        else:
+            _lt20 = read_design(
+                _resolve_dxf("072026_UVPFLM_D100D50.dxf", "registration")).cells[0]
+            _rs20, _rt20 = synth_scan(_lt20, x_um_per_px=2.0, y_um_per_px=2.0,
+                                      origin_px=(140.0, 140.0), rotation_deg=3.0,
+                                      depth_um=30.0, seed=2020)
+
+            def _reg20(gpu):                         # gpu=True: opt into the GPU backend for this run
+                _prevf = accel._FORCE_CPU
+                _preve = os.environ.get("PFLM_ACCEL")
+                accel.set_force_cpu(not gpu)
+                if gpu:
+                    os.environ["PFLM_ACCEL"] = "cupy"
+                try:
+                    return register_scan(_rs20, _lt20, n_cells=1)[0]
+                finally:
+                    accel.set_force_cpu(_prevf)
+                    if _preve is None:
+                        os.environ.pop("PFLM_ACCEL", None)
+                    else:
+                        os.environ["PFLM_ACCEL"] = _preve
+
+            _pc = _reg20(False)                      # deterministic CPU float64
+            _pg = _reg20(True)                       # GPU opted in -- must be byte-identical because
+            #                                          every register NCC is decisive -> CPU float64
+            ck.check(_pc.x_right == _pg.x_right and _pc.y_up == _pg.y_up
+                     and _pc.method == _pg.method
+                     and _pc.origin_col == _pg.origin_col and _pc.origin_row == _pg.origin_row
+                     and _pc.rotation_deg == _pg.rotation_deg,
+                     "#P2b register output byte-identical with GPU opted in (decisive NCCs insulate "
+                     "registration from float32 GPU)")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"GPU-insulation path raised: {e!r}")
+
+    # ------------------------------------------- 21. CPU parallelism == serial (Phase 2c) #
+    print("\n[21] parallel per-array extraction is identical to serial (Phase 2c)")
+    try:
+        import parallel
+        import run_sample
+
+        _pe21 = os.environ.pop("PFLM_JOBS", None)             # default-on: all cores when unset
+        try:
+            _defon21 = parallel.resolve_jobs(None) == (os.cpu_count() or 1)
+        finally:
+            if _pe21 is not None:
+                os.environ["PFLM_JOBS"] = _pe21
+        ck.check(_defon21 and parallel.resolve_jobs("1") == 1 and parallel.resolve_jobs("3") == 3
+                 and parallel.resolve_jobs(0) >= 1 and parallel.resolve_jobs("bad") == 1,
+                 "#P2c resolve_jobs: default-on (all cores), explicit honored, junk -> serial")
+
+        def _res_eq(r1, r2):
+            d1, d2 = r1.__dict__, r2.__dict__
+            if d1.keys() != d2.keys():
+                return False
+            for k in d1:
+                v1, v2 = d1[k], d2[k]
+                try:
+                    if np.array_equal(np.asarray(v1, float), np.asarray(v2, float), equal_nan=True):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                if v1 != v2:
+                    return False
+            return True
+
+        # Use the 2-array L cell (not the 1-array base template) so jobs=2 truly SPAWNS workers
+        # (pmap_shared short-circuits to serial when there is <=1 item).
+        _lt21 = read_design(
+            _resolve_dxf("072026_UVPFLM_D100D50.dxf", "registration")).cells[0]
+        _rs21, _rt21 = synth_scan(_lt21, x_um_per_px=2.0, y_um_per_px=2.0,
+                                  origin_px=(140.0, 140.0), rotation_deg=0.0, depth_um=30.0, seed=77)
+        _pl21 = register_scan(_rs21, _lt21, n_cells=1)[0]
+        _bt21 = ra._band_targets(_lt21)
+        _work21 = []
+        for a in _lt21.arrays:
+            _s21 = ArraySample(
+                filename=f"p2c_b{a.band}c{a.col}_D{a.diameter_um:g}", vk4_stem="p2c", cell_id=1,
+                array_id=a.array_id, band=a.band, col=a.col, passes=20, speed=400.0,
+                nominal_diameter_um=a.diameter_um, target_diameter_um=_bt21[a.band],
+                nominal_pitch_um=a.pitch_um, nominal_pitch_x_um=a.pitch_x_um,
+                nominal_pitch_y_um=a.pitch_y_um, nx=a.nx, ny=a.ny, cx_um=a.cx_um, cy_um=a.cy_um)
+            _work21.append((_pl21, a, _s21, None, False))    # (pl, array, sample, qc_path, make_qc)
+
+        _serial21 = parallel.pmap_shared(run_sample._extract_worker, _work21, _rs21, jobs=1)
+        _par21 = parallel.pmap_shared(run_sample._extract_worker, _work21, _rs21, jobs=2)
+        ck.check(len(_serial21) == len(_par21) == len(_work21) and len(_work21) >= 2,
+                 f"#P2c pmap_shared spawns for >1 item, one result each ({len(_par21)} arrays)")
+        ck.check(all(_res_eq(_a, _b) for _a, _b in zip(_serial21, _par21)),
+                 "#P2c parallel (jobs=2) per-array extraction is field-identical to serial (jobs=1)")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"CPU parallelism path raised: {e!r}")
+
+    # ------------------------------- 22. geom-edge-margin on a wide grid (Phase 3, #2) #
+    print("\n[22] geom-edge-margin resolves a wide grid the old area threshold would reject")
+    try:
+        from types import SimpleNamespace
+        from register import _register_uniform_lattice, _edge_margin_threshold
+        from synth import _stamp_disk
+
+        # Unit-lock the min-rule: O(N) edge term fixes large grids; min with the old area rule keeps
+        # the bar never stricter than before (no recall regression on narrow arrays); floor at 5.
+        _th = _edge_margin_threshold
+        ck.check(_th(3630, 30) == 15.0 and 0.01 * 3630 > 30,
+                 "#P3 large one-edge: geom margin (15) accepts what the old area rule (~36) rejected")
+        ck.check(_th(324, 18) == 5.0,
+                 "#P3 narrow array: min(area,geom) holds at the floor 5 (no recall loss vs old)")
+        ck.check(_th(0, 0) == 5.0 and _th(10000, 200) == 100.0,
+                 "#P3 edge-margin threshold: floor 5; large both-edge grid uses the O(N) edge term")
+
+        # A 150-col x 30-row uniform grid, rendered so the NEAR u-edge (col 0) + its floor are in
+        # frame but the far u-edge is cropped out (only 121 columns visible); both v-edges are in
+        # frame.  The u-axis then has ONE captured termination (~NY=30 discriminating nodes) over a
+        # wide interior (matched ~ 121*30 = 3630).  The retired threshold min_raw = 0.01*matched
+        # (~36) exceeds that one-edge evidence, so the OLD code would have marked u ambiguous; the
+        # geom-edge-margin (>= 0.5 * the geometrically expected edge nodes) accepts it.
+        _P, _Dpx, _NX, _NY, _cols = 6.0, 3.0, 150, 30, 121
+        _mL = _mT = 12
+        _Wv = _mL + (_cols - 1) * int(_P) + 3            # frame ends just past the last visible column
+        _Hv = _mT + (_NY - 1) * int(_P) + _mT
+        _z0v = np.zeros((_Hv, _Wv), float)
+        _valv = np.ones((_Hv, _Wv), bool)
+        for _j in range(_cols):
+            for _i in range(_NY):
+                _stamp_disk(_z0v, _mL + _j * _P, _mT + _i * _P, 0.5 * _Dpx, 5.0, "set")
+        _scanv = SimpleNamespace(x_um_per_px=1.0, y_um_per_px=1.0)
+        _tmplv = SimpleNamespace(arrays=[SimpleNamespace(
+            pitch_x_um=_P, pitch_y_um=_P, nx=_NX, ny=_NY, diameter_um=_Dpx)])
+        _plv = _register_uniform_lattice(_scanv, _tmplv, _z0v, _valv,
+                                         x_right_options=(1,), y_up_options=(1,),
+                                         angles_deg=(0.0,), allow_phase_only=True)[0]
+        ck.check(_plv.method == "uniform-edge" and _plv.absolute_origin
+                 and not _plv.ambiguous_axes
+                 and abs(_plv.origin_col - _mL) <= 3.0 and abs(_plv.origin_row - _mT) <= 3.0,
+                 f"#P3 wide one-edge grid resolves BOTH absolute indices "
+                 f"(method={_plv.method}, absolute={_plv.absolute_origin}, "
+                 f"ambiguous='{_plv.ambiguous_axes}')")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"geom-edge-margin path raised: {e!r}")
 
     df.to_csv(OUT / "synth_measurements.csv", index=False)
     print(f"\nWrote synthetic measurements + plots to {OUT}")
