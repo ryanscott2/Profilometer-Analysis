@@ -130,8 +130,15 @@ def _estimate_step(tiles, ys, xs, tile_hw, ds=4):
     xpairs = [(y, x) for y in ys for x in xs[:-1] if (y, x) in tiles and (y, x + 1) in tiles]
     ypairs = [(y, x) for y in ys[:-1] for x in xs if (y, x) in tiles and (y + 1, x) in tiles]
     edge = 0                                             # pairs whose best shift pinned at the 50% edge
+    _featds = {}                                         # cache the downsampled feature per tile key
+    def _fds(key):                                       # each interior tile is in up to 4 pairs; the
+        f = _featds.get(key)                             # full-res percentile normalisation in _feat is
+        if f is None:                                    # pure, so caching is bit-exact and just avoids
+            f = _feat(tiles[key])[::ds, ::ds]            # recomputing the same array 2-4x
+            _featds[key] = f
+        return f
     for (y, x) in xpairs:
-        A = _feat(tiles[(y, x)])[::ds, ::ds]; B = _feat(tiles[(y, x + 1)])[::ds, ::ds]
+        A = _fds((y, x)); B = _fds((y, x + 1))
         W = A.shape[1]; lo = int(0.5 * W)
         d, p, ncc = _best_shift(A, B, range(lo, int(0.98 * W)), "x")
         if ncc > 0.3:
@@ -140,7 +147,7 @@ def _estimate_step(tiles, ys, xs, tile_hw, ds=4):
             else:                                        # peak pinned at the 50%-overlap search limit
                 edge += 1
     for (y, x) in ypairs:
-        A = _feat(tiles[(y, x)])[::ds, ::ds]; B = _feat(tiles[(y + 1, x)])[::ds, ::ds]
+        A = _fds((y, x)); B = _fds((y + 1, x))
         H = A.shape[0]; lo = int(0.5 * H)
         d, p, ncc = _best_shift(A, B, range(lo, int(0.98 * H)), "y")
         if ncc > 0.3:

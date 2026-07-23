@@ -235,17 +235,30 @@ def rasterize_cell_pins(cell, x_um_per_px, y_um_per_px, shape, origin,
         rx = 0.5 * a.diameter_um / x_um_per_px      # per-axis pin radius (ellipse if px non-square)
         ry = 0.5 * a.diameter_um / y_um_per_px
         rrx, rry = int(np.ceil(rx)), int(np.ceil(ry))
-        for (x_um, y_um) in a.centers_um:
-            xr, yr = x_right * x_um, y_up * y_um             # reflect + rotate in um, then scale
-            xr, yr = c * xr - s * yr, s * xr + c * yr        # (matches CellPlacement.dxf_to_px)
-            ci = int(round(oc + xr / x_um_per_px))
-            ri = int(round(orow + yr / y_um_per_px))
-            for dr in range(-rry, rry + 1):
-                for dc in range(-rrx, rrx + 1):
-                    if (dc / rx) ** 2 + (dr / ry) ** 2 <= 1.0:
-                        yy, xx = ri + dr, ci + dc
-                        if 0 <= yy < H and 0 <= xx < W:
-                            mask[yy, xx] = True
+        centers = np.asarray(a.centers_um, float)
+        if centers.size == 0:
+            continue
+        # Vectorised equivalent of the former per-pin/per-pixel double loop, byte-identical to it on
+        # every tested geometry (see selftest [18]): reflect + rotate in um then scale, np.rint ==
+        # Python round() (both round-half-to-even), the same ellipse test on the same integer offset
+        # grid, the same in-bounds guard, and the same idempotent OR into the mask.  (Do NOT swap
+        # np.rint for (x+0.5).astype(int): that truncates toward zero and would mis-round negative /
+        # exact-half centres.)
+        xr = x_right * centers[:, 0]                          # reflect
+        yr = y_up * centers[:, 1]
+        xr, yr = c * xr - s * yr, s * xr + c * yr             # rotate (matches CellPlacement.dxf_to_px)
+        ci = np.rint(oc + xr / x_um_per_px).astype(np.intp)   # pin-centre pixel (col, row)
+        ri = np.rint(orow + yr / y_um_per_px).astype(np.intp)
+        dcc, drr = np.arange(-rrx, rrx + 1), np.arange(-rry, rry + 1)
+        DC, DR = np.meshgrid(dcc, drr)                        # disk stencil (identical for every pin)
+        keep = (DC / rx) ** 2 + (DR / ry) ** 2 <= 1.0
+        drel, crel = DR[keep], DC[keep]
+        if drel.size == 0:
+            continue
+        yy = ri[:, None] + drel[None, :]                     # (n_pins, n_stencil) stamped pixels
+        xx = ci[:, None] + crel[None, :]
+        inb = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)
+        mask[yy[inb], xx[inb]] = True
     return mask
 
 

@@ -998,6 +998,129 @@ def main():
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"adversarial-review regression path raised: {e!r}")
 
+    # ------------------------------------------ 18. Phase-1 perf refactors are bit-exact (perf) #
+    print("\n[18] Phase-1 optimizations reproduce the reference output bit-for-bit")
+    try:
+        def _rasterize_ref(cell, xppx, yppx, shape, origin, y_up=1, x_right=1, rot_deg=0.0):
+            """The pre-optimization nested-loop rasteriser, kept here as the equivalence oracle."""
+            m = np.zeros(shape, bool); H, W = shape; oc, orow = origin
+            th = np.deg2rad(rot_deg); c, s = np.cos(th), np.sin(th)
+            for a in cell.arrays:
+                rx = 0.5 * a.diameter_um / xppx; ry = 0.5 * a.diameter_um / yppx
+                rrx, rry = int(np.ceil(rx)), int(np.ceil(ry))
+                for (x_um, y_um) in a.centers_um:
+                    xr, yr = x_right * x_um, y_up * y_um
+                    xr, yr = c * xr - s * yr, s * xr + c * yr
+                    ci = int(round(oc + xr / xppx)); ri = int(round(orow + yr / yppx))
+                    for dr in range(-rry, rry + 1):
+                        for dc in range(-rrx, rrx + 1):
+                            if (dc / rx) ** 2 + (dr / ry) ** 2 <= 1.0:
+                                yy, xx = ri + dr, ci + dc
+                                if 0 <= yy < H and 0 <= xx < W:
+                                    m[yy, xx] = True
+            return m
+
+        # Cover square + non-square pixels, rotation, exact-half origins (tie-to-even rounding),
+        # and negative origins that clip many pins off-canvas -- the edge cases where a naive
+        # vectorisation (e.g. truncating round, np.roll) would diverge from the loop.
+        _shape18 = (160, 200)
+        _cfgs18 = [(24.0, 24.0, 0.0, (30.0, 30.0)),
+                   (24.0, 20.0, 0.0, (25.0, 40.0)),
+                   (24.0, 24.0, 3.7, (30.5, 30.5)),
+                   (24.0, 24.0, -2.3, (-12.0, 18.0)),
+                   (28.0, 21.0, 4.9, (-40.5, -8.5))]
+        _rast_ok = all(
+            np.array_equal(
+                rasterize_cell_pins(template, _sx, _sy, _shape18, _org, rot_deg=_rot),
+                _rasterize_ref(template, _sx, _sy, _shape18, _org, rot_deg=_rot))
+            for (_sx, _sy, _rot, _org) in _cfgs18)
+        ck.check(_rast_ok,
+                 "#P1 rasterize_cell_pins vectorised == loop (square/non-square/rot/half/off-canvas)")
+
+        # share-rr: classification must be byte-identical whether rr is recomputed or shared.
+        from extract import _classify_floor_depth, _level_floor, _nearest_pin_um
+
+        def _eqnan(x, y):
+            return np.array_equal(np.asarray(x, float), np.asarray(y, float), equal_nan=True)
+
+        _r18 = np.random.default_rng(1)
+        _H18 = _W18 = 120
+        _yy18, _xx18 = np.mgrid[0:_H18, 0:_W18]
+        _z18 = 0.02 * _xx18 - 0.015 * _yy18 + _r18.normal(0, 0.2, (_H18, _W18))
+        _cen18 = []
+        for _cy in range(12, _H18, 24):
+            for _cx in range(12, _W18, 24):
+                _cen18.append((_cx, _cy))
+                _z18[((_xx18 - _cx) ** 2 + (_yy18 - _cy) ** 2) <= 64] = 8.0
+        _cen18 = np.array(_cen18, float); _val18 = np.ones((_H18, _W18), bool)
+        _pxu18 = _pyu18 = 1.5
+        _shared18 = _nearest_pin_um(_z18.shape, _cen18, _pxu18, _pyu18)
+        _clsA = _classify_floor_depth(_z18, _val18, _cen18, _pxu18, _pyu18, 12.0, 24.0 * _pxu18)
+        _clsB = _classify_floor_depth(_z18, _val18, _cen18, _pxu18, _pyu18, 12.0, 24.0 * _pxu18,
+                                      rr=_shared18)
+        ck.check(np.isfinite(_clsA["depth"]),
+                 "#P1 share-rr test actually exercises a successful classification (finite depth)")
+        ck.check(_eqnan(_clsA["rr"], _clsB["rr"])
+                 and np.array_equal(_clsA["pin_mask"], _clsB["pin_mask"])
+                 and np.array_equal(_clsA["floor_region"], _clsB["floor_region"])
+                 and _eqnan(_clsA["depth"], _clsB["depth"])
+                 and _eqnan(_clsA["clean_floor"], _clsB["clean_floor"])
+                 and _eqnan(_clsA["pin_top"], _clsB["pin_top"]),
+                 "#P1 _classify_floor_depth byte-identical with shared vs recomputed rr")
+
+        # Frozen oracle of the ORIGINAL inline nearest-pin formula so a FUTURE edit to
+        # _nearest_pin_um that diverges from the pre-refactor code is caught (the check above is
+        # self-referential -- both branches call the new helper).  _classify used bare
+        # centers*array; _level_floor used np.asarray(centers,float)*array -- exercise BOTH by
+        # feeding an ndarray and a plain Python list.
+        from scipy.spatial import cKDTree as _ckd
+
+        def _rr_oracle(shape, centers, pxu, pyu, wrap):
+            _H, _W = shape
+            _yo, _xo = np.mgrid[0:_H, 0:_W]
+            _cen = (np.asarray(centers, float) if wrap else centers) * np.array([pxu, pyu])
+            return _ckd(_cen).query(
+                np.column_stack([(_xo * pxu).ravel(), (_yo * pyu).ravel()]))[0].reshape(_H, _W)
+
+        _rr_nd = _nearest_pin_um(_z18.shape, _cen18, _pxu18, _pyu18)
+        _rr_li = _nearest_pin_um(_z18.shape, _cen18.tolist(), _pxu18, _pyu18)
+        ck.check(_eqnan(_rr_nd, _rr_oracle(_z18.shape, _cen18, _pxu18, _pyu18, wrap=False))
+                 and _eqnan(_rr_li, _rr_oracle(_z18.shape, _cen18.tolist(), _pxu18, _pyu18, wrap=True)),
+                 "#P1 _nearest_pin_um matches the original inline cKDTree formula (ndarray + list)")
+
+        # _level_floor's rr path shapes the leveled z0 (hence depth): byte-check it directly.
+        _rpin18 = float(min(0.5 * 12.0, 0.46 * 24.0 * _pxu18))
+        _lfA = _level_floor(_z18, _val18, _cen18, _pxu18, _pyu18, _rpin18)
+        _lfB = _level_floor(_z18, _val18, _cen18, _pxu18, _pyu18, _rpin18, rr=_shared18)
+        ck.check(_eqnan(_lfA, _lfB),
+                 "#P1 _level_floor byte-identical with shared vs recomputed rr")
+
+        # The rr= kwarg must actually be CONSUMED (not silently ignored): a deliberately wrong rr
+        # must change both classification and leveling.
+        _rr_bad = _shared18 + 1000.0
+        _clsW = _classify_floor_depth(_z18, _val18, _cen18, _pxu18, _pyu18, 12.0, 24.0 * _pxu18,
+                                      rr=_rr_bad)
+        _lfW = _level_floor(_z18, _val18, _cen18, _pxu18, _pyu18, _rpin18, rr=_rr_bad)
+        ck.check(not np.array_equal(_clsW["floor_region"], _clsA["floor_region"])
+                 and not _eqnan(_lfA, _lfW),
+                 "#P1 rr= kwarg is consumed by _classify_floor_depth and _level_floor")
+
+        # Exact-half pixel centres (tie-to-even): odd-um centres at 2 um/px land every centre on
+        # X.5, so this genuinely exercises np.rint's round-half-to-even against int(round()).
+        import types
+        _halfcell = types.SimpleNamespace(arrays=[types.SimpleNamespace(
+            diameter_um=6.0,
+            centers_um=np.array([[1.0, 1.0], [3.0, 3.0], [5.0, 1.0], [1.0, 5.0], [7.0, 7.0]],
+                                float))])
+        _cpx = _halfcell.arrays[0].centers_um[:, 0] / 2.0
+        _has_half = bool(np.any(np.abs(_cpx - np.rint(_cpx)) == 0.5))
+        _half_ok = np.array_equal(rasterize_cell_pins(_halfcell, 2.0, 2.0, (24, 24), (0.0, 0.0)),
+                                  _rasterize_ref(_halfcell, 2.0, 2.0, (24, 24), (0.0, 0.0)))
+        ck.check(_has_half and _half_ok,
+                 "#P1 rasterize matches loop on exact-half pixel centres (tie-to-even actually hit)")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"Phase-1 bit-exactness path raised: {e!r}")
+
     df.to_csv(OUT / "synth_measurements.csv", index=False)
     print(f"\nWrote synthetic measurements + plots to {OUT}")
     print(f"\n{'='*60}\n{ck.n - len(ck.fails)}/{ck.n} checks passed")
