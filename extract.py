@@ -21,6 +21,7 @@ One :class:`PinFinResult` is produced per array per unit cell.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -162,11 +163,13 @@ def _nearest_pin_um(shape, centers_local, pxu, pyu):
     H, W = shape
     yy, xx = np.mgrid[0:H, 0:W]
     tree = cKDTree(np.asarray(centers_local, float) * np.array([pxu, pyu]))
-    # workers=-1 threads the per-pixel nearest-neighbour query across cores; scipy partitions the
-    # QUERY POINTS (not the reduction), so every returned distance is bit-identical to workers=1
-    # (asserted by selftest [18]'s byte-identity oracle).
+    # Thread the per-pixel query across cores; scipy partitions the QUERY POINTS (not the reduction),
+    # so every returned distance is bit-identical to workers=1 (asserted by selftest [18]). Inside a
+    # parallel.pmap_shared worker (PFLM_WORKER set), use a single thread instead so N worker
+    # processes x N cores do not oversubscribe -- the process fan-out already provides parallelism.
+    _kw = 1 if os.environ.get("PFLM_WORKER") else -1
     return tree.query(np.column_stack([(xx * pxu).ravel(), (yy * pyu).ravel()]),
-                      workers=-1)[0].reshape(H, W)
+                      workers=_kw)[0].reshape(H, W)
 
 
 def _level_floor(z, valid, centers_local=None, pxu=None, pyu=None, r_pin_um=None, rr=None):

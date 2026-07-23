@@ -1216,6 +1216,64 @@ def main():
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"GPU-insulation path raised: {e!r}")
 
+    # ------------------------------------------- 21. CPU parallelism == serial (Phase 2c) #
+    print("\n[21] parallel per-array extraction is identical to serial (Phase 2c)")
+    try:
+        import parallel
+        import run_sample
+
+        _pe21 = os.environ.pop("PFLM_JOBS", None)             # default-on: all cores when unset
+        try:
+            _defon21 = parallel.resolve_jobs(None) == (os.cpu_count() or 1)
+        finally:
+            if _pe21 is not None:
+                os.environ["PFLM_JOBS"] = _pe21
+        ck.check(_defon21 and parallel.resolve_jobs("1") == 1 and parallel.resolve_jobs("3") == 3
+                 and parallel.resolve_jobs(0) >= 1 and parallel.resolve_jobs("bad") == 1,
+                 "#P2c resolve_jobs: default-on (all cores), explicit honored, junk -> serial")
+
+        def _res_eq(r1, r2):
+            d1, d2 = r1.__dict__, r2.__dict__
+            if d1.keys() != d2.keys():
+                return False
+            for k in d1:
+                v1, v2 = d1[k], d2[k]
+                try:
+                    if np.array_equal(np.asarray(v1, float), np.asarray(v2, float), equal_nan=True):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                if v1 != v2:
+                    return False
+            return True
+
+        # Use the 2-array L cell (not the 1-array base template) so jobs=2 truly SPAWNS workers
+        # (pmap_shared short-circuits to serial when there is <=1 item).
+        _lt21 = read_design(
+            _resolve_dxf("072026_UVPFLM_D100D50.dxf", "registration")).cells[0]
+        _rs21, _rt21 = synth_scan(_lt21, x_um_per_px=2.0, y_um_per_px=2.0,
+                                  origin_px=(140.0, 140.0), rotation_deg=0.0, depth_um=30.0, seed=77)
+        _pl21 = register_scan(_rs21, _lt21, n_cells=1)[0]
+        _bt21 = ra._band_targets(_lt21)
+        _work21 = []
+        for a in _lt21.arrays:
+            _s21 = ArraySample(
+                filename=f"p2c_b{a.band}c{a.col}_D{a.diameter_um:g}", vk4_stem="p2c", cell_id=1,
+                array_id=a.array_id, band=a.band, col=a.col, passes=20, speed=400.0,
+                nominal_diameter_um=a.diameter_um, target_diameter_um=_bt21[a.band],
+                nominal_pitch_um=a.pitch_um, nominal_pitch_x_um=a.pitch_x_um,
+                nominal_pitch_y_um=a.pitch_y_um, nx=a.nx, ny=a.ny, cx_um=a.cx_um, cy_um=a.cy_um)
+            _work21.append((_pl21, a, _s21, None, False))    # (pl, array, sample, qc_path, make_qc)
+
+        _serial21 = parallel.pmap_shared(run_sample._extract_worker, _work21, _rs21, jobs=1)
+        _par21 = parallel.pmap_shared(run_sample._extract_worker, _work21, _rs21, jobs=2)
+        ck.check(len(_serial21) == len(_par21) == len(_work21) and len(_work21) >= 2,
+                 f"#P2c pmap_shared spawns for >1 item, one result each ({len(_par21)} arrays)")
+        ck.check(all(_res_eq(_a, _b) for _a, _b in zip(_serial21, _par21)),
+                 "#P2c parallel (jobs=2) per-array extraction is field-identical to serial (jobs=1)")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"CPU parallelism path raised: {e!r}")
+
     df.to_csv(OUT / "synth_measurements.csv", index=False)
     print(f"\nWrote synthetic measurements + plots to {OUT}")
     print(f"\n{'='*60}\n{ck.n - len(ck.fails)}/{ck.n} checks passed")
