@@ -1401,8 +1401,9 @@ def analyze_multi_snapshot(snapshots, out_dir, dxf_path, *, passes=0, speed=floa
     write_3d_pin_maps(out_dir / "figures",
                       [(t["label"], t["scan"], t["placement"], _plabel) for t in tiles], template)
 
-    # Average the snapshots (replicate views of one uniform cell) -> averaged cell report, radial
-    # overlays, and diameter model. (measurements.csv keeps the per-snapshot rows above.)
+    # Average the snapshots (replicate views of one uniform cell) -> averaged cell report + radial
+    # overlays. (No diameter_model: a single-geometry, single-dose snapshot has one point, which
+    # cannot fit the process model Ø ~ drawn+passes+speed. measurements.csv keeps the per-tile rows.)
     by_array = {}
     for _sm, _res, _rel in results:
         by_array.setdefault(_sm.array_id, []).append(_res)
@@ -1414,13 +1415,6 @@ def analyze_multi_snapshot(snapshots, out_dir, dxf_path, *, passes=0, speed=floa
     render_snapshot_cell_report(tiles, template, avg_by_array, _dose_label,
                                 cells_dir / "cell_averaged.png")
     make_snapshot_radial_overlays(template, avg_by_array, out_dir, dose_label=_dose_tag)
-    avg_rows = []
-    for _r in avg_by_array.values():
-        _rel = passes > 0 and not any(k in _r.flags for k in ra.CRITICAL_FLAGS)
-        _row = ra.result_to_row(_r, _rel); _row["snapshot"] = "averaged"
-        avg_rows.append(_row)
-    if avg_rows:
-        ra.make_diameter_model(pd.DataFrame(avg_rows), out_dir / "figures")
 
     n_dose = df[["passes", "speed"]].drop_duplicates().shape[0]
     if n_dose < 2:
