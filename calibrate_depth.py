@@ -22,8 +22,8 @@ Usage:
     python calibrate_depth.py --results Results --out Results/_depth_calibration --exclude bad_run
     python calibrate_depth.py --cell-filters cells.json        # keep/drop cell_ids per sample
 
-Deliverables (under --out):  depth_calibration.txt, depth_vs_dose.png, depth_parity.png,
-depth_heatmap.png.
+Deliverables (under --out):  depth_calibration.txt, depth_vs_passes_speed_3d.png, depth_vs_dose.png,
+depth_parity.png, depth_heatmap.png.
 """
 from __future__ import annotations
 
@@ -724,7 +724,7 @@ def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude
                  array_row_count=len(gated), allow_legacy_qc=allow_legacy_qc)
     # The report is the primary deliverable; isolate each figure so one bad panel can't abort the
     # whole run (and the already-written report + other figures survive).
-    for fn in (fig_depth_3d, fig_parity, fig_heatmap):
+    for fn in (fig_depth_3d, fig_depth_vs_dose, fig_parity, fig_heatmap):
         try:
             fn(out_dir, per_band, targets)
         except Exception as e:                           # pragma: no cover - defensive
@@ -906,31 +906,33 @@ def _grid(n):
     return nrows, ncols
 
 
+def _band_sweeps_both(R):
+    """True when the band's pooled units vary BOTH passes and speed (so a passes×speed surface is
+    defined -> 3-D view); False when only one factor was swept (a 2-D depth-vs-dose view is honest).
+    Drives the split between depth_vs_passes_speed_3d.png and depth_vs_dose.png."""
+    g = R["g"]
+    P = g["passes"].to_numpy(float); S = g["speed"].to_numpy(float)
+    return bool(np.isfinite(P).any() and np.isfinite(S).any()
+                and np.nanmin(P) < np.nanmax(P) and np.nanmin(S) < np.nanmax(S))
+
+
 def fig_depth_3d(out_dir, per_band, targets):
     """Per-band 3-D etch depth = f(passes, speed): measured points + the recommended-model surface
     + a target-depth plane. Passes and speed are on separate axes because depth does not collapse to
-    dose = passes/speed. Bands that swept only one of passes/speed fall back to a depth-vs-dose view."""
+    dose = passes/speed. ONLY bands that swept both passes and speed appear here; bands with a single
+    factor swept are drawn by :func:`fig_depth_vs_dose` (depth_vs_dose.png)."""
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the '3d' projection)
-    bands = list(per_band)
+    bands = [b for b in per_band if _band_sweeps_both(per_band[b])]
+    if not bands:
+        print("No band swept both passes and speed -> skipping 3-D depth figure "
+              "(their dose response is in depth_vs_dose.png).")
+        return
     nrows, ncols = _grid(len(bands))
     colors = _sample_colors(per_band)
     fig = plt.figure(figsize=(6.8 * ncols, 5.4 * nrows))
     for idx, b in enumerate(bands):
         R = per_band[b]; g = R["g"]; rk = R["rec_key"]
         P = g["passes"].to_numpy(float); S = g["speed"].to_numpy(float)
-        both = (P.min() < P.max()) and (S.min() < S.max())
-        if not both:                                         # only one factor swept -> 2-D dose view
-            ax = fig.add_subplot(nrows, ncols, idx + 1)
-            for s, gs in g.groupby("sample"):
-                ax.plot(gs["dose_ratio"], gs["depth_um"], "o", ms=6, mec="white", color=colors[s],
-                        ls="none", label=str(s))
-            for t in targets:
-                ax.axhline(t, color="crimson", ls="--", lw=1)
-            ax.set_xlabel("dose = passes / speed"); ax.set_ylabel("depth (µm)")
-            ax.set_title(R["label"] + "  (single factor swept)", fontsize=9); ax.grid(alpha=0.3)
-            if idx == 0:
-                ax.legend(fontsize=7)
-            continue
         ax = fig.add_subplot(nrows, ncols, idx + 1, projection="3d")
         if rk in ("saturating", "log-dose", "interaction"):  # recommended-model surface
             pg = np.linspace(P.min(), P.max(), 24); sg = np.linspace(S.min(), S.max(), 24)
@@ -950,10 +952,41 @@ def fig_depth_3d(out_dir, per_band, targets):
         ax.set_title(R["label"], fontsize=9); ax.view_init(elev=22, azim=-60)
         if idx == 0:
             ax.legend(fontsize=7, loc="upper left")
-    fig.suptitle("Etch depth = f(passes, speed) per band  (surface = recommended model, "
-                 "red plane = target)", y=1.0)
+    fig.suptitle("Etch depth = f(passes, speed) per band", y=1.0)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     p = out_dir / "depth_vs_passes_speed_3d.png"
+    fig.savefig(p, dpi=170, bbox_inches="tight"); plt.close(fig)
+    print(f"Wrote {p}")
+
+
+def fig_depth_vs_dose(out_dir, per_band, targets):
+    """Depth vs dose = passes/speed for the bands that swept only ONE of passes/speed (so a
+    passes×speed surface is undefined and they cannot go in the 3-D figure). One panel per such band,
+    points coloured by sample, with the target depth(s) marked. Written to its own depth_vs_dose.png."""
+    bands = [b for b in per_band if not _band_sweeps_both(per_band[b])]
+    if not bands:
+        print("Every band swept both passes and speed -> no separate depth-vs-dose figure needed.")
+        return
+    nrows, ncols = _grid(len(bands))
+    colors = _sample_colors(per_band)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.4 * ncols, 4.8 * nrows), squeeze=False)
+    for idx, b in enumerate(bands):
+        ax = axes[idx // ncols][idx % ncols]
+        R = per_band[b]; g = R["g"]
+        for s, gs in g.groupby("sample"):
+            ax.plot(gs["dose_ratio"], gs["depth_um"], "o", ms=6, mec="white", color=colors[s],
+                    ls="none", label=str(s))
+        for t in targets:
+            ax.axhline(t, color="crimson", ls="--", lw=1)
+        ax.set_xlabel("dose = passes / speed"); ax.set_ylabel("depth (µm)")
+        ax.set_title(R["label"], fontsize=9); ax.grid(alpha=0.3)
+        if idx == 0:
+            ax.legend(fontsize=7)
+    for idx in range(len(bands), nrows * ncols):             # blank any unused grid cell
+        axes[idx // ncols][idx % ncols].axis("off")
+    fig.suptitle("Etch depth vs dose", y=1.0)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    p = out_dir / "depth_vs_dose.png"
     fig.savefig(p, dpi=170, bbox_inches="tight"); plt.close(fig)
     print(f"Wrote {p}")
 
