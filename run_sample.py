@@ -46,6 +46,17 @@ from register import RegistrationAmbiguityError, register_sample
 from extract import ArraySample, extract_array
 from laser_params import load_cell_params, CELL_CSV_NAME
 import report as ra          # shared measurement-row builder + legacy plot suite
+import parallel              # optional CPU process fan-out for the per-array extraction loop
+
+
+def _extract_worker(scan, item):
+    """Top-level (picklable) unit of work for :func:`parallel.pmap_shared`: measure one array.
+
+    Pure w.r.t. the shared read-only ``scan`` and its own picklable ``item``; returns one
+    PinFinResult.  Kept module-level so process workers can import it under Windows 'spawn'.
+    """
+    pl, a, sample, qc_path, make_qc = item
+    return extract_array(scan, pl, a, sample, make_qc=make_qc, qc_path=qc_path)
 
 HERE = Path(__file__).parent
 DEF_DXF_DIR = HERE / "DXF"
@@ -235,7 +246,7 @@ def _band_targets(template):
     return out
 
 
-def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
+def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False, jobs=None):
     # Build the new run beside the last good result. Nothing below writes to the final
     # destination until every required artifact has been produced successfully.
     stage_dir, final_out_dir = _prepare_output_transaction(
@@ -290,14 +301,18 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
     save_provenance(out_dir / "figures", vk4_dir, dxf_path, cell_csv)   # cell_params/radial + manifest
 
     rows, results = [], []
-    res_by_cell = {}
+    res_by_cell = {pl.cell_id: {} for pl in placements}
+    # Build the flat list of independent (cell x array) extraction jobs, then run them -- serially by
+    # default (byte-identical reference) or across processes when jobs>1 / PFLM_JOBS is set. Every
+    # extract_array call is pure w.r.t. the shared read-only scan, so parallelism only reorders
+    # execution; results come back in submission order, so the CSV / bookkeeping is unchanged.
+    work, book = [], []                          # work: extract inputs; book: bookkeeping (in order)
     for pl in placements:
         pr = params.get((pl.cell_row, pl.cell_col))
         passes = pr.passes if pr else 0
         speed = pr.speed if pr else float("nan")
         label = pr.label if pr else ""
         reliable_cell = pl.score >= 0.5
-        res_by_cell[pl.cell_id] = {}
         for a in template.arrays:
             sample = ArraySample(
                 filename=f"r{pl.cell_row}c{pl.cell_col}_b{a.band}c{a.col}_D{a.diameter_um:g}",
@@ -307,16 +322,20 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False):
                 nominal_pitch_um=a.pitch_um, nominal_pitch_x_um=a.pitch_x_um,
                 nominal_pitch_y_um=a.pitch_y_um, nx=a.nx, ny=a.ny,
                 cx_um=a.cx_um, cy_um=a.cy_um, cell_label=label)
-            res = extract_array(scan, pl, a, sample, make_qc=make_qc,
-                                qc_path=qc_dir / (sample.filename + ".png"))
-            reliable = (reliable_cell and passes > 0
-                        and not any(k in res.flags for k in ra.CRITICAL_FLAGS))
-            row = ra.result_to_row(res, reliable)
-            row["cell_row"], row["cell_col"] = pl.cell_row, pl.cell_col
-            row["reg_score"], row["cell_label"] = pl.score, label
-            rows.append(row)
-            results.append((sample, res, reliable))
-            res_by_cell[pl.cell_id][a.array_id] = res
+            work.append((pl, a, sample, qc_dir / (sample.filename + ".png"), make_qc))
+            book.append((pl, a, sample, passes, label, reliable_cell))
+
+    extracted = parallel.pmap_shared(_extract_worker, work, scan, jobs=jobs)
+
+    for (pl, a, sample, passes, label, reliable_cell), res in zip(book, extracted):
+        reliable = (reliable_cell and passes > 0
+                    and not any(k in res.flags for k in ra.CRITICAL_FLAGS))
+        row = ra.result_to_row(res, reliable)
+        row["cell_row"], row["cell_col"] = pl.cell_row, pl.cell_col
+        row["reg_score"], row["cell_label"] = pl.score, label
+        rows.append(row)
+        results.append((sample, res, reliable))
+        res_by_cell[pl.cell_id][a.array_id] = res
 
     df = pd.DataFrame(rows).sort_values(["cell_row", "cell_col", "band", "col"])
     out_dir.mkdir(parents=True, exist_ok=True)

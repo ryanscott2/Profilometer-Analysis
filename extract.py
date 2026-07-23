@@ -21,6 +21,7 @@ One :class:`PinFinResult` is produced per array per unit cell.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -151,22 +152,42 @@ class PinFinResult:
 
 
 # ================================ core maths (ported from v1 extract.py) ==== #
-def _level_floor(z, valid, centers_local=None, pxu=None, pyu=None, r_pin_um=None):
+def _nearest_pin_um(shape, centers_local, pxu, pyu):
+    """Distance (um) from every pixel to the nearest registered pin centre.
+
+    Shared by :func:`_level_floor` and :func:`_classify_floor_depth` so the identical full-pixel
+    cKDTree query runs once per array instead of twice.  It depends only on geometry (centres, pixel
+    pitch), never on the height values, so both call sites receive byte-identical ``rr``.
+    """
+    from scipy.spatial import cKDTree
+    H, W = shape
+    yy, xx = np.mgrid[0:H, 0:W]
+    tree = cKDTree(np.asarray(centers_local, float) * np.array([pxu, pyu]))
+    # Thread the per-pixel query across cores; scipy partitions the QUERY POINTS (not the reduction),
+    # so every returned distance is bit-identical to workers=1 (asserted by selftest [18]). Inside a
+    # parallel.pmap_shared worker (PFLM_WORKER set), use a single thread instead so N worker
+    # processes x N cores do not oversubscribe -- the process fan-out already provides parallelism.
+    _kw = 1 if os.environ.get("PFLM_WORKER") else -1
+    return tree.query(np.column_stack([(xx * pxu).ravel(), (yy * pyu).ravel()]),
+                      workers=_kw)[0].reshape(H, W)
+
+
+def _level_floor(z, valid, centers_local=None, pxu=None, pyu=None, r_pin_um=None, rr=None):
     """Fit and subtract a tilt plane so the trench floor sits near 0.
 
     Prefer fitting to the KNOWN clean floor -- pixels far from every registered pin centre -- which is
     unbiased by pin sidewalls. On a dense (>60% pin) array the old 'lowest 40% of heights' fit set
     necessarily includes sidewall pixels; with any real stage tilt that biases the fitted SLOPE, which
     inflates the reported floor flatness and under-counts debris (and can flip floor_reliable). Fall
-    back to the 40th-percentile set when the geometry isn't supplied or the floor region is too small."""
+    back to the 40th-percentile set when the geometry isn't supplied or the floor region is too small.
+
+    ``rr`` (distance-to-nearest-pin in um) may be supplied to reuse the shared query; when None it is
+    computed here exactly as :func:`_classify_floor_depth` does, so behaviour is unchanged."""
     zz = np.where(valid, z, np.nan)
     fp = None
     if centers_local is not None and len(centers_local) and pxu and pyu and r_pin_um:
-        H, W = z.shape
-        yy, xx = np.mgrid[0:H, 0:W]
-        from scipy.spatial import cKDTree                 # same distance-to-nearest-pin as _classify
-        tree = cKDTree(np.asarray(centers_local, float) * np.array([pxu, pyu]))
-        rr = tree.query(np.column_stack([(xx * pxu).ravel(), (yy * pyu).ravel()]))[0].reshape(H, W)
+        if rr is None:                                   # same distance-to-nearest-pin as _classify
+            rr = _nearest_pin_um(z.shape, centers_local, pxu, pyu)
         floor = valid & (rr >= r_pin_um + max(2.0 * max(pxu, pyu), 0.05 * r_pin_um))
         if floor.sum() >= 50:
             fp = floor
@@ -326,7 +347,7 @@ def _diameters_from_profile(rc, prof, floor, depth):
     return d_base, d_mid, d_top, base_extrapolated
 
 
-def _classify_floor_depth(z0, valid, centers_local, pxu, pyu, d_nom_um, pitch_um):
+def _classify_floor_depth(z0, valid, centers_local, pxu, pyu, d_nom_um, pitch_um, rr=None):
     """Classify pins vs clean floor vs debris from the KNOWN pin centres, and measure depth
     from the low, flat (debris-free) trench floor.
 
@@ -338,13 +359,8 @@ def _classify_floor_depth(z0, valid, centers_local, pxu, pyu, d_nom_um, pitch_um
     """
     H, W = z0.shape
     r_pin_um = float(min(0.5 * d_nom_um, 0.46 * pitch_um))
-    yy, xx = np.mgrid[0:H, 0:W]
-    px_um = (xx * pxu).ravel()
-    py_um = (yy * pyu).ravel()
-    from scipy.spatial import cKDTree
-    centers_um = centers_local * np.array([pxu, pyu])          # (N,2) col*pxu, row*pyu
-    tree = cKDTree(centers_um)
-    rr = tree.query(np.column_stack([px_um, py_um]))[0].reshape(H, W)   # um to nearest pin
+    if rr is None:                                             # um to nearest registered pin
+        rr = _nearest_pin_um(z0.shape, centers_local, pxu, pyu)
 
     pin_core = (rr <= 0.55 * r_pin_um) & valid
     pin_mask = (rr <= r_pin_um) & valid
@@ -455,7 +471,11 @@ def extract_array(scan, placement, array, sample, *,
     # debris / spuriously mark the floor reliable). r_pin follows _classify_floor_depth's convention.
     _kpx, _kpy = lattice["px_px"], lattice["py_px"]
     _r_pin = float(min(0.5 * d_nom, 0.46 * 0.5 * (_kpx * pxu + _kpy * pyu)))
-    z0 = _level_floor(z, valid, lattice["centers_local"], pxu, pyu, _r_pin)
+    # Distance-to-nearest-pin depends only on geometry, so compute it ONCE and share it between
+    # floor-leveling and classification (the identical full-pixel query previously ran twice).
+    _rr = (_nearest_pin_um(z.shape, lattice["centers_local"], pxu, pyu)
+           if len(lattice["centers_local"]) else None)
+    z0 = _level_floor(z, valid, lattice["centers_local"], pxu, pyu, _r_pin, rr=_rr)
 
     # --- known lattice (primary) vs measured autocorrelation (QC) ---
     known_px, known_py = lattice["px_px"], lattice["py_px"]
@@ -484,7 +504,7 @@ def extract_array(scan, placement, array, sample, *,
     # take the floor and pin-top HEIGHTS from those classified pixel populations (robust to
     # debris; the folded profile is not used to define the heights). ---
     cls = _classify_floor_depth(z0, valid, lattice["centers_local"], pxu, pyu,
-                                d_nom, pitch_um)
+                                d_nom, pitch_um, rr=_rr)
     depth, floor, top = cls["depth"], cls["clean_floor"], cls["pin_top"]
     floor_flatness, debris_fraction = cls["flatness"], cls["debris_frac"]
     floor_reliable = cls.get("floor_reliable", True)

@@ -32,6 +32,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+import accel                       # optional GPU/CPU FFT-NCC backend (see accel.py)
+
 
 # --------------------------------------------------------------------------- #
 class RegistrationAmbiguityError(RuntimeError):
@@ -235,17 +237,30 @@ def rasterize_cell_pins(cell, x_um_per_px, y_um_per_px, shape, origin,
         rx = 0.5 * a.diameter_um / x_um_per_px      # per-axis pin radius (ellipse if px non-square)
         ry = 0.5 * a.diameter_um / y_um_per_px
         rrx, rry = int(np.ceil(rx)), int(np.ceil(ry))
-        for (x_um, y_um) in a.centers_um:
-            xr, yr = x_right * x_um, y_up * y_um             # reflect + rotate in um, then scale
-            xr, yr = c * xr - s * yr, s * xr + c * yr        # (matches CellPlacement.dxf_to_px)
-            ci = int(round(oc + xr / x_um_per_px))
-            ri = int(round(orow + yr / y_um_per_px))
-            for dr in range(-rry, rry + 1):
-                for dc in range(-rrx, rrx + 1):
-                    if (dc / rx) ** 2 + (dr / ry) ** 2 <= 1.0:
-                        yy, xx = ri + dr, ci + dc
-                        if 0 <= yy < H and 0 <= xx < W:
-                            mask[yy, xx] = True
+        centers = np.asarray(a.centers_um, float)
+        if centers.size == 0:
+            continue
+        # Vectorised equivalent of the former per-pin/per-pixel double loop, byte-identical to it on
+        # every tested geometry (see selftest [18]): reflect + rotate in um then scale, np.rint ==
+        # Python round() (both round-half-to-even), the same ellipse test on the same integer offset
+        # grid, the same in-bounds guard, and the same idempotent OR into the mask.  (Do NOT swap
+        # np.rint for (x+0.5).astype(int): that truncates toward zero and would mis-round negative /
+        # exact-half centres.)
+        xr = x_right * centers[:, 0]                          # reflect
+        yr = y_up * centers[:, 1]
+        xr, yr = c * xr - s * yr, s * xr + c * yr             # rotate (matches CellPlacement.dxf_to_px)
+        ci = np.rint(oc + xr / x_um_per_px).astype(np.intp)   # pin-centre pixel (col, row)
+        ri = np.rint(orow + yr / y_um_per_px).astype(np.intp)
+        dcc, drr = np.arange(-rrx, rrx + 1), np.arange(-rry, rry + 1)
+        DC, DR = np.meshgrid(dcc, drr)                        # disk stencil (identical for every pin)
+        keep = (DC / rx) ** 2 + (DR / ry) ** 2 <= 1.0
+        drel, crel = DR[keep], DC[keep]
+        if drel.size == 0:
+            continue
+        yy = ri[:, None] + drel[None, :]                     # (n_pins, n_stencil) stamped pixels
+        xx = ci[:, None] + crel[None, :]
+        inb = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)
+        mask[yy[inb], xx[inb]] = True
     return mask
 
 
@@ -848,6 +863,20 @@ def _block_bootstrap_margin(present, testable, best_pred, alt_pred, *, seed=2026
     return float(np.percentile(margins, 1.0))
 
 
+def _edge_margin_threshold(matched, expected):
+    """Minimum one-pitch-alias node-loss margin required to accept a finite index on one axis.
+
+    ``matched`` is the interior match count (~O(N^2) area) and ``expected`` the geometric edge
+    evidence for that axis (~O(N); the testable nodes where the best hypothesis and its nearest alias
+    disagree).  The gate is the SMALLER of the retired area rule (0.01*matched) and half the edge
+    evidence (0.5*expected), floored at 5: the edge term caps the requirement at O(N) so large grids
+    stay identifiable, while the min with the area term keeps the bar never stricter than before (no
+    recall loss on narrow arrays).  ``raw >= 0.5*expected`` forces a 3:1 edge supermajority, and the
+    independent block-bootstrap gate remains an AND-condition in the caller.
+    """
+    return max(5.0, min(0.01 * float(matched), 0.5 * float(expected)))
+
+
 def _register_uniform_lattice(scan, template, z0, valid, *, x_right_options=(-1, 1),
                               y_up_options=(1, -1), angles_deg=None,
                               allow_phase_only=False):
@@ -928,23 +957,29 @@ def _register_uniform_lattice(scan, template, z0, valid, *, x_right_options=(-1,
     for axis, pos in (("x", 2), ("y", 3)):
         alt = next((cnd for cnd in candidates if cnd[pos] != best[pos]), None)
         if alt is None:
-            evidence[axis] = (float("inf"), float("inf"), None)
+            evidence[axis] = (float("inf"), float("inf"), 0.0, None)
             continue
         alt_pred = _uniform_prediction(qu, qv, testable, alt[2], alt[3], a.nx, a.ny)
         raw_margin = float(alt[0] - best[0])
+        # Geometric maximum edge evidence for this axis: the testable lattice nodes where the best
+        # hypothesis and its nearest one-pitch alias DISAGREE (best predicts a pin where the alias
+        # predicts floor at the near termination, and vice-versa at the far one).  A perfectly clean
+        # grid makes every one of these nodes vote for `best`, so this count equals the raw_margin
+        # such a grid would produce -- and it scales with the physical edge length (~c*N), NOT the
+        # interior area (~N^2).
+        expected = float(np.count_nonzero(best_pred ^ alt_pred))
         boot_margin = _block_bootstrap_margin(
             present, testable, best_pred, alt_pred,
             seed=20260722 + (0 if axis == "x" else 1))
-        evidence[axis] = (raw_margin, boot_margin, alt)
+        evidence[axis] = (raw_margin, boot_margin, expected, alt)
 
-    # A one-pitch alias of a large N x N array differs along O(N) edge nodes while the interior
-    # contains O(N^2) matches, so a fraction-of-all-pins threshold would perversely get stricter as
-    # the array grows.  One percent plus the block-bootstrap guard retains ample independent edge
-    # support for the 100x100 fabrication grid without rejecting its mathematically expected ~2N
-    # margin after rotated-frame clipping.
-    min_raw = max(5, int(np.ceil(0.01 * matched)))
-    ambiguous = [axis for axis, (raw, boot, _alt) in evidence.items()
-                 if raw < min_raw or boot <= 0.0]
+    # geom-edge-margin (Phase 3): an axis is ambiguous unless the observed alias margin clears
+    # _edge_margin_threshold(matched, expected) AND the block-bootstrap lower bound (boot>0) holds.
+    # The threshold caps the requirement at O(N) edge evidence (fixing large grids the retired
+    # O(N^2) area rule wrongly rejected) while never being stricter than that old rule.  See
+    # selftest sections 15 and 22.
+    ambiguous = [axis for axis, (raw, boot, exp, _alt) in evidence.items()
+                 if raw < _edge_margin_threshold(matched, exp) or boot <= 0.0]
     if ambiguous:
         detail = ", ".join(
             f"{axis}: next alias +{evidence[axis][0]:g} node loss, "
@@ -1013,29 +1048,20 @@ def _marker_feature(z0, valid, pitch_px):
     return np.clip((prom - lo) / (hi - lo + 1e-9), 0.0, 1.0)
 
 
-def _pattern_ncc(img, tpl):
+def _pattern_ncc(img, tpl, decisive=False):
     """Normalized cross-correlation of ``img`` with ``tpl``, FULL mode, in [-1, 1].
 
     Plain correlation is biased toward dense regions of the (fairly full) local pin mask, which
     pulls coarse peaks onto spurious high-fill spots. NCC divides by the local image energy under
     the template, so a peak reflects PATTERN agreement, not local density -- essential for
     accurately localising every cell. 'full' mode keeps the lag->origin mapping unambiguous: a
-    peak at (k,l) means the template's top-left sits at img (k-Ht+1, l-Wt+1)."""
-    from scipy.signal import fftconvolve
-    t = tpl.astype(np.float64)
-    t0 = t - t.mean()
-    tnorm = float(np.sqrt((t0 * t0).sum()))
-    ones = np.ones_like(t)
-    if tnorm < 1e-9:
-        Hi, Wi = img.shape; Ht, Wt = t.shape
-        return np.zeros((Hi + Ht - 1, Wi + Wt - 1))
-    num = fftconvolve(img, t0[::-1, ::-1], mode="full")            # sum (img * zero-mean tpl)
-    s1 = fftconvolve(img, ones[::-1, ::-1], mode="full")           # local sum of img
-    s2 = fftconvolve(img * img, ones[::-1, ::-1], mode="full")     # local sum of img^2
-    n = float(t.size)
-    denom = np.sqrt(np.maximum(s2 - s1 * s1 / n, 0.0)) * tnorm
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return np.where(denom > 1e-9, num / denom, 0.0)
+    peak at (k,l) means the template's top-left sits at img (k-Ht+1, l-Wt+1).
+
+    Delegates to :func:`accel.pattern_ncc`; the CPU/scipy path is byte-identical to the historical
+    implementation.  Pass ``decisive=True`` when the peak VALUE (not just its position) selects a
+    reflection/rotation, so that comparison always runs on deterministic CPU float64 rather than a
+    float32 GPU result."""
+    return accel.pattern_ncc(img, tpl, decisive=decisive)
 
 
 def _dealias_origin(pin_mask, template, origin, xppx, yppx, y_up, x_right, rot_deg, margin=0.02):
@@ -1138,7 +1164,7 @@ def _register_by_pattern(scan, template, z0, valid, *, cell_pitch_um=None,
                 T, t0c, t0r, Ht, Wt = _cell_pin_pattern(template, xppx, yppx, xr, yu, ang, ds)
                 if T.sum() < 5:
                     continue
-                corr = _pattern_ncc(img, T)
+                corr = _pattern_ncc(img, T, decisive=True)   # peak value selects reflection+angle
                 pv = float(corr.max())
                 if best is None or pv > best[0]:
                     best = (pv, xr, yu, ang, corr, t0c, t0r, Ht, Wt)
@@ -1153,7 +1179,7 @@ def _register_by_pattern(scan, template, z0, valid, *, cell_pitch_um=None,
                 template, xppx, yppx, best_xr, best_yu, float(ang2), ds)
             if T.sum() < 5:
                 continue
-            corr2 = _pattern_ncc(img, T)
+            corr2 = _pattern_ncc(img, T, decisive=True)      # peak value selects the fine angle
             pv2 = float(corr2.max())
             if pv2 > best[0]:
                 best = (pv2, best_xr, best_yu, float(ang2), corr2,
@@ -1270,7 +1296,7 @@ def _solid_square_ncc_markers(feat, marker_px, min_sep, max_n=40, thresh=0.30):
     T[marg:marg + sq, marg:marg + sq] = 1.0
     Ht, Wt = T.shape
     t0 = marg + sq / 2.0
-    corr = np.abs(_pattern_ncc(feat, T))
+    corr = np.abs(_pattern_ncc(feat, T, decisive=True))   # peak value feeds count/reflection/accept
     sep = max(2, int(round(min_sep)))
     out = []
     for _ in range(max_n):
@@ -1296,7 +1322,7 @@ def _detect_marker_origins(feat, cell, xppx, yppx, x_right, y_up, rot, min_sep,
     Ht, Wt = T.shape
     if T.sum() < 3:
         return []
-    corr = np.abs(_pattern_ncc(feat, T))
+    corr = np.abs(_pattern_ncc(feat, T, decisive=True))   # peak value feeds count/reflection/accept
     sep = max(2, int(round(min_sep)))
     out = []
     for _ in range(max_n):
@@ -1337,7 +1363,7 @@ def _detect_marker_origins_rotated(features, cell, xppx, yppx, x_right, y_up,
             return -1.0
         score = -1.0
         for f in coarse_features:
-            corr = np.abs(_pattern_ncc(f, T))
+            corr = np.abs(_pattern_ncc(f, T, decisive=True))  # peak value scores this angle
             if corr.size:
                 score = max(score, float(np.max(corr)))
         return score
