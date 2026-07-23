@@ -130,6 +130,30 @@ row/column leaves a hole, not a shift); a `cell_params` entry with no registered
 a possible edge-dropout that could shift the parameter mapping. (`register_scan` remains the
 low-level single-cell primitive used by `selftest.py`.)
 
+The markerless finite-edge acceptance margin scales with the geometrically expected termination
+evidence (~O(N), `register._edge_margin_threshold`), not the interior match area (~O(N²)), so a large
+uniform grid stays identifiable when a real edge is captured while a no-edge crop still fails closed.
+
+**Deferred registration hardening — pick up when real VK4 scans are in.** Two refinements are
+intentionally deferred until fabrication scans exist, so they can be validated and tuned against
+genuine imperfections rather than synthetic assumptions:
+
+- **Honest per-axis "no-edge" vs "weak-edge" reporting** (`_register_uniform_lattice`). An unresolved
+  axis is currently reported the same whether *no* termination edge was in frame (inherently
+  unresolvable → `uniform-phase` is the correct answer) or an edge *was* captured but its evidence was
+  too weak. Splitting the two would make the refusal message and the `ambiguous_axes` metadata state
+  *why* each axis is unresolved. Needs real partial scans to confirm the "edge present" test is not
+  fooled by interior noise.
+- **Tile-seam phase-drift detect-and-refuse** (`_fit_uniform_lattice` + `assemble` stitching). A
+  consistent sub-pitch tile-seam offset on a stitched mosaic can bias the fitted lattice phase and
+  quietly shift predicted node positions. The plan is to *detect* seam-correlated phase residual and
+  **refuse** (fail-closed) — never silently "correct" the phase (that would violate the "cleanest real
+  results" / fail-closed policy). Sizing the threshold requires real stitched VK4s.
+
+(A third idea, restricting the finite-index candidate enumeration to the observed span, was measured
+to prune only ~6–9% of candidates on these wide grids — and the enumeration is not the bottleneck —
+so it was dropped as not worth the added complexity.)
+
 ## Outputs (`Results/<dataset name>/`)
 
 The UI writes each run under `Results/<sample name>/` — named after the sample selected in the UI
