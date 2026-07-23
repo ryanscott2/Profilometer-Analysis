@@ -190,12 +190,12 @@ def _write_results_sentinel(path, final_dir, state):
     (Path(path) / RESULTS_SENTINEL).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def _resilient_rmtree(path, *, attempts=10, delay=0.3):
-    """``shutil.rmtree`` with retries. On Windows a cloud-sync client (OneDrive) or an antivirus
-    scanner can briefly hold a handle on a just-renamed directory, so ``rmtree`` transiently raises
-    ``PermissionError``/``OSError`` even though the caller owns the tree. Retry a few times, then
-    give up. Returns True on success (or if already gone), False if it never succeeded -- the caller
-    decides whether that is fatal."""
+def _resilient_rmtree(path, *, attempts=30, delay=0.5):
+    """``shutil.rmtree`` with retries (~15 s). On Windows a cloud-sync client (OneDrive), the Search
+    indexer, or an antivirus scanner can briefly hold a handle on a just-renamed directory, so
+    ``rmtree`` transiently raises ``PermissionError``/``OSError`` even though the caller owns the
+    tree. Retry until the handle is released, then give up. Returns True on success (or if already
+    gone), False if it never succeeded -- the caller decides whether that is fatal."""
     import time
     path = Path(path)
     for i in range(attempts):
@@ -211,11 +211,32 @@ def _resilient_rmtree(path, *, attempts=10, delay=0.3):
     return False
 
 
+# The transaction's previous-result backup is kept OUTSIDE the Results tree (which is OneDrive-
+# synced) so a cloud-sync client cannot lock it and block cleanup -- that lock was what left
+# ``.previous`` dirs stranded. Documents is on the same drive, so the swap stays a fast, atomic
+# same-volume rename; ``_relocate`` falls back to a (non-atomic) copy only if the backup root ever
+# lands on a different volume.
+BACKUP_ROOT = Path.home() / "Documents" / ".pflm-backups"
+
+
+def _backup_dir(final_dir):
+    return BACKUP_ROOT / f"{Path(final_dir).name}.previous"
+
+
+def _relocate(src, dst):
+    """Move directory ``src`` -> ``dst`` (atomic same-volume rename; copy fallback cross-volume)."""
+    try:
+        os.replace(src, dst)
+    except OSError:
+        shutil.move(str(src), str(dst))
+
+
 def _prepare_output_transaction(out_dir, protect=(), results_root=DEF_OUT_DIR):
     """Create an owned hidden staging sibling while leaving the last good result untouched."""
     final_dir = _validate_output_target(out_dir, protect=protect, results_root=results_root)
     final_dir.parent.mkdir(parents=True, exist_ok=True)
-    backup = final_dir.parent / f".{final_dir.name}.previous"
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    backup = _backup_dir(final_dir)
     if backup.exists():
         if final_dir.exists():
             if not (_sentinel_valid(backup, final_dir, ("complete",))
@@ -226,7 +247,7 @@ def _prepare_output_transaction(out_dir, protect=(), results_root=DEF_OUT_DIR):
                     f"could not remove the stale recovery directory {backup} (a cloud-sync client "
                     f"or another process is holding it); close anything using it and re-run.")
         else:
-            os.replace(backup, final_dir)
+            _relocate(backup, final_dir)
             print(f"Recovered previous completed output after an interrupted swap -> {final_dir}")
     for stale in final_dir.parent.glob(f".{final_dir.name}.staging-*"):
         if (stale.is_dir()
@@ -249,16 +270,17 @@ def _commit_output_transaction(stage, final_dir):
     if missing:
         raise RuntimeError(f"staged analysis is incomplete; missing required outputs: {missing}")
     _write_results_sentinel(stage, final_dir, "complete")
-    backup = final_dir.parent / f".{final_dir.name}.previous"
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    backup = _backup_dir(final_dir)
     if backup.exists():
         raise RuntimeError(f"recovery directory unexpectedly exists: {backup}")
     if final_dir.exists():
-        os.replace(final_dir, backup)
+        _relocate(final_dir, backup)                     # move the old result OUT to Documents
     try:
-        os.replace(stage, final_dir)
+        os.replace(stage, final_dir)                     # atomic same-dir swap-in of the new result
     except BaseException:
         if backup.exists() and not final_dir.exists():
-            os.replace(backup, final_dir)
+            _relocate(backup, final_dir)
         raise
     # The swap is done and the result is valid; removing the old backup is non-critical cleanup.
     # If a cloud-sync client is momentarily holding it, warn and leave it -- the next run's
@@ -403,7 +425,7 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False, jobs=
     print(f"Wrote {len(placements)} per-cell reports -> {cells_dir}")
 
     # Clean outputs live in figures/ (intensity_map, sample_heightmap, param_depth_scatter,
-    # radial_overlays/, cells/, diameter_calibration.txt). Legacy outputs (v1 figure set,
+    # radial_overlays/, cells/, diameter_model). Legacy outputs (v1 figure set,
     # measurements.csv, qc/) are regenerated under legacy/ ahead of the planned refactor.
     save_sample_overview(scan, template, placements, out_dir / "figures" / "intensity_map.png")
     save_sample_heightmap(scan, out_dir / "figures" / "sample_heightmap.png")
@@ -419,7 +441,6 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False, jobs=
     make_param_depth_scatter(df, out_dir)    # same, with every array scattered around the median
     make_radial_overlays(template, placements, params, res_by_cell, out_dir,
                          sets_csv=Path(cell_csv).parent / RADIAL_CSV_NAME)
-    ra.print_diameter_calibration(df, out_dir / "figures")
     ra.make_diameter_model(df, out_dir / "figures")     # process-conditional model (drawn,P,S) + R²/CI
     ra.make_plots(df, results, out_dir / "legacy")
     _commit_output_transaction(out_dir, final_out_dir)
@@ -1090,13 +1111,14 @@ def save_3d_pin_map(scan, placement, template, array, path, *, res_um=2.0, block
     ax = fig.add_subplot(111, projection="3d")
     surf = ax.plot_surface(xx, yy, zf, cmap="viridis", vmin=0, vmax=vmax,
                            rcount=160, ccount=160, linewidth=0, antialiased=True)
-    ax.set_xlabel("x (µm)"); ax.set_ylabel("y (µm)"); ax.set_zlabel("height above floor (µm)")
+    ax.set_xlabel("x (µm)"); ax.set_ylabel("y (µm)")
+    ax.set_zlabel("")                                     # height shown on the colorbar (no overlap)
     ax.set_title(f"3D height — D{array.diameter_um:g} P{array.pitch_um:g}", fontsize=12)
     ax.view_init(elev=28, azim=-55)
-    ax.zaxis.set_major_locator(plt.MaxNLocator(5))        # avoid z-ticks crowding the colorbar
+    ax.zaxis.set_major_locator(plt.MaxNLocator(5))
     dz = max(1e-6, float(np.nanmax(zf) - np.nanmin(zf)))
     ax.set_box_aspect((x1 - x0, y1 - y0, dz))             # TRUE physical aspect (1 µm == 1 µm on z)
-    fig.colorbar(surf, ax=ax, shrink=0.5, pad=0.08)       # height also on the z-axis; no dup label
+    fig.colorbar(surf, ax=ax, shrink=0.5, pad=0.16, label="height above floor (µm)")
     if param_label:                                       # laser-parameter info box, bottom-left
         ax.text2D(0.02, 0.02, param_label, transform=ax.transAxes, fontsize=11, va="bottom",
                   ha="left", bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="0.5", alpha=0.9))
@@ -1123,6 +1145,134 @@ def write_3d_pin_maps(figures_dir, items, template, *, res_um=2.0):
                 n += 1
     print(f"Wrote {n} 3D centre-5×5 height maps -> {root}")
     return n
+
+
+# ------------------------------------- averaging over snapshots (replicates) #
+def _average_results(res_list, dose_label="averaged"):
+    """Average same-array PinFinResults from the disjoint snapshots (replicate views of one uniform
+    cell) into a single result: scalar metrics -> nanmean, the mean-pin radial profile -> per-bin
+    nanmean on the shared radius axis, flags unioned. Marked ``averaged`` / phase-only so no absolute
+    position is implied. Returns None if the list is empty."""
+    from extract import PinFinResult
+    rs = [r for r in res_list if r is not None]
+    if not rs:
+        return None
+    base = rs[0]
+    avg_fields = ("pitch_um pitch_x_um pitch_y_um diameter_um base_diameter_um top_diameter_um "
+                  "depth_um floor_um top_um lattice_strength coverage n_cells meas_pitch_um "
+                  "meas_pitch_x_um meas_pitch_y_um floor_flatness_um debris_fraction pin_sat_frac "
+                  "reg_score cx_um cy_um").split()
+
+    def _m(attr):
+        v = np.array([getattr(r, attr) for r in rs], float)
+        return float(np.nanmean(v)) if np.isfinite(v).any() else float("nan")
+
+    flags = sorted({f for r in rs for f in (r.flags.split(";") if r.flags else []) if f})
+    avg = PinFinResult(
+        filename=f"averaged_b{base.band}c{base.col}_D{base.nominal_diameter_um:g}",
+        vk4_stem=dose_label, cell_id=0, array_id=base.array_id, band=base.band, col=base.col,
+        passes=base.passes, speed=base.speed,
+        nominal_diameter_um=base.nominal_diameter_um, target_diameter_um=base.target_diameter_um,
+        nominal_pitch_um=base.nominal_pitch_um,
+        reg_method="averaged", absolute_origin=False, ambiguous_axes="xy",
+        base_extrapolated=any(getattr(r, "base_extrapolated", False) for r in rs),
+        flags=";".join(flags))
+    for a in avg_fields:
+        setattr(avg, a, _m(a))
+    profs = [(np.asarray(r.rc, float), np.asarray(r.prof, float)) for r in rs
+             if getattr(r, "rc", None) is not None and getattr(r, "prof", None) is not None]
+    if profs:
+        rc0 = profs[0][0]
+        stack = [p for (rc, p) in profs if p.shape == rc0.shape]
+        if stack:
+            avg.rc = rc0
+            avg.prof = np.nanmean(np.vstack(stack), axis=0)
+    return avg
+
+
+def render_snapshot_cell_report(tiles, template, avg_by_array, dose_label, path, *, res_um=2.0):
+    """Averaged cell report for a snapshot dataset: the snapshots tiled (height over intensity) on
+    the left, and a per-array table AVERAGED over the snapshots on the right."""
+    m = build_snapshot_montage(tiles, template, res_um=res_um)
+    if m is None:
+        return
+    canvas, icanvas, boxes = m["canvas"], m["intensity"], m["boxes"]
+    fig = plt.figure(figsize=(19, 10))
+    gs = GridSpec(2, 2, width_ratios=[1.5, 1.0], figure=fig)
+    axh = fig.add_subplot(gs[0, 0]); axi = fig.add_subplot(gs[1, 0])
+    imh = axh.imshow(canvas, origin="lower", cmap="viridis", vmin=0, vmax=m["vmax"], aspect="equal")
+    axh.set_xticks([]); axh.set_yticks([]); axh.set_title("Height above floor — snapshots tiled")
+    _annotate_snapshot_panels(axh, boxes, canvas.shape[0])
+    plt.colorbar(imh, ax=axh, shrink=0.8, label="height above local floor (µm)")
+    if icanvas is not None and m["ivmax"] is not None:
+        imi = axi.imshow(icanvas, origin="lower", cmap="gray",
+                         vmin=m["ivmin"], vmax=m["ivmax"], aspect="equal")
+        _annotate_snapshot_panels(axi, boxes, icanvas.shape[0])
+        plt.colorbar(imi, ax=axi, shrink=0.8, label="intensity")
+    axi.set_xticks([]); axi.set_yticks([]); axi.set_title("Intensity — snapshots tiled")
+
+    axr = fig.add_subplot(gs[:, 1]); axr.axis("off")
+    names = ", ".join(t["label"] for t in tiles)
+    axr.text(0.0, 1.0, f"Averaged cell — {len(tiles)} snapshots ({names})   —   {dose_label}",
+             transform=axr.transAxes, va="top", fontsize=13, weight="bold")
+
+    def _f(v):
+        return f"{v:.1f}" if np.isfinite(v) else "—"
+
+    rows_t = []
+    for a in sorted(template.arrays, key=lambda a: (a.band, a.col)):
+        r = avg_by_array.get(a.array_id)
+        if r is None:
+            continue
+        rows_t.append([f"D{a.diameter_um:g} P{a.pitch_um:g}", _f(r.depth_um), _f(r.top_diameter_um),
+                       _f(r.diameter_um), _f(r.base_diameter_um),
+                       f"{r.meas_pitch_um:.0f}/{a.pitch_um:g}", f"{100 * r.debris_fraction:.0f}"])
+    col_labels = ["array (D drawn / P)", "depth µm", "Ø top", "Ø nom", "Ø floor",
+                  "pitch m/e", "debris%"]
+    if rows_t:
+        _th = min(0.82, 0.09 * (len(rows_t) + 1))
+        tbl = axr.table(cellText=rows_t, colLabels=col_labels, cellLoc="center",
+                        bbox=[0.0, 0.80 - _th, 1.0, _th])
+        tbl.auto_set_font_size(False); tbl.set_fontsize(8)
+        for c in range(len(col_labels)):
+            tbl[0, c].set_facecolor("#dddddd"); tbl[0, c].set_text_props(weight="bold")
+    axr.text(0.0, 0.86, "Values are the mean over the snapshots (replicate views of one uniform "
+             "cell); Ø top/nom are the reliable measures.",
+             transform=axr.transAxes, va="top", fontsize=8, style="italic", color="0.3")
+    fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150); plt.close(fig)
+    print(f"Wrote {path}")
+
+
+def make_snapshot_radial_overlays(template, avg_by_array, out_dir, dose_label=""):
+    """One radial-profile figure per array geometry, showing the mean-pin profile AVERAGED over the
+    snapshots (into figures/radial_overlays/, matching the tiled workflow's naming)."""
+    root = Path(out_dir) / "figures" / "radial_overlays"; root.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for a in sorted(template.arrays, key=lambda a: a.array_id):
+        res = avg_by_array.get(a.array_id)
+        if res is None or getattr(res, "rc", None) is None or getattr(res, "prof", None) is None:
+            continue
+        rc = np.asarray(res.rc, float); prof = np.asarray(res.prof, float)
+        if not np.isfinite(prof).any():
+            continue
+        floor = res.floor_um if np.isfinite(res.floor_um) else np.nanmin(prof)
+        z = prof - floor
+        depth = res.depth_um if np.isfinite(res.depth_um) else np.nanmax(z)
+        fig, ax = plt.subplots(figsize=(9, 6))
+        ax.plot(rc, z, "-", lw=1.9, label=f"{dose_label}   (depth {depth:.0f} µm, mean of snapshots)")
+        ax.axhline(0, color="grey", lw=0.8)
+        ax.axvline(a.diameter_um / 2, color="green", ls=":", lw=1.2,
+                   label=f"drawn radius {a.diameter_um/2:g} µm")
+        ax.set_xlabel("radius from pin centre (µm)")
+        ax.set_ylabel("mean height above clean floor (µm)")
+        ax.set_title(f"Radial pin profile — Ø {a.diameter_um:g} µm, pitch {a.pitch_um:g} µm")
+        ax.grid(alpha=0.3); ax.legend(fontsize=8)
+        fig.tight_layout()
+        fig.savefig(root / f"a{a.array_id:02d}_D{a.diameter_um:g}_P{a.pitch_um:g}.png", dpi=170)
+        plt.close(fig)
+        n += 1
+    print(f"Wrote {n} averaged radial-overlay figures -> {root}")
 
 
 def _save_snapshot_provenance(figures_dir, snapshots, dxf_path, passes, speed):
@@ -1258,6 +1408,27 @@ def analyze_multi_snapshot(snapshots, out_dir, dxf_path, *, passes=0, speed=floa
     _plabel = f"Passes: {passes}\nSpeed: {speed:g} mm/s" if passes > 0 else ""
     write_3d_pin_maps(out_dir / "figures",
                       [(t["label"], t["scan"], t["placement"], _plabel) for t in tiles], template)
+
+    # Average the snapshots (replicate views of one uniform cell) -> averaged cell report, radial
+    # overlays, and diameter model. (measurements.csv keeps the per-snapshot rows above.)
+    by_array = {}
+    for _sm, _res, _rel in results:
+        by_array.setdefault(_sm.array_id, []).append(_res)
+    _dose_tag = f"P{passes}_S{speed:g}" if passes > 0 else "averaged"
+    avg_by_array = {aid: _average_results(rl, dose_label=_dose_tag) for aid, rl in by_array.items()}
+    avg_by_array = {k: v for k, v in avg_by_array.items() if v is not None}
+    _dose_label = f"P{passes}  S{speed:g}" if passes > 0 else "laser params: unset"
+    cells_dir = out_dir / "figures" / "cells"; cells_dir.mkdir(parents=True, exist_ok=True)
+    render_snapshot_cell_report(tiles, template, avg_by_array, _dose_label,
+                                cells_dir / "cell_averaged.png")
+    make_snapshot_radial_overlays(template, avg_by_array, out_dir, dose_label=_dose_tag)
+    avg_rows = []
+    for _r in avg_by_array.values():
+        _rel = passes > 0 and not any(k in _r.flags for k in ra.CRITICAL_FLAGS)
+        _row = ra.result_to_row(_r, _rel); _row["snapshot"] = "averaged"
+        avg_rows.append(_row)
+    if avg_rows:
+        ra.make_diameter_model(pd.DataFrame(avg_rows), out_dir / "figures")
 
     n_dose = df[["passes", "speed"]].drop_duplicates().shape[0]
     if n_dose < 2:
