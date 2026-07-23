@@ -82,8 +82,13 @@ def select_backend(decisive: bool = False) -> str:
         if _cupy() is not None:
             return "cupy"
         return "pyfftw" if _have_pyfftw() else "scipy"
-    # "auto" (and anything unrecognised): stay on the deterministic CPU path.  GPU/pyfftw are opt-in
-    # until the confirm-on-CPU detection wiring lands, so the default never perturbs a measurement.
+    # "auto" (and anything unrecognised): the deterministic CPU path.  Every NCC in register.py is
+    # DECISIVE -- its peak value feeds a marker count / reflection / accept decision (see
+    # _register_rotated_marker_cells: quality=(len(prelim), marker_top+2*mean_ov, ...)), so float32
+    # GPU cannot be used there without a GPU-proposes / CPU-float64-confirms rewrite that also can't
+    # match the CPU baseline bit-for-bit.  Until such a path exists, GPU stays opt-in via
+    # PFLM_ACCEL=cupy and the auto default never perturbs a measured result.  pyfftw measured
+    # ~=scipy for one-off calls, so it is not in the auto chain either.
     return "scipy"
 
 

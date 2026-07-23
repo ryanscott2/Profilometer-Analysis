@@ -1276,7 +1276,7 @@ def _solid_square_ncc_markers(feat, marker_px, min_sep, max_n=40, thresh=0.30):
     T[marg:marg + sq, marg:marg + sq] = 1.0
     Ht, Wt = T.shape
     t0 = marg + sq / 2.0
-    corr = np.abs(_pattern_ncc(feat, T))
+    corr = np.abs(_pattern_ncc(feat, T, decisive=True))   # peak value feeds count/reflection/accept
     sep = max(2, int(round(min_sep)))
     out = []
     for _ in range(max_n):
@@ -1302,7 +1302,7 @@ def _detect_marker_origins(feat, cell, xppx, yppx, x_right, y_up, rot, min_sep,
     Ht, Wt = T.shape
     if T.sum() < 3:
         return []
-    corr = np.abs(_pattern_ncc(feat, T))
+    corr = np.abs(_pattern_ncc(feat, T, decisive=True))   # peak value feeds count/reflection/accept
     sep = max(2, int(round(min_sep)))
     out = []
     for _ in range(max_n):

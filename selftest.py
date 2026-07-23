@@ -1177,6 +1177,45 @@ def main():
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"accel backend path raised: {e!r}")
 
+    # ---------------------------------- 20. GPU opt-in cannot change register output (Phase 2b) #
+    print("\n[20] opting into the GPU backend does not change register output (skipped w/o a GPU)")
+    try:
+        if accel._cupy() is None:
+            ck.check(True, "#P2b GPU not available -- GPU-insulation check skipped")
+        else:
+            _lt20 = read_design(
+                _resolve_dxf("072026_UVPFLM_D100D50.dxf", "registration")).cells[0]
+            _rs20, _rt20 = synth_scan(_lt20, x_um_per_px=2.0, y_um_per_px=2.0,
+                                      origin_px=(140.0, 140.0), rotation_deg=3.0,
+                                      depth_um=30.0, seed=2020)
+
+            def _reg20(gpu):                         # gpu=True: opt into the GPU backend for this run
+                _prevf = accel._FORCE_CPU
+                _preve = os.environ.get("PFLM_ACCEL")
+                accel.set_force_cpu(not gpu)
+                if gpu:
+                    os.environ["PFLM_ACCEL"] = "cupy"
+                try:
+                    return register_scan(_rs20, _lt20, n_cells=1)[0]
+                finally:
+                    accel.set_force_cpu(_prevf)
+                    if _preve is None:
+                        os.environ.pop("PFLM_ACCEL", None)
+                    else:
+                        os.environ["PFLM_ACCEL"] = _preve
+
+            _pc = _reg20(False)                      # deterministic CPU float64
+            _pg = _reg20(True)                       # GPU opted in -- must be byte-identical because
+            #                                          every register NCC is decisive -> CPU float64
+            ck.check(_pc.x_right == _pg.x_right and _pc.y_up == _pg.y_up
+                     and _pc.method == _pg.method
+                     and _pc.origin_col == _pg.origin_col and _pc.origin_row == _pg.origin_row
+                     and _pc.rotation_deg == _pg.rotation_deg,
+                     "#P2b register output byte-identical with GPU opted in (decisive NCCs insulate "
+                     "registration from float32 GPU)")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"GPU-insulation path raised: {e!r}")
+
     df.to_csv(OUT / "synth_measurements.csv", index=False)
     print(f"\nWrote synthetic measurements + plots to {OUT}")
     print(f"\n{'='*60}\n{ck.n - len(ck.fails)}/{ck.n} checks passed")

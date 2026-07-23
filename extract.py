@@ -162,7 +162,11 @@ def _nearest_pin_um(shape, centers_local, pxu, pyu):
     H, W = shape
     yy, xx = np.mgrid[0:H, 0:W]
     tree = cKDTree(np.asarray(centers_local, float) * np.array([pxu, pyu]))
-    return tree.query(np.column_stack([(xx * pxu).ravel(), (yy * pyu).ravel()]))[0].reshape(H, W)
+    # workers=-1 threads the per-pixel nearest-neighbour query across cores; scipy partitions the
+    # QUERY POINTS (not the reduction), so every returned distance is bit-identical to workers=1
+    # (asserted by selftest [18]'s byte-identity oracle).
+    return tree.query(np.column_stack([(xx * pxu).ravel(), (yy * pyu).ravel()]),
+                      workers=-1)[0].reshape(H, W)
 
 
 def _level_floor(z, valid, centers_local=None, pxu=None, pyu=None, r_pin_um=None, rr=None):
