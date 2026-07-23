@@ -1274,6 +1274,53 @@ def main():
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"CPU parallelism path raised: {e!r}")
 
+    # ------------------------------- 22. geom-edge-margin on a wide grid (Phase 3, #2) #
+    print("\n[22] geom-edge-margin resolves a wide grid the old area threshold would reject")
+    try:
+        from types import SimpleNamespace
+        from register import _register_uniform_lattice, _edge_margin_threshold
+        from synth import _stamp_disk
+
+        # Unit-lock the min-rule: O(N) edge term fixes large grids; min with the old area rule keeps
+        # the bar never stricter than before (no recall regression on narrow arrays); floor at 5.
+        _th = _edge_margin_threshold
+        ck.check(_th(3630, 30) == 15.0 and 0.01 * 3630 > 30,
+                 "#P3 large one-edge: geom margin (15) accepts what the old area rule (~36) rejected")
+        ck.check(_th(324, 18) == 5.0,
+                 "#P3 narrow array: min(area,geom) holds at the floor 5 (no recall loss vs old)")
+        ck.check(_th(0, 0) == 5.0 and _th(10000, 200) == 100.0,
+                 "#P3 edge-margin threshold: floor 5; large both-edge grid uses the O(N) edge term")
+
+        # A 150-col x 30-row uniform grid, rendered so the NEAR u-edge (col 0) + its floor are in
+        # frame but the far u-edge is cropped out (only 121 columns visible); both v-edges are in
+        # frame.  The u-axis then has ONE captured termination (~NY=30 discriminating nodes) over a
+        # wide interior (matched ~ 121*30 = 3630).  The retired threshold min_raw = 0.01*matched
+        # (~36) exceeds that one-edge evidence, so the OLD code would have marked u ambiguous; the
+        # geom-edge-margin (>= 0.5 * the geometrically expected edge nodes) accepts it.
+        _P, _Dpx, _NX, _NY, _cols = 6.0, 3.0, 150, 30, 121
+        _mL = _mT = 12
+        _Wv = _mL + (_cols - 1) * int(_P) + 3            # frame ends just past the last visible column
+        _Hv = _mT + (_NY - 1) * int(_P) + _mT
+        _z0v = np.zeros((_Hv, _Wv), float)
+        _valv = np.ones((_Hv, _Wv), bool)
+        for _j in range(_cols):
+            for _i in range(_NY):
+                _stamp_disk(_z0v, _mL + _j * _P, _mT + _i * _P, 0.5 * _Dpx, 5.0, "set")
+        _scanv = SimpleNamespace(x_um_per_px=1.0, y_um_per_px=1.0)
+        _tmplv = SimpleNamespace(arrays=[SimpleNamespace(
+            pitch_x_um=_P, pitch_y_um=_P, nx=_NX, ny=_NY, diameter_um=_Dpx)])
+        _plv = _register_uniform_lattice(_scanv, _tmplv, _z0v, _valv,
+                                         x_right_options=(1,), y_up_options=(1,),
+                                         angles_deg=(0.0,), allow_phase_only=True)[0]
+        ck.check(_plv.method == "uniform-edge" and _plv.absolute_origin
+                 and not _plv.ambiguous_axes
+                 and abs(_plv.origin_col - _mL) <= 3.0 and abs(_plv.origin_row - _mT) <= 3.0,
+                 f"#P3 wide one-edge grid resolves BOTH absolute indices "
+                 f"(method={_plv.method}, absolute={_plv.absolute_origin}, "
+                 f"ambiguous='{_plv.ambiguous_axes}')")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"geom-edge-margin path raised: {e!r}")
+
     df.to_csv(OUT / "synth_measurements.csv", index=False)
     print(f"\nWrote synthetic measurements + plots to {OUT}")
     print(f"\n{'='*60}\n{ck.n - len(ck.fails)}/{ck.n} checks passed")
