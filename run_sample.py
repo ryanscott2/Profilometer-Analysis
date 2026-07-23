@@ -798,7 +798,7 @@ def make_radial_overlays(template, placements, params, res_by_cell, out_dir, set
                 z = prof - floor
                 depth = res.depth_um if np.isfinite(res.depth_um) else np.nanmax(z)
                 ax.plot(rc, z, "-", lw=1.9, color=_combo_color(i, len(combos)),
-                        label=f"{combo}   (depth {depth:.0f} µm)")
+                        label=f"{combo} — depth {depth:.0f} µm")
                 n_lines += 1
             if not n_lines:
                 plt.close(fig)
@@ -808,7 +808,8 @@ def make_radial_overlays(template, placements, params, res_by_cell, out_dir, set
                        label=f"drawn radius {a.diameter_um/2:g} µm")
             ax.set_xlabel("radius from pin centre (µm)")
             ax.set_ylabel("mean height above clean floor (µm)")
-            ax.set_title(f"Radial pin profile — Ø {a.diameter_um:g} µm, pitch {a.pitch_um:g} µm")
+            ax.set_title(f"Mean radial pin profile — Ø {a.diameter_um:g} µm, "
+                         f"pitch {a.pitch_um:g} µm")
             ax.grid(alpha=0.3)
             ax.legend(fontsize=7, ncol=2 if n_lines > 8 else 1)
             fig.tight_layout()
@@ -1123,7 +1124,7 @@ def save_3d_pin_map(scan, placement, template, array, path, *, res_um=2.0, block
         ax.text2D(0.02, 0.02, param_label, transform=ax.transAxes, fontsize=11, va="bottom",
                   ha="left", bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="0.5", alpha=0.9))
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=150); plt.close(fig)
+    fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     return True
 
 
@@ -1260,13 +1261,14 @@ def make_snapshot_radial_overlays(template, avg_by_array, out_dir, dose_label=""
         z = prof - floor
         depth = res.depth_um if np.isfinite(res.depth_um) else np.nanmax(z)
         fig, ax = plt.subplots(figsize=(9, 6))
-        ax.plot(rc, z, "-", lw=1.9, label=f"{dose_label}   (depth {depth:.0f} µm, mean of snapshots)")
+        ax.plot(rc, z, "-", lw=1.9, label=f"{dose_label} — depth {depth:.0f} µm")
         ax.axhline(0, color="grey", lw=0.8)
         ax.axvline(a.diameter_um / 2, color="green", ls=":", lw=1.2,
                    label=f"drawn radius {a.diameter_um/2:g} µm")
         ax.set_xlabel("radius from pin centre (µm)")
         ax.set_ylabel("mean height above clean floor (µm)")
-        ax.set_title(f"Radial pin profile — Ø {a.diameter_um:g} µm, pitch {a.pitch_um:g} µm")
+        ax.set_title(f"Mean radial pin profile — Ø {a.diameter_um:g} µm, "
+                     f"pitch {a.pitch_um:g} µm")
         ax.grid(alpha=0.3); ax.legend(fontsize=8)
         fig.tight_layout()
         fig.savefig(root / f"a{a.array_id:02d}_D{a.diameter_um:g}_P{a.pitch_um:g}.png", dpi=170)
