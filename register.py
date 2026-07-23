@@ -32,6 +32,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+import accel                       # optional GPU/CPU FFT-NCC backend (see accel.py)
+
 
 # --------------------------------------------------------------------------- #
 class RegistrationAmbiguityError(RuntimeError):
@@ -1026,29 +1028,20 @@ def _marker_feature(z0, valid, pitch_px):
     return np.clip((prom - lo) / (hi - lo + 1e-9), 0.0, 1.0)
 
 
-def _pattern_ncc(img, tpl):
+def _pattern_ncc(img, tpl, decisive=False):
     """Normalized cross-correlation of ``img`` with ``tpl``, FULL mode, in [-1, 1].
 
     Plain correlation is biased toward dense regions of the (fairly full) local pin mask, which
     pulls coarse peaks onto spurious high-fill spots. NCC divides by the local image energy under
     the template, so a peak reflects PATTERN agreement, not local density -- essential for
     accurately localising every cell. 'full' mode keeps the lag->origin mapping unambiguous: a
-    peak at (k,l) means the template's top-left sits at img (k-Ht+1, l-Wt+1)."""
-    from scipy.signal import fftconvolve
-    t = tpl.astype(np.float64)
-    t0 = t - t.mean()
-    tnorm = float(np.sqrt((t0 * t0).sum()))
-    ones = np.ones_like(t)
-    if tnorm < 1e-9:
-        Hi, Wi = img.shape; Ht, Wt = t.shape
-        return np.zeros((Hi + Ht - 1, Wi + Wt - 1))
-    num = fftconvolve(img, t0[::-1, ::-1], mode="full")            # sum (img * zero-mean tpl)
-    s1 = fftconvolve(img, ones[::-1, ::-1], mode="full")           # local sum of img
-    s2 = fftconvolve(img * img, ones[::-1, ::-1], mode="full")     # local sum of img^2
-    n = float(t.size)
-    denom = np.sqrt(np.maximum(s2 - s1 * s1 / n, 0.0)) * tnorm
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return np.where(denom > 1e-9, num / denom, 0.0)
+    peak at (k,l) means the template's top-left sits at img (k-Ht+1, l-Wt+1).
+
+    Delegates to :func:`accel.pattern_ncc`; the CPU/scipy path is byte-identical to the historical
+    implementation.  Pass ``decisive=True`` when the peak VALUE (not just its position) selects a
+    reflection/rotation, so that comparison always runs on deterministic CPU float64 rather than a
+    float32 GPU result."""
+    return accel.pattern_ncc(img, tpl, decisive=decisive)
 
 
 def _dealias_origin(pin_mask, template, origin, xppx, yppx, y_up, x_right, rot_deg, margin=0.02):
@@ -1151,7 +1144,7 @@ def _register_by_pattern(scan, template, z0, valid, *, cell_pitch_um=None,
                 T, t0c, t0r, Ht, Wt = _cell_pin_pattern(template, xppx, yppx, xr, yu, ang, ds)
                 if T.sum() < 5:
                     continue
-                corr = _pattern_ncc(img, T)
+                corr = _pattern_ncc(img, T, decisive=True)   # peak value selects reflection+angle
                 pv = float(corr.max())
                 if best is None or pv > best[0]:
                     best = (pv, xr, yu, ang, corr, t0c, t0r, Ht, Wt)
@@ -1166,7 +1159,7 @@ def _register_by_pattern(scan, template, z0, valid, *, cell_pitch_um=None,
                 template, xppx, yppx, best_xr, best_yu, float(ang2), ds)
             if T.sum() < 5:
                 continue
-            corr2 = _pattern_ncc(img, T)
+            corr2 = _pattern_ncc(img, T, decisive=True)      # peak value selects the fine angle
             pv2 = float(corr2.max())
             if pv2 > best[0]:
                 best = (pv2, best_xr, best_yu, float(ang2), corr2,
@@ -1350,7 +1343,7 @@ def _detect_marker_origins_rotated(features, cell, xppx, yppx, x_right, y_up,
             return -1.0
         score = -1.0
         for f in coarse_features:
-            corr = np.abs(_pattern_ncc(f, T))
+            corr = np.abs(_pattern_ncc(f, T, decisive=True))  # peak value scores this angle
             if corr.size:
                 score = max(score, float(np.max(corr)))
         return score
