@@ -204,13 +204,10 @@ def main():
     df = pd.DataFrame(rows)
     try:
         ra.make_plots(df, results, OUT)
-        ra.print_diameter_calibration(df, OUT)
         figs = ["overview_3x3", "dose_collapse", "per_row", "diameter_fit",
                 "depth_vs_dose", "grid_overlays"]
         for name in figs:
             ck.check((OUT / "figures" / f"{name}.png").exists(), f"{name}.png written")
-        ck.check((OUT / "diameter_calibration.txt").exists(),
-                 "diameter_calibration.txt written")
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"plotting raised: {e!r}")
 

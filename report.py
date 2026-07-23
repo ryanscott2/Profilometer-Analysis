@@ -2,7 +2,7 @@
 Shared measurement-row builder + the legacy (v1) plot suite.
 
 Both drivers reuse this: ``run_sample.py`` (the tiled full-sample workflow) imports
-``result_to_row``, ``CRITICAL_FLAGS``, ``print_diameter_calibration`` and ``make_plots``;
+``result_to_row``, ``CRITICAL_FLAGS`` and ``make_plots``;
 ``selftest.py`` additionally uses ``_band_targets``. The figures produced here are the v1
 overview/dose/per-band/diameter-fit/grid set, written under ``<out_dir>/figures``.
 """
@@ -294,76 +294,6 @@ def make_grid_overlays(results, out_dir):
     plt.close(fig)
 
 
-def print_diameter_calibration(df, out_dir):
-    d = _fit_subset(df)
-    dfd = df[df.drawn_diameter_um.notna()] if len(df) else df
-    lines = ["Diameter calibration  (measured = a*drawn + b; to hit target, draw (target-b)/a)",
-             "Primary = TOP diameter; MID also shown.",
-             "Per-diameter lines give the measured Ø for each nominal geometry in the DXF and "
-             "the drawn Ø that would hit it.", ""]
-    if not len(d) or not len(dfd):
-        lines.append("(no reliable pins with plausible diameters yet)")
-        (out_dir / "diameter_calibration.txt").write_text("\n".join(lines), encoding="utf-8")
-        print("\n" + "\n".join(lines))
-        return
-
-    def fit(g, col):
-        if g.drawn_diameter_um.nunique() < 2:
-            return None
-        a, b = np.polyfit(g.drawn_diameter_um, g[col], 1)
-        return float(a), float(b)
-
-    def _first(series, default=float("nan")):
-        s = series.dropna()
-        return s.iloc[0] if len(s) else default
-
-    def invert(target, a, b, ref):
-        """measured = a*drawn + b  ->  drawn = (target-b)/a. A near-flat slope (|a|~0) or a result far
-        outside the drawn range makes "draw X" meaningless -> NaN, so an absurd actionable value
-        (e.g. a=0.01 -> 'draw 500 µm') is never printed. ``ref`` = the largest drawn Ø in the band."""
-        if not (np.isfinite(a) and np.isfinite(b)) or abs(a) < 1e-3:
-            return float("nan")
-        x = (target - b) / a
-        return x if (np.isfinite(x) and 0.0 < x < 3.0 * ref) else float("nan")
-
-    for band in sorted(dfd.band.dropna().unique()):
-        gband = dfd[dfd.band == band]                    # every nominal Ø drawn in this band
-        g = d[d.band == band]                            # reliable+plausible subset for the fit
-        tgt = _first(gband.target_diameter_um)
-        pitch = _first(gband.nominal_pitch_um)
-        seg = [f"band {band} (pitch {pitch:g}, target Ø {tgt:g} µm, n={len(g)}):"]
-        nominal_ds = sorted(gband.drawn_diameter_um.unique())
-        ref = max(nominal_ds) if nominal_ds else tgt      # sane upper bound for an inverted "draw X"
-        for col, nm in [("top_diameter_um", "TOP"), ("diameter_um", "MID")]:
-            fb = fit(g, col)
-            if fb:
-                a, b = fb
-                draw = invert(tgt, a, b, ref)
-                dtxt = (f"draw {draw:6.1f} µm to get {tgt:g} µm {nm.lower()}-Ø" if np.isfinite(draw)
-                        else f"slope {a:.3g} too flat to invert to {tgt:g} µm {nm.lower()}-Ø")
-                seg.append(f"    {nm}: measured = {a:.3f}*drawn {b:+.1f}  ->  {dtxt}")
-            else:
-                seg.append(f"    {nm}: (need >=2 reliable drawn diameters to fit a line)")
-            for D in nominal_ds:                         # one result per nominal diameter
-                gd = g[np.isclose(g.drawn_diameter_um, D)]
-                meas = (f"measured {gd[col].median():6.1f} µm (n={len(gd)})" if len(gd)
-                        else "no reliable measurement")
-                di = invert(D, fb[0], fb[1], ref) if fb else float("nan")
-                inv = (f"  ->  draw {di:6.1f} µm to get {D:g} µm {nm.lower()}-Ø"
-                       if np.isfinite(di) else "")
-                seg.append(f"        drawn {D:6.1f} µm: {meas}{inv}")
-        lines.append("\n".join(seg))
-    if d.drawn_diameter_um.nunique() >= 2:
-        ga, gb = np.polyfit(d.drawn_diameter_um, d.top_diameter_um, 1)
-        ma, mb = np.polyfit(d.drawn_diameter_um, d.diameter_um, 1)
-        lines += ["", f"GLOBAL (all bands, {len(d)} pins):",
-                  f"    TOP: measured = {ga:.3f}*drawn {gb:+.1f} µm",
-                  f"    MID: measured = {ma:.3f}*drawn {mb:+.1f} µm"]
-    text = "\n".join(lines)
-    print("\n" + text)
-    (out_dir / "diameter_calibration.txt").write_text(text, encoding="utf-8")
-
-
 def _ols_fit(X, y, alpha=0.05):
     """OLS via statsmodels. X already includes the intercept column. Returns
     (params, conf_int[p,2], r2, adj_r2, n, p, pvalues)."""
@@ -394,7 +324,7 @@ def _model_design(g):
 
 
 def make_diameter_model(df, out_dir):
-    """ADDITIVE calibration (does not replace print_diameter_calibration): per band, fit
+    """Per band, fit
     TOP Ø ~ drawn + passes + speed + interactions by OLS on reliable pins, with R²/adj-R² and 95%
     CIs -- so the drawn->measured relationship is conditional on the laser process rather than a
     single line pooled over an ~8x dose range. Writes diameter_model.txt + diameter_model.png."""
@@ -412,7 +342,7 @@ def make_diameter_model(df, out_dir):
     d = _fit_subset(df)
     d = d[d["top_diameter_um"].notna() & d["drawn_diameter_um"].notna()
           & (d["passes"] > 0) & (d["speed"] > 0)]
-    lines = ["Diameter model  (ADDITIVE to diameter_calibration.txt)",
+    lines = ["Diameter model",
              "TOP Ø ~ drawn + passes + speed + drawn:passes + drawn:speed  (OLS, reliable pins)",
              "Predictors are CENTERED per band, so the intercept is the top Ø at that band's mean",
              "drawn/passes/speed; a term is dropped when constant within the band. 95% CIs shown.",

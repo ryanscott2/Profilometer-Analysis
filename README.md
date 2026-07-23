@@ -212,7 +212,6 @@ Clean outputs live under `figures/`; the v1 plot set, `measurements.csv` and per
 | `figures/cells/cell_x*_y*.png` | per-cell report: height/intensity with pin overlay + measured-vs-drawn table |
 | `figures/param_summary.png`, `figures/param_depth_scatter.png` | depth & mid-Ø oversizing vs laser passes/speed (reliable arrays; ◇ D300 □ D100 △ D50) |
 | `figures/radial_overlays/<set>/a*.png` | mean-pin radial profiles overlaid across a laser-parameter set |
-| `figures/diameter_calibration.txt` | "draw X to get Y" calibration from the per-band fits |
 | `figures/` (provenance) | DXF copy, `vk4_source.zip`, `cell_params.csv`, `radial_sets.csv`, `run_manifest.json` (git commit + inputs) |
 | `legacy/figures/{overview_3x3,per_row,diameter_fit,depth_vs_dose,dose_collapse,grid_overlays}.png` | the v1 plot set |
 | `legacy/qc/<name>.png` | per-array QC (only with `make_qc`): height + known pins, mean pin with fitted rings, pin/floor/debris classification, radial profile |
