@@ -48,7 +48,9 @@ DEF_RESULTS = HERE / "Results"
 OUT_NAME = "etch depth"                # cross-sample output dir; has no legacy/ so it self-skips discovery
 MEAS_REL = Path("legacy") / "measurements.csv"
 DEF_TARGET_UM = 55.0                   # the design target used throughout the codebase
-DEF_MAX_DEBRIS = 0.6                   # depth-specific: a debris-buried floor gives untrustworthy depth
+DEF_MAX_DEBRIS = None                  # OFF by default: debris_fraction is a poor proxy for a bad
+#                                        depth read (the user vets which samples are good). Pass
+#                                        --max-debris X to re-enable the cut.
 PITCH_MATCH_TOL_UM = 1.0               # a row's nominal pitch must equal a band's declared pitch within
                                        # this (design pitches are discrete, so this is effectively exact)
 MIN_PREDICTIVE_R2 = 0.10               # below this, a fit is too weak to drive process inversion
@@ -244,7 +246,7 @@ def apply_gates(df, max_debris=DEF_MAX_DEBRIS, drop_shallow=False,
     if {"passes", "speed", "dose_ratio"} <= set(df.columns):
         step((df["passes"] > 0) & (df["speed"] > 0) & np.isfinite(df["dose_ratio"]),
              "passes/speed/dose not positive-finite")
-    if "debris_fraction" in df.columns:
+    if "debris_fraction" in df.columns and max_debris is not None:
         debris = pd.to_numeric(df["debris_fraction"], errors="coerce")
         if allow_legacy_qc:
             # The explicit compatibility mode preserves unmeasured legacy rows, but it is never
@@ -286,6 +288,16 @@ def aggregate_cell_bands(df, allow_legacy_qc=False):
             raise ValueError("cell_id is missing on some rows; refusing pseudo-replicated fitting")
         missing_id = d["cell_id"].isna()
         d.loc[missing_id, "cell_id"] = [f"legacy-row-{i}" for i in d.index[missing_id]]
+
+    # A snapshot dataset images ONE uniform cell as several disjoint tiles (Center, TopLeft, ...).
+    # Those tiles are replicate VIEWS of the same cell, not distinct cells, so collapse them into a
+    # single observation per sample/band -- the tile depths are averaged (median of two = mean).
+    # Detected via the 'snapshot' column, which only multi-snapshot runs emit.
+    if "snapshot" in d.columns:
+        snap = d["snapshot"].notna() & d["snapshot"].astype(str).str.strip().ne("")
+        if snap.any():
+            d["cell_id"] = d["cell_id"].astype(object)
+            d.loc[snap, "cell_id"] = "snapshot"
 
     keys = ["sample", "cell_id", "band", "nominal_pitch_um",
             "passes", "speed", "dose_ratio"]
@@ -784,8 +796,9 @@ def write_report(out_dir, samples, gate_rep, gated, per_band, targets, alpha, ma
                  "'!' = exclude):")
         for n in sorted(_applied):
             L.append(f"    {n}:  {_applied[n]}")
+    _deb = "off" if max_debris is None else f"{max_debris:g}"
     L.append(f"Targets: {', '.join(f'{t:g}' for t in targets)} µm   ·   "
-             f"max debris_fraction {max_debris:g}   ·   drop_shallow={drop_shallow}   ·   "
+             f"max debris_fraction {_deb}   ·   drop_shallow={drop_shallow}   ·   "
              f"CI level {100*(1-alpha):g}%")
     L.append(f"QC schema mode: {'LEGACY OVERRIDE (missing QC may pass)' if allow_legacy_qc else 'strict'}")
     L += _gate_report_lines(gate_rep)
@@ -1043,7 +1056,8 @@ def main(argv=None):
     ap.add_argument("--exclude", nargs="*", default=None, help="sample folder names to exclude")
     ap.add_argument("--targets", type=lambda s: [float(x) for x in _csv_list(s)], default=[DEF_TARGET_UM],
                     help="target depth(s) in µm, comma-separated (default 55)")
-    ap.add_argument("--max-debris", type=float, default=DEF_MAX_DEBRIS, help="drop rows with debris_fraction above this")
+    ap.add_argument("--max-debris", type=float, default=DEF_MAX_DEBRIS,
+                    help="drop rows with debris_fraction above this (default: off -- no debris gate)")
     ap.add_argument("--drop-shallow", action="store_true", help="also drop 'shallow' (<3 µm) rows")
     ap.add_argument("--allow-legacy-qc", action="store_true",
                     help="explicitly allow old measurements lacking reliable/debris/cell QC fields")

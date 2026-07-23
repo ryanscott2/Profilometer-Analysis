@@ -233,7 +233,7 @@ each sample's `legacy/measurements.csv`.
 python calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
                           [--results Results] [--out "Results/etch depth"] \
                           [--bands band_defs.csv] [--cell-filters cells.json] \
-                          [--max-debris 0.6] [--drop-shallow] [--allow-legacy-qc]
+                          [--max-debris X] [--drop-shallow] [--allow-legacy-qc]
 ```
 
 - **Discovers** the samples (folders under `Results/` with a `legacy/measurements.csv`), injects a
@@ -245,9 +245,10 @@ python calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
   row 1 = top, col 1 = left). The applied filters are echoed to the console and recorded in
   `depth_calibration.txt` for provenance. A sample whose CSV lacks a `cell_id` column is skipped
   (fail-closed) rather than pooled unfiltered.
-- **Gates** for a trustworthy depth read (`reliable`, finite depth, a stricter debris cut) and
-  prints the retained/total counts and *why* rows dropped. Missing `reliable` or
-  `debris_fraction` fields fail closed. `--allow-legacy-qc` is an explicit unsafe compatibility
+- **Gates** for a trustworthy depth read (`reliable`, finite depth) and prints the retained/total
+  counts and *why* rows dropped. The debris cut is **off by default** — `debris_fraction` is a poor
+  proxy for a bad depth read, so you vet which samples are good; pass `--max-debris X` to re-enable
+  it. Missing `reliable` fails closed. `--allow-legacy-qc` is an explicit unsafe compatibility
   override for manually reviewed older CSVs. `shallow` (<3 µm) points are kept by default — they
   anchor the low-dose rise — but `--drop-shallow` removes them.
 - **Bands** — `--bands` names a file whose every row is one band, `min_Ø, max_Ø, pitch` (µm): the
@@ -258,7 +259,10 @@ python calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
   falls back to the measurements' own `band` **plus nominal pitch**, so a local `band 1` from a
   D50/P100 design cannot alias a `band 1` from a D300/P350 design.
 - **Collapses technical replicates** to one median observation per sample/cell/band before fitting;
-  arrays sharing a cell exposure are not counted as independent trials.
+  arrays sharing a cell exposure are not counted as independent trials. The disjoint tiles of a
+  **snapshot** dataset (e.g. Center + TopLeft) are replicate views of one uniform cell, so they
+  collapse to a single observation per band with their **depth averaged** — not two independent
+  trials.
 - **Fits per band** (never pooling across pitch/diameter families): a saturating NLS
   `depth = a·(1−e^{−k·dose})`, a log-dose OLS (+ drawn-Ø covariate), and a passes×speed interaction
   OLS — all reported with R²/adj-R²/AICc/95% CI/p. The **recommended** form has the lowest
