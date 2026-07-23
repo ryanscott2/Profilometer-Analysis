@@ -409,8 +409,11 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False, jobs=
     save_sample_heightmap(scan, out_dir / "figures" / "sample_heightmap.png")
     # 3D centre-5x5 height map per array; repeating cells get per-cell subfolders (all cells).
     _multi = len({(p.cell_row, p.cell_col) for p in placements}) > 1
+    def _plabel3d(p):
+        pr = params.get((p.cell_row, p.cell_col))
+        return f"Passes: {pr.passes}\nSpeed: {pr.speed:g} mm/s" if (pr and pr.valid) else ""
     write_3d_pin_maps(out_dir / "figures",
-                      [((f"cell_x{p.cell_col}_y{p.cell_row}" if _multi else None), scan, p)
+                      [((f"cell_x{p.cell_col}_y{p.cell_row}" if _multi else None), scan, p, _plabel3d(p))
                        for p in placements], template)
     make_param_summary(df, out_dir)          # per-cell median depth & Ø-oversizing vs params
     make_param_depth_scatter(df, out_dir)    # same, with every array scattered around the median
@@ -1053,7 +1056,7 @@ def _center_block_box(scan, placement, array, block=5, margin_um=None):
     return (sx.min() - r - m, sx.max() + r + m, sy.min() - r - m, sy.max() + r + m)
 
 
-def save_3d_pin_map(scan, placement, template, array, path, *, res_um=2.0, block=5):
+def save_3d_pin_map(scan, placement, template, array, path, *, res_um=2.0, block=5, param_label=""):
     """Render a 3D height surface of the centre ``block``x``block`` pins of ``array`` to ``path``.
 
     Height is design-oriented (via the registration transform) and referenced to the local trench
@@ -1080,11 +1083,14 @@ def save_3d_pin_map(scan, placement, template, array, path, *, res_um=2.0, block
                            rcount=160, ccount=160, linewidth=0, antialiased=True)
     ax.set_xlabel("x (µm)"); ax.set_ylabel("y (µm)"); ax.set_zlabel("height above floor (µm)")
     ax.set_title(f"3D height — D{array.diameter_um:g} P{array.pitch_um:g}", fontsize=12)
-    ax.view_init(elev=38, azim=-55)
+    ax.view_init(elev=28, azim=-55)
     ax.zaxis.set_major_locator(plt.MaxNLocator(5))        # avoid z-ticks crowding the colorbar
     dz = max(1e-6, float(np.nanmax(zf) - np.nanmin(zf)))
     ax.set_box_aspect((x1 - x0, y1 - y0, dz))             # TRUE physical aspect (1 µm == 1 µm on z)
     fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.12)       # height also on the z-axis; no dup label
+    if param_label:                                       # laser-parameter info box, bottom-left
+        ax.text2D(0.02, 0.02, param_label, transform=ax.transAxes, fontsize=11, va="bottom",
+                  ha="left", bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="0.5", alpha=0.9))
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=150); plt.close(fig)
     return True
@@ -1093,16 +1099,18 @@ def save_3d_pin_map(scan, placement, template, array, path, *, res_um=2.0, block
 def write_3d_pin_maps(figures_dir, items, template, *, res_um=2.0):
     """Write a 3D centre-5x5 height map per array for each item into ``figures_dir/3D height map/``.
 
-    ``items`` : list of ``(subdir, scan, placement)`` -- ``subdir`` is a per-cell / per-snapshot
-    folder name (e.g. ``cell_x2_y1`` or ``Center``), or ``None`` to write straight into the root
-    (single cell). One PNG per array, named ``array{id}_D{d}_P{p}.png``."""
+    ``items`` : list of ``(subdir, scan, placement, param_label)`` -- ``subdir`` is a per-cell /
+    per-snapshot folder name (e.g. ``cell_x2_y1`` or ``Center``), or ``None`` to write straight into
+    the root (single cell); ``param_label`` is the laser-parameter string shown in a bottom-left info
+    box (``""`` to omit). One PNG per array, named ``array{id}_D{d}_P{p}.png``."""
     root = Path(figures_dir) / "3D height map"
     n = 0
-    for sub, scan, placement in items:
+    for sub, scan, placement, param_label in items:
         d = root / sub if sub else root
         for a in template.arrays:
             fname = f"array{a.array_id:02d}_D{a.diameter_um:g}_P{a.pitch_um:g}.png"
-            if save_3d_pin_map(scan, placement, template, a, d / fname, res_um=res_um):
+            if save_3d_pin_map(scan, placement, template, a, d / fname, res_um=res_um,
+                               param_label=param_label):
                 n += 1
     print(f"Wrote {n} 3D centre-5×5 height maps -> {root}")
     return n
@@ -1238,8 +1246,9 @@ def analyze_multi_snapshot(snapshots, out_dir, dxf_path, *, passes=0, speed=floa
                             montage=montage)
     save_snapshot_overview(tiles, template, out_dir / "figures" / "intensity_map.png",
                            montage=montage)
+    _plabel = f"Passes: {passes}\nSpeed: {speed:g} mm/s" if passes > 0 else ""
     write_3d_pin_maps(out_dir / "figures",
-                      [(t["label"], t["scan"], t["placement"]) for t in tiles], template)
+                      [(t["label"], t["scan"], t["placement"], _plabel) for t in tiles], template)
 
     n_dose = df[["passes", "speed"]].drop_duplicates().shape[0]
     if n_dose < 2:

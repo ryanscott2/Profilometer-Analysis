@@ -1461,7 +1461,8 @@ def main():
                  "#23F centre-5x5 block box is well-formed and ~5 pitches wide")
         _td3 = Path(tempfile.mkdtemp())
         try:
-            _ok3 = save_3d_pin_map(_corner, _tp[0], _mcell, _marr, _td3 / "a.png")
+            _ok3 = save_3d_pin_map(_corner, _tp[0], _mcell, _marr, _td3 / "a.png",
+                                   param_label="Passes: 35\nSpeed: 400 mm/s")
             ck.check(bool(_ok3) and (_td3 / "a.png").is_file(),
                      "#23F 3D centre-5x5 height map renders to a file")
         finally:
