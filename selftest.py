@@ -1321,6 +1321,140 @@ def main():
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"geom-edge-margin path raised: {e!r}")
 
+    # ---------------------- 23. multi-disjoint-snapshot stitched heightmap (Center + TopLeft) #
+    print("\n[23] multi-disjoint-snapshot: independent crops measured + tiled into one heightmap")
+    try:
+        import tempfile
+        from run_sample import (build_snapshot_montage, snapshots_from_dir, _label_from_name,
+                                _visible_content_box)
+        from assemble import assemble_tiles
+
+        _msd = _resolve_dxf("D300_P350_1cm2.dxf", "markerless")
+        _mcell = read_design(_msd).cells[0]
+        _marr = _mcell.arrays[0]
+        _msc = 10.0
+        _mo = (60.0, 60.0)
+        _mp = _marr.pitch_x_um / _msc
+
+        # Two INDEPENDENT captures of the same uniform cell at DIFFERENT absolute floors (60 vs 90
+        # um): separate sessions do not share a Z zero, so the montage must floor-level each panel.
+        _full_ctr, _ = synth_scan(_mcell, x_um_per_px=_msc, y_um_per_px=_msc, origin_px=_mo,
+                                  marker=False, depth_um=30.0, floor_um=60.0, seed=970)
+        _full_cor, _ = synth_scan(_mcell, x_um_per_px=_msc, y_um_per_px=_msc, origin_px=_mo,
+                                  marker=False, depth_um=30.0, floor_um=90.0, seed=971)
+
+        def _crop(full, r0, r1, c0, c1):
+            return SynthScan(full.height_raw[r0:r1, c0:c1], full.intensity[r0:r1, c0:c1],
+                             full.x_um_per_px, full.y_um_per_px, full.z_um_per_digit)
+
+        # "Center" = deep interior crop (phase-only, xy) ; "TopLeft" = corner crop with two
+        # captured pin terminations (absolute origin resolved) -- exactly the user's two cases.
+        _center = _crop(_full_ctr, int(_mo[1] + 5 * _mp), int(_mo[1] + 20 * _mp),
+                        int(_mo[0] + 5 * _mp), int(_mo[0] + 20 * _mp))
+        _corner = _crop(_full_cor, 0, int(_mo[1] + 18 * _mp), 0, int(_mo[0] + 18 * _mp))
+        _cp = register_sample(_center, _mcell, mirror_x=False)
+        _tp = register_sample(_corner, _mcell, mirror_x=False)
+
+        # (A) per-snapshot registration: interior stays phase-only/ambiguous; corner resolves both.
+        ck.check(len(_cp) == 1 and _cp[0].method == "uniform-phase"
+                 and not _cp[0].absolute_origin and _cp[0].ambiguous_axes == "xy",
+                 "#23A Center interior crop -> phase-only lock, ambiguous xy (position not absolute)")
+        ck.check(len(_tp) == 1 and _tp[0].absolute_origin and not _tp[0].ambiguous_axes
+                 and max(abs(_tp[0].origin_col - _mo[0]), abs(_tp[0].origin_row - _mo[1])) <= 2.0,
+                 "#23A TopLeft corner crop -> absolute origin resolved on both axes")
+
+        _tiles = [dict(label="Center", scan=_center, placement=_cp[0], snapshot_id=1),
+                  dict(label="TopLeft", scan=_corner, placement=_tp[0], snapshot_id=2)]
+
+        # (B) both snapshots measured in ONE dataset: build rows exactly as analyze_multi_snapshot
+        # does; assert a snapshot column, one row per array per snapshot, unique identities, and
+        # accurate geometry recovered from each partial crop.
+        _bt = ra._band_targets(_mcell)
+        _rows = []
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            for _t in _tiles:
+                for a in _mcell.arrays:
+                    _s = ArraySample(
+                        filename=f"{_t['label']}_b{a.band}c{a.col}_D{a.diameter_um:g}",
+                        vk4_stem=_t["label"], cell_id=_t["snapshot_id"], array_id=a.array_id,
+                        band=a.band, col=a.col, passes=35, speed=400.0,
+                        nominal_diameter_um=a.diameter_um, target_diameter_um=_bt[a.band],
+                        nominal_pitch_um=a.pitch_um, nominal_pitch_x_um=a.pitch_x_um,
+                        nominal_pitch_y_um=a.pitch_y_um, nx=a.nx, ny=a.ny,
+                        cx_um=a.cx_um, cy_um=a.cy_um)
+                    _res = extract_array(_t["scan"], _t["placement"], a, _s, make_qc=False)
+                    _row = ra.result_to_row(_res, True)
+                    _row["snapshot"], _row["snapshot_id"] = _t["label"], _t["snapshot_id"]
+                    _rows.append(_row)
+        _df = pd.DataFrame(_rows)
+        ck.check("snapshot" in _df.columns and len(_df) == 2 * _mcell.n_arrays
+                 and set(_df["snapshot"]) == {"Center", "TopLeft"}
+                 and _df["cell_id"].nunique() == 2 and _df["filename"].nunique() == len(_df),
+                 "#23B both snapshots measured in one table, tagged + collision-free")
+        ck.check(bool((_df["diameter_um"].sub(295.0).abs() <= 5.0).all()
+                      and (_df["depth_um"].sub(30.0).abs() <= 4.0).all()
+                      and (_df["n_cells"] > 0).all()
+                      and (_df["n_cells"] < _marr.nx * _marr.ny).all()),
+                 "#23B each partial crop recovers accurate diameter/depth from its visible pins")
+        ck.check(bool((~_df.loc[_df["snapshot"] == "Center", "absolute_origin"]).all()
+                      and _df.loc[_df["snapshot"] == "TopLeft", "absolute_origin"].all()),
+                 "#23B phase-only/absolute status propagates per-snapshot into the CSV rows")
+
+        # (C) the montage: ONE image (height + matching intensity), panels DISJOINT with a gutter,
+        # each floor-referenced so the 30 um relief survives despite the 30 um floor offset.
+        _m = build_snapshot_montage(_tiles, _mcell)
+        _b0, _b1 = _m["boxes"][0], _m["boxes"][1]
+        _gutter = _m["canvas"][:, _b0["c1"]:_b1["c0"]]
+        _reg0 = _m["canvas"][_b0["r0"]:_b0["r1"], _b0["c0"]:_b0["c1"]]
+        _reg1 = _m["canvas"][_b1["r0"]:_b1["r1"], _b1["c0"]:_b1["c1"]]
+        ck.check(_m is not None and _m["canvas"].shape[1] >= _reg0.shape[1] + _reg1.shape[1]
+                 and _b0["c1"] < _b1["c0"] and bool(np.all(np.isnan(_gutter)))
+                 and (_b1["c0"] - _b0["c1"]) == _m["gutter_px"],
+                 "#23C montage stitches both tiles side by side, disjoint across an all-NaN gutter")
+        ck.check(bool(np.isfinite(_reg0).any() and np.isfinite(_reg1).any()
+                      and 25.0 <= np.nanmax(_reg0) <= 35.0 and 25.0 <= np.nanmax(_reg1) <= 35.0),
+                 "#23C both panels contribute relief; per-tile floor-levelling neutralises Z offset")
+        ck.check(_m["intensity"] is not None and _m["intensity"].shape == _m["canvas"].shape,
+                 "#23C intensity montage exists and is tiled in the SAME layout as the height map")
+        ck.check([b["label"] for b in _m["boxes"]] == ["Center", "TopLeft"]
+                 and not _m["boxes"][0]["placement"].absolute_origin
+                 and _m["boxes"][1]["placement"].absolute_origin,
+                 "#23C montage panels carry the snapshot names + honest phase-only/absolute flags")
+
+        # (D) fail-closed: the raster assembler must REFUSE disjoint, non-_Y_X snapshots (never
+        # silently mosaic them) -- proving the multi-snapshot path bypasses assemble entirely.
+        _td = Path(tempfile.mkdtemp())
+        try:
+            (_td / "072226_PFLMTIM_D300_Center.vk4").write_bytes(b"not a raster tile")
+            (_td / "072226_PFLMTIM_D300_TopLeft.vk4").write_bytes(b"not a raster tile")
+            _raster_refused = False
+            try:
+                assemble_tiles(_td, verbose=False)
+            except (SystemExit, ValueError):
+                _raster_refused = True
+            ck.check(_raster_refused,
+                     "#23D assemble_tiles refuses disjoint non-_Y_X snapshots (no silent mosaic)")
+            _disc = snapshots_from_dir(_td)
+            ck.check([lab for _, lab in _disc] == ["Center", "TopLeft"]
+                     and _label_from_name("072226_PFLMTIM_D50_TopLeft.vk4") == "TopLeft",
+                     "#23D snapshot discovery labels tiles by their trailing filename token")
+        finally:
+            shutil.rmtree(_td, ignore_errors=True)
+
+        # (E) order-invariance: the montage layout + per-tile content do not depend on input order.
+        _m_rev = build_snapshot_montage(list(reversed(_tiles)), _mcell)
+        def _sig(m):
+            out = {}
+            for b in m["boxes"]:
+                reg = m["canvas"][b["r0"]:b["r1"], b["c0"]:b["c1"]]
+                out[b["label"]] = (reg.shape, round(float(np.nanmax(reg)), 3))
+            return out
+        ck.check(_sig(_m) == _sig(_m_rev),
+                 "#23E montage panels are identical regardless of snapshot input order")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"multi-disjoint-snapshot path raised: {e!r}")
+
     df.to_csv(OUT / "synth_measurements.csv", index=False)
     print(f"\nWrote synthetic measurements + plots to {OUT}")
     print(f"\n{'='*60}\n{ck.n - len(ck.fails)}/{ck.n} checks passed")

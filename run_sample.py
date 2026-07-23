@@ -45,6 +45,7 @@ from assemble import assemble_tiles
 from register import RegistrationAmbiguityError, register_sample
 from extract import ArraySample, extract_array
 from laser_params import load_cell_params, CELL_CSV_NAME
+from vk4 import read_vk4     # per-snapshot ingest for the disjoint multi-snapshot mode
 import report as ra          # shared measurement-row builder + legacy plot suite
 import parallel              # optional CPU process fan-out for the per-array extraction loop
 
@@ -188,6 +189,27 @@ def _write_results_sentinel(path, final_dir, state):
     (Path(path) / RESULTS_SENTINEL).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _resilient_rmtree(path, *, attempts=10, delay=0.3):
+    """``shutil.rmtree`` with retries. On Windows a cloud-sync client (OneDrive) or an antivirus
+    scanner can briefly hold a handle on a just-renamed directory, so ``rmtree`` transiently raises
+    ``PermissionError``/``OSError`` even though the caller owns the tree. Retry a few times, then
+    give up. Returns True on success (or if already gone), False if it never succeeded -- the caller
+    decides whether that is fatal."""
+    import time
+    path = Path(path)
+    for i in range(attempts):
+        try:
+            shutil.rmtree(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except (PermissionError, OSError):
+            if i == attempts - 1:
+                return False
+            time.sleep(delay)
+    return False
+
+
 def _prepare_output_transaction(out_dir, protect=(), results_root=DEF_OUT_DIR):
     """Create an owned hidden staging sibling while leaving the last good result untouched."""
     final_dir = _validate_output_target(out_dir, protect=protect, results_root=results_root)
@@ -198,14 +220,17 @@ def _prepare_output_transaction(out_dir, protect=(), results_root=DEF_OUT_DIR):
             if not (_sentinel_valid(backup, final_dir, ("complete",))
                     or _looks_like_legacy_output(backup)):
                 raise SystemExit(f"refusing to remove unowned recovery directory {backup}")
-            shutil.rmtree(backup)
+            if not _resilient_rmtree(backup):
+                raise SystemExit(
+                    f"could not remove the stale recovery directory {backup} (a cloud-sync client "
+                    f"or another process is holding it); close anything using it and re-run.")
         else:
             os.replace(backup, final_dir)
             print(f"Recovered previous completed output after an interrupted swap -> {final_dir}")
     for stale in final_dir.parent.glob(f".{final_dir.name}.staging-*"):
         if (stale.is_dir()
                 and _sentinel_valid(stale, final_dir, ("staging",))):
-            shutil.rmtree(stale)
+            _resilient_rmtree(stale)                     # best-effort; a stale staging dir is inert
     stage = Path(tempfile.mkdtemp(prefix=f".{final_dir.name}.staging-", dir=final_dir.parent))
     _write_results_sentinel(stage, final_dir, "staging")
     return stage, final_dir
@@ -234,8 +259,14 @@ def _commit_output_transaction(stage, final_dir):
         if backup.exists() and not final_dir.exists():
             os.replace(backup, final_dir)
         raise
-    if backup.exists():
-        shutil.rmtree(backup)
+    # The swap is done and the result is valid; removing the old backup is non-critical cleanup.
+    # If a cloud-sync client is momentarily holding it, warn and leave it -- the next run's
+    # _prepare_output_transaction GC (also resilient) will remove it -- rather than fail a
+    # completed run.
+    if backup.exists() and not _resilient_rmtree(backup):
+        print(f"WARNING: analysis committed successfully, but the previous backup {backup} could "
+              f"not be removed (locked by a cloud-sync client / another process). It is inert and "
+              f"will be cleaned up automatically on the next run.")
     print(f"Committed complete analysis transaction -> {final_dir}")
 
 
@@ -425,8 +456,9 @@ def _resample_cell(field, placement, template, valid, res_um=2.0, box=None):
 
 def _overlay_design(ax, template, res_by_array, box=None):
     """Red pin + alignment-marker outlines, dashed array dividers, per-array D/P + discrepancy."""
-    ax.add_patch(Rectangle((0, 0), template.marker_size_um, template.marker_size_um,
-                           ec="red", fill=False, lw=1.6))                # alignment marker
+    if np.isfinite(template.marker_size_um):                             # markerless cells have none
+        ax.add_patch(Rectangle((0, 0), template.marker_size_um, template.marker_size_um,
+                               ec="red", fill=False, lw=1.6))            # alignment marker
     for a in template.arrays:
         ax.add_patch(Rectangle((a.x0_um - 18, a.y0_um - 18), a.width_um + 36, a.height_um + 36,
                                ec="red", ls="--", fill=False, lw=0.8))   # array divider
@@ -443,11 +475,15 @@ def _overlay_design(ax, template, res_by_array, box=None):
     ax.set_xlabel("x (µm, design)"); ax.set_ylabel("y (µm, design)")
 
 
-def render_cell_report(scan, placement, template, res_by_array, params, path):
+def render_cell_report(scan, placement, template, res_by_array, params, path, box=None):
     """One report per unit cell: height (floor=0) + intensity with pin/marker/array overlays,
-    a title with laser params + cell position, and a measured-vs-expected table per array."""
+    a title with laser params + cell position, and a measured-vs-expected table per array.
+
+    ``box`` = (x0, x1, y0, y1) marker-relative design bounds to render; defaults to the full cell
+    content box. A partial snapshot passes its visible-pin box so the report frames the data, not
+    5 mm of empty design space."""
     valid = scan.height_raw != 0
-    box = _cell_content_box(template)
+    box = box if box is not None else _cell_content_box(template)
     z_cell, ext = _resample_cell(scan.height_um, placement, template, valid, box=box)
     floor = np.nanpercentile(z_cell, 20) if np.isfinite(z_cell).any() else 0.0
     zdisp = z_cell - floor                                # local zero = trench floor
@@ -802,12 +838,365 @@ def save_sample_overview(scan, template, placements, path, ds=6):
     fig.savefig(path, dpi=170); plt.close(fig)
 
 
+# ============================================================================ #
+# Multi-snapshot mode: DISJOINT crops of ONE uniform unit cell                  #
+# ============================================================================ #
+# A dataset here is a set of independent VK4 snapshots (e.g. a "Center" interior crop and a
+# "TopLeft" corner crop) of the SAME uniform-cell DXF geometry, with NO known relative position.
+# Each snapshot is registered INDEPENDENTLY (phase-only for an interior crop) and measured on
+# whatever pins it contains; the "combined height map" is a side-by-side MONTAGE of the tiles, not
+# a spatial mosaic (assemble.py is deliberately bypassed -- its overlap/step model cannot place
+# disjoint crops and would alias on the periodic pin lattice). All snapshots share one laser dose.
+
+_RASTER_RE = __import__("re").compile(r"_Y\d+_X\d+$", __import__("re").IGNORECASE)
+
+
+def _label_from_name(path):
+    """Human label for a snapshot from its filename: the trailing '_'-token (e.g. 'Center',
+    'TopLeft'). Falls back to the whole stem when there is no underscore."""
+    stem = Path(path).stem
+    return stem.rsplit("_", 1)[-1] if "_" in stem else stem
+
+
+def snapshots_from_dir(vk4_dir):
+    """Discover disjoint snapshots in ``vk4_dir``: every ``*.vk4`` that is NOT a ``_Y{n}_X{m}``
+    raster tile. Label each by its trailing filename token; if those collide, fall back to the
+    full stem so identities never merge. Returns a sorted list of ``(Path, label)``."""
+    files = sorted(p for p in Path(vk4_dir).glob("*.vk4") if not _RASTER_RE.search(p.stem))
+    labels = [_label_from_name(p) for p in files]
+    if len(set(labels)) != len(labels):                  # collision -> disambiguate, never merge
+        labels = [p.stem for p in files]
+    return list(zip(files, labels))
+
+
+def _parse_ps_label(text):
+    """Parse a single ``P{passes}_S{speed}`` dose token -> (passes, speed); (0, nan) if absent."""
+    if not text:
+        return 0, float("nan")
+    m = __import__("re").search(r"P(\d+)_S(\d+(?:\.\d+)?)", str(text))
+    if not m:
+        return 0, float("nan")
+    return int(m.group(1)), float(m.group(2))
+
+
+def _visible_content_box(scan, placement, template, margin_um=None):
+    """Marker-relative design bbox (x0, x1, y0, y1) of the pins this placement maps INSIDE the
+    scan, plus a pin radius and ~1-pitch margin. ``None`` if fewer than 3 pins are in frame. Frames
+    a partial snapshot on the region it actually covers, not the whole (mostly-empty) design cell."""
+    allc = template.all_centers_um()
+    cols, rows = placement.dxf_to_px(allc[:, 0], allc[:, 1])
+    H, W = scan.height_raw.shape
+    inb = (cols >= 0) & (cols < W) & (rows >= 0) & (rows < H)
+    if int(inb.sum()) < 3:
+        return None
+    if margin_um is None:
+        margin_um = float(np.median([a.pitch_um for a in template.arrays]))
+    r = 0.5 * max(a.diameter_um for a in template.arrays)
+    xs, ys = allc[inb, 0], allc[inb, 1]
+    return (xs.min() - margin_um - r, xs.max() + margin_um + r,
+            ys.min() - margin_um - r, ys.max() + margin_um + r)
+
+
+def _snapshot_panel(scan, placement, template, res_um=2.0):
+    """Design-oriented crops of one snapshot's visible region. Returns
+    ``(zdisp, inten, extent_um)`` where ``zdisp`` is height referenced to the local trench floor
+    (floor = 0) and ``inten`` is the same-footprint intensity image (``None`` if the scan has no
+    intensity channel). ``(None, None, None)`` when nothing is in frame."""
+    box = _visible_content_box(scan, placement, template)
+    if box is None:
+        return None, None, None
+    valid = scan.height_raw != 0
+    z, ext = _resample_cell(scan.height_um, placement, template, valid, res_um=res_um, box=box)
+    if not np.isfinite(z).any():
+        return None, None, None
+    floor = np.nanpercentile(z, 20)
+    inten = None
+    if getattr(scan, "intensity", None) is not None:                # same box/placement -> aligned
+        inten = _resample_cell(scan.intensity.astype(float), placement, template, valid,
+                               res_um=res_um, box=box)[0]
+    return z - floor, inten, ext
+
+
+def _stitch_snapshot_panels(panels, gutter_px=24):
+    """Lay design-oriented panels side by side on shared canvases (vertically centred, NaN gutter +
+    NaN padding). Panels are INDEPENDENT captures with no known relative position, so the horizontal
+    arrangement is presentation only -- never a spatial mosaic. Height and intensity use the SAME
+    layout (same boxes) so the two rows line up column-for-column.
+
+    ``panels`` : list of ``(label, placement, zdisp, inten)`` (``inten`` may be ``None``). Returns
+    ``(hcanvas, icanvas, boxes)``; ``icanvas`` is ``None`` when no panel has intensity. Each box is
+    ``dict(label, placement, c0, c1, r0, r1)`` locating that panel within the canvases."""
+    heights = [z.shape[0] for _, _, z, _ in panels]
+    widths = [z.shape[1] for _, _, z, _ in panels]
+    hc = max(heights)
+    wc = sum(widths) + gutter_px * (len(panels) - 1)
+    hcanvas = np.full((hc, wc), np.nan)
+    has_int = any(ip is not None for _, _, _, ip in panels)
+    icanvas = np.full((hc, wc), np.nan) if has_int else None
+    boxes, c = [], 0
+    for (label, pl, z, ip), w, h in zip(panels, widths, heights):
+        r0 = (hc - h) // 2
+        hcanvas[r0:r0 + h, c:c + w] = z
+        if icanvas is not None and ip is not None:
+            icanvas[r0:r0 + h, c:c + w] = ip
+        boxes.append(dict(label=label, placement=pl, c0=c, c1=c + w, r0=r0, r1=r0 + h))
+        c += w + gutter_px
+    return hcanvas, icanvas, boxes
+
+
+def build_snapshot_montage(tiles, template, *, res_um=2.0, gutter_px=24):
+    """Pure builder (no I/O) for the snapshot montage: independent, floor-referenced,
+    design-oriented panels stitched side by side, with a matching intensity montage. Returns
+    ``dict(canvas, intensity, boxes, vmax, ivmin, ivmax, labels, gutter_px)`` or ``None`` when no
+    tile has a visible region. Separate from :func:`save_snapshot_montage` so the self-test can
+    assert on the composited arrays directly."""
+    panels = []
+    for tile in tiles:
+        z, ip, _ = _snapshot_panel(tile["scan"], tile["placement"], template, res_um=res_um)
+        if z is not None:
+            panels.append((tile["label"], tile["placement"], z, ip))
+    if not panels:
+        return None
+    hcanvas, icanvas, boxes = _stitch_snapshot_panels(panels, gutter_px=gutter_px)
+    vmax = max(np.nanpercentile(z, 98) for _, _, z, _ in panels)
+    vmax = float(vmax) if np.isfinite(vmax) and vmax > 0 else 1.0
+    ivmin = ivmax = None
+    if icanvas is not None and np.isfinite(icanvas).any():
+        ivmin = float(np.nanpercentile(icanvas, 2))
+        ivmax = float(np.nanpercentile(icanvas, 98))
+    return dict(canvas=hcanvas, intensity=icanvas, boxes=boxes, vmax=vmax,
+                ivmin=ivmin, ivmax=ivmax, labels=[lab for lab, _, _, _ in panels],
+                gutter_px=gutter_px)
+
+
+def _annotate_snapshot_panels(ax, boxes, canvas_h, *, flag_phase):
+    """Label each tiled panel with its snapshot name (Center / TopLeft / ...) in a boxed callout
+    above the panel, so the reader can tell which crop is which. Adds headroom above the panels so
+    the labels are never clipped; on the height map, also flags a phase-only tile (position not
+    absolute). ``canvas_h`` is the composited canvas height in pixels."""
+    ax.set_ylim(-0.03 * canvas_h, canvas_h * 1.16)          # headroom for the labels above panels
+    for b in boxes:
+        pl = b["placement"]
+        flag = ("" if (not flag_phase or pl.absolute_origin)
+                else f"\n(phase-only; {pl.ambiguous_axes.upper()} index not absolute)")
+        ax.text(0.5 * (b["c0"] + b["c1"]), b["r1"] + 0.02 * canvas_h, f"{b['label']}{flag}",
+                color="black", ha="center", va="bottom", fontsize=12, weight="bold", clip_on=False,
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.6", alpha=0.9))
+
+
+def save_snapshot_heightmap(tiles, template, path, *, res_um=2.0, gutter_px=24, montage=None):
+    """Full-sample HEIGHT map for the multi-snapshot mode, written under the SAME filename as the
+    single-scan heightmap (``sample_heightmap.png``): each snapshot's floor-referenced,
+    design-oriented crop tiled side by side and annotated with its snapshot name. Panels are
+    separate captures, so the inter-panel spacing is presentation only, not a spatial mosaic."""
+    m = montage if montage is not None else build_snapshot_montage(
+        tiles, template, res_um=res_um, gutter_px=gutter_px)
+    if m is None:
+        print("No snapshot has a visible in-frame region -> skipping height map.")
+        return
+    canvas, boxes, vmax = m["canvas"], m["boxes"], m["vmax"]
+    fig, ax = plt.subplots(figsize=(max(8.0, 5.5 * len(boxes)), 8.0))
+    im = ax.imshow(canvas, origin="lower", cmap="viridis", vmin=0, vmax=vmax, aspect="equal")
+    ax.set_xticks([]); ax.set_yticks([])
+    _annotate_snapshot_panels(ax, boxes, canvas.shape[0], flag_phase=True)
+    plt.colorbar(im, ax=ax, shrink=0.85, label="height above local floor (µm)")
+    ax.set_title("Sample height — tiled snapshots (design orientation)\n"
+                 "(separate captures; inter-panel spacing is presentation only, "
+                 "not a spatial mosaic)", fontsize=11)
+    fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=200, bbox_inches="tight"); plt.close(fig)
+    print(f"Wrote {path}")
+
+
+def save_snapshot_overview(tiles, template, path, *, res_um=2.0, gutter_px=24, montage=None):
+    """INTENSITY overview for the multi-snapshot mode, written under the SAME filename as the
+    single-scan overview (``cell_overview.png``): the same snapshots tiled in the same layout as
+    the height map, annotated with their snapshot names."""
+    m = montage if montage is not None else build_snapshot_montage(
+        tiles, template, res_um=res_um, gutter_px=gutter_px)
+    if m is None or m["intensity"] is None or m["ivmax"] is None:
+        print("No snapshot intensity available -> skipping intensity overview.")
+        return
+    icanvas, boxes = m["intensity"], m["boxes"]
+    fig, ax = plt.subplots(figsize=(max(8.0, 5.5 * len(boxes)), 8.0))
+    imi = ax.imshow(icanvas, origin="lower", cmap="gray",
+                    vmin=m["ivmin"], vmax=m["ivmax"], aspect="equal")
+    ax.set_xticks([]); ax.set_yticks([])
+    _annotate_snapshot_panels(ax, boxes, icanvas.shape[0], flag_phase=False)
+    plt.colorbar(imi, ax=ax, shrink=0.85, label="intensity")
+    ax.set_title("Sample intensity — tiled snapshots (design orientation, same tiling as height)",
+                 fontsize=11)
+    fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=200, bbox_inches="tight"); plt.close(fig)
+    print(f"Wrote {path}")
+
+
+def _save_snapshot_provenance(figures_dir, snapshots, dxf_path, passes, speed):
+    """Self-describing provenance for a multi-snapshot run: copy the DXF, zip the exact snapshot
+    VK4s, and write ``run_manifest.json`` (git commit + inputs + labels + shared dose)."""
+    figures_dir = Path(figures_dir); figures_dir.mkdir(parents=True, exist_ok=True)
+    dxf_path = Path(dxf_path)
+    if dxf_path.exists():
+        shutil.copy2(dxf_path, figures_dir / dxf_path.name)
+    zpath = figures_dir / "vk4_source.zip"
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path, _label in snapshots:
+            p = Path(path)
+            if p.exists():
+                zf.write(p, arcname=p.name)
+    try:
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(HERE),
+                                         stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        commit = "unknown"
+    manifest = {
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "git_commit": commit,
+        "mode": "multi-snapshot",
+        "dxf": str(dxf_path),
+        "passes": passes,
+        "speed": speed,
+        "n_snapshots": len(snapshots),
+        "snapshots": [{"file": Path(p).name, "label": lab} for p, lab in snapshots],
+    }
+    (figures_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"Wrote multi-snapshot provenance -> {figures_dir}")
+
+
+def analyze_multi_snapshot(snapshots, out_dir, dxf_path, *, passes=0, speed=float("nan"),
+                           cell_label="", make_qc=False, jobs=None):
+    """Analyze a set of DISJOINT snapshots (crops) of ONE uniform unit-cell DXF.
+
+    ``snapshots`` : list of ``(vk4_path, label)``. Each is registered independently (phase-only for
+    an interior crop) and measured on the pins it contains; all share one laser (passes, speed).
+    Writes ``legacy/measurements.csv`` (one row per array per snapshot, tagged with ``snapshot``),
+    a per-snapshot report, and one side-by-side montage. Absolute pin position is never claimed.
+    Returns ``(df, results, tiles)``.
+    """
+    snapshots = [(Path(p), str(lab)) for p, lab in snapshots]
+    if not snapshots:
+        raise SystemExit("analyze_multi_snapshot: no snapshots provided.")
+    labels = [lab for _, lab in snapshots]
+    if len(set(labels)) != len(labels):
+        raise SystemExit(f"analyze_multi_snapshot: snapshot labels must be unique, got {labels}.")
+
+    stage_dir, final_out_dir = _prepare_output_transaction(
+        out_dir,
+        protect=(*[p for p, _ in snapshots], dxf_path),
+        results_root=DEF_OUT_DIR,
+    )
+    out_dir = Path(stage_dir)
+    design = read_design(dxf_path)
+    validate_equivalent_cells(design)
+    template = design.cells[0]
+    band_target = _band_targets(template)
+    print(design.summary())
+
+    # Register each snapshot INDEPENDENTLY (no assemble; positions are unknown / phase-only).
+    tiles = []
+    for i, (path, label) in enumerate(snapshots, start=1):
+        scan = read_vk4(path)
+        try:
+            pls = register_sample(scan, template)
+        except RegistrationAmbiguityError as e:
+            print(f"WARNING: snapshot '{label}' ({path.name}) failed registration ({e}); skipping.")
+            continue
+        if not pls:
+            print(f"WARNING: snapshot '{label}' ({path.name}) registered no cell; skipping.")
+            continue
+        pl = max(pls, key=lambda p: p.score)
+        if len(pls) > 1:
+            print(f"WARNING: snapshot '{label}' registered {len(pls)} cells; "
+                  f"keeping the highest-score placement.")
+        tiles.append(dict(label=label, scan=scan, placement=pl, snapshot_id=i, source=path.name))
+        note = ("" if pl.absolute_origin
+                else f"  <-- PHASE ONLY; absolute {pl.ambiguous_axes.upper()} index unresolved")
+        print(f"  snapshot {i:>2} '{label:<10}' method={pl.method:<13} score={pl.score:.2f} "
+              f"rot={pl.rotation_deg:+.2f}{note}")
+    if not tiles:
+        raise SystemExit("No snapshots could be registered against the DXF.")
+
+    qc_dir = out_dir / "legacy" / "qc"
+    (out_dir / "figures").mkdir(parents=True, exist_ok=True)
+    (out_dir / "legacy").mkdir(parents=True, exist_ok=True)
+    _save_snapshot_provenance(out_dir / "figures", snapshots, dxf_path, passes, speed)
+
+    # Measure every array of every snapshot. Each snapshot has its OWN scan, so the shared-scan
+    # process fan-out runs per snapshot (results come back in submission order -> stable CSV).
+    rows, results = [], []
+    for tile in tiles:
+        pl, scan, label = tile["placement"], tile["scan"], tile["label"]
+        work, book = [], []
+        for a in template.arrays:
+            sample = ArraySample(
+                filename=f"{label}_b{a.band}c{a.col}_D{a.diameter_um:g}",
+                vk4_stem=label, cell_id=tile["snapshot_id"],
+                array_id=a.array_id, band=a.band, col=a.col, passes=passes, speed=speed,
+                nominal_diameter_um=a.diameter_um, target_diameter_um=band_target[a.band],
+                nominal_pitch_um=a.pitch_um, nominal_pitch_x_um=a.pitch_x_um,
+                nominal_pitch_y_um=a.pitch_y_um, nx=a.nx, ny=a.ny,
+                cx_um=a.cx_um, cy_um=a.cy_um, cell_label=cell_label)
+            work.append((pl, a, sample, qc_dir / (sample.filename + ".png"), make_qc))
+            book.append(sample)
+        extracted = parallel.pmap_shared(_extract_worker, work, scan, jobs=jobs)
+        for sample, res in zip(book, extracted):
+            reliable = (passes > 0
+                        and not any(k in res.flags for k in ra.CRITICAL_FLAGS))
+            row = ra.result_to_row(res, reliable)
+            row["snapshot"], row["snapshot_id"] = label, tile["snapshot_id"]
+            row["reg_score"], row["cell_label"] = pl.score, cell_label
+            rows.append(row)
+            results.append((sample, res, reliable))
+
+    df = pd.DataFrame(rows).sort_values(["snapshot_id", "band", "col"])
+    meas_csv = out_dir / "legacy" / "measurements.csv"
+    df.to_csv(meas_csv, index=False)
+    print(f"\nWrote {meas_csv} ({len(df)} rows across {len(tiles)} snapshot(s))")
+
+    # Tiled figures under the SAME filenames as the single-scan pipeline (no new figure names):
+    # the snapshots tiled side by side and annotated by name -- sample_heightmap.png = tiled height,
+    # cell_overview.png = tiled intensity (identical layout). One montage build feeds both.
+    montage = build_snapshot_montage(tiles, template)
+    save_snapshot_heightmap(tiles, template, out_dir / "figures" / "sample_heightmap.png",
+                            montage=montage)
+    save_snapshot_overview(tiles, template, out_dir / "figures" / "cell_overview.png",
+                           montage=montage)
+
+    n_dose = df[["passes", "speed"]].drop_duplicates().shape[0]
+    if n_dose < 2:
+        print("Single laser dose across all snapshots -> skipping laser-parameter sweep plots "
+              "(depth/Ø-vs-dose need >=2 doses); montage + per-snapshot geometry are the outputs.")
+    _commit_output_transaction(out_dir, final_out_dir)
+    return df, results, tiles
+
+
+def analyze_multi_snapshot_dir(vk4_dir, out_dir, dxf_path, *, passes=0, speed=float("nan"),
+                               cell_label="", make_qc=False, jobs=None):
+    """Convenience wrapper: discover snapshots in ``vk4_dir`` (non-raster ``*.vk4``) and analyze."""
+    snaps = snapshots_from_dir(vk4_dir)
+    if not snaps:
+        raise SystemExit(f"No disjoint snapshot .vk4 files found in {vk4_dir} "
+                         f"(a '_Y*_X*' raster belongs to the tiled mode -> use analyze_sample).")
+    return analyze_multi_snapshot(snaps, out_dir, dxf_path, passes=passes, speed=speed,
+                                  cell_label=cell_label, make_qc=make_qc, jobs=jobs)
+
+
 def main():
     # Suppress only the known-benign numpy noise from phase-correlation (divide/invalid on
     # all-zero windows), not every warning -- a blanket ignore would also hide real deprecation
     # and runtime warnings.
     warnings.filterwarnings("ignore", message=".*invalid value encountered.*")
     warnings.filterwarnings("ignore", message=".*divide by zero encountered.*")
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("--snapshots", "--multi"):
+        # python run_sample.py --snapshots <vk4_dir> <out_dir> <dxf> <P{passes}_S{speed}>
+        a = argv[1:]
+        vk4_dir = Path(a[0]) if len(a) > 0 else DEF_VK4_DIR
+        out_dir = Path(a[1]) if len(a) > 1 else DEF_OUT_DIR / "direct"
+        dxf_path = Path(a[2]) if len(a) > 2 else next(DEF_DXF_DIR.glob("*.dxf"))
+        passes, speed = _parse_ps_label(a[3]) if len(a) > 3 else (0, float("nan"))
+        analyze_multi_snapshot_dir(vk4_dir, out_dir, dxf_path, passes=passes, speed=speed)
+        return
     vk4_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else DEF_VK4_DIR
     out_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else DEF_OUT_DIR / "direct"
     dxf_path = Path(sys.argv[3]) if len(sys.argv) > 3 else next(DEF_DXF_DIR.glob("*.dxf"))

@@ -107,6 +107,38 @@ def _parse_drop(data: str):
     return [p for p in out if p]
 
 
+# Multi-snapshot mode: a dataset folder can hold either a ``_Y{n}_X{m}`` tile raster (the tiled
+# full-sample workflow) OR a set of DISJOINT snapshots -- independent crops of ONE uniform cell
+# (e.g. a "Center" and a "TopLeft"). These mirror ``run_sample._RASTER_RE`` / ``snapshots_from_dir``
+# so the UI can show which mode a folder will run in and route the run command accordingly.
+_RASTER_TILE_RE = re.compile(r"_Y\d+_X\d+$", re.IGNORECASE)
+
+
+def _snapshot_label(stem):
+    """Snapshot label from a filename stem: the trailing ``_``-token (e.g. 'Center', 'TopLeft')."""
+    return stem.rsplit("_", 1)[-1] if "_" in stem else stem
+
+
+def _classify_vk4_folder(vk4_dir):
+    """``(mode, labels)`` for a VK4 folder. ``mode`` is ``'snapshots'`` when it holds plain
+    ``*.vk4`` with no ``_Y{n}_X{m}`` raster tile (-> run_sample multi-snapshot), else ``'raster'``.
+    ``labels`` lists the snapshot names (empty for a raster)."""
+    vks = sorted(Path(vk4_dir).glob("*.vk4"))
+    if vks and not any(_RASTER_TILE_RE.search(p.stem) for p in vks):
+        labels = [_snapshot_label(p.stem) for p in vks]
+        if len(set(labels)) != len(labels):                 # collision -> disambiguate, never merge
+            labels = [p.stem for p in vks]
+        return "snapshots", labels
+    return "raster", []
+
+
+def _first_ps_label(text):
+    """First ``P{passes}_S{speed}`` dose token in the params text (the shared dose for a
+    multi-snapshot dataset), or ``''`` if none."""
+    m = re.search(r"P\d+_S\d+(?:\.\d+)?", text or "")
+    return m.group(0) if m else ""
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -527,7 +559,12 @@ class App:
         vks = sorted(d.glob("*.vk4"))
         for f in vks:
             self.vk4_list.insert(tk.END, f.name)
-        self.vk4_dir_lbl.config(text=f"{d}   ({len(vks)} .vk4)")
+        mode, labels = _classify_vk4_folder(d)
+        if mode == "snapshots":                              # disjoint crops -> tiled montage
+            self.vk4_dir_lbl.config(
+                text=f"{d}   ({len(vks)} .vk4 — snapshot montage: {', '.join(labels)})")
+        else:
+            self.vk4_dir_lbl.config(text=f"{d}   ({len(vks)} .vk4)")
 
     def _browse_vk4(self):
         d = filedialog.askdirectory(title="Select VK4 folder")
@@ -641,8 +678,16 @@ class App:
         # each run writes under Results/<dataset name>/ so datasets don't overwrite each other
         # (run_sample clears only this subfolder, leaving other datasets' results intact)
         out_dir = self._dataset_out_dir()
-        cmd = [sys.executable, "-u", str(HERE / "run_sample.py"),
-               str(vk4), str(out_dir), str(dxf), str(csv_path)]
+        mode, _labels = _classify_vk4_folder(vk4)
+        if mode == "snapshots":
+            # Disjoint snapshots of ONE uniform cell -> multi-snapshot montage. Labels come from the
+            # filenames; all snapshots share one dose, parsed from the params box (first P#_S#).
+            dose = _first_ps_label(self._csv())
+            cmd = [sys.executable, "-u", str(HERE / "run_sample.py"),
+                   "--snapshots", str(vk4), str(out_dir), str(dxf), dose]
+        else:
+            cmd = [sys.executable, "-u", str(HERE / "run_sample.py"),
+                   str(vk4), str(out_dir), str(dxf), str(csv_path)]
         self.console.delete("1.0", "end")
         self._log("$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd) + "\n")
         try:
