@@ -63,6 +63,37 @@ python run_sample.py                    # -> Results/direct/{figures,legacy,...}
 # laser-parameter plots; or: python run_sample.py <vk4_dir> <out_dir> [<dxf>] [<cell_csv>]
 ```
 
+## Workflow — disjoint snapshots of one uniform cell (`run_sample.py --snapshots`)
+
+Sometimes a scan is not a continuous raster but a few **independent snapshots** of one large
+uniform unit cell — e.g. a `..._Center.vk4` interior crop and a `..._TopLeft.vk4` corner crop of
+the same design — captured at unknown, unrelated stage positions. They have no overlap to stitch
+by, and their absolute position in the cell is neither known nor needed. This mode registers
+**each snapshot independently** against the one DXF cell (an interior crop resolves *phase-only*; a
+corner that captures pin terminations can resolve an absolute origin), measures the pins visible in
+each, and renders a **side-by-side tiled montage** under the usual figure names:
+
+- `figures/sample_heightmap.png` — each snapshot's floor-referenced, design-oriented height crop
+  tiled side by side, annotated by snapshot name (a phase-only tile is flagged). Per-tile floor
+  levelling lets separate captures with different absolute Z share one honest colour scale; the
+  panels are **not** a spatial mosaic (inter-panel spacing is presentation only).
+- `figures/cell_overview.png` — the same snapshots' intensity, tiled in the identical layout.
+- `legacy/measurements.csv` — one row per array per snapshot, tagged with a `snapshot` column plus
+  the per-snapshot `reg_method` / `absolute_origin` / `ambiguous_axes`.
+
+All snapshots in one dataset share a single laser dose. Provide them as a folder of `*.vk4` files
+**not** named `_Y{n}_X{m}` (that suffix selects the tiled-raster mode); each file's trailing
+`_`-token is its label (`Center`, `TopLeft`, …). The tiled-raster `assemble_tiles` path is bypassed
+entirely — it would refuse (or, on a periodic pin lattice, alias) disjoint non-overlapping crops.
+
+```bash
+python run_sample.py --snapshots <vk4_dir> <out_dir> <dxf> P{passes}_S{speed}
+```
+
+**From the UI:** select the dataset's folder as usual — the VK4 label shows
+`snapshot montage: Center, TopLeft` when it detects disjoint snapshots, and Run routes to this mode
+automatically (the shared dose is the first `P{passes}_S{speed}` in the params box).
+
 Inspect just the DXF geometry:
 
 ```bash
@@ -257,7 +288,9 @@ at left).
 - `extract.py` — per-array measurement (classification-based heights, pin-stacked diameter).
 - `laser_params.py` — the `cell_params.csv` grid reader (by-cell (row, col)).
 - `report.py` — shared measurement-row builder + the legacy plot suite.
-- `run_sample.py` — full-sample driver (assemble → register grid → measure → plots).
+- `run_sample.py` — full-sample driver (assemble → register grid → measure → plots); also the
+  `--snapshots` multi-snapshot mode (register each disjoint crop of one uniform cell independently →
+  measure → tiled montage under the usual figure names).
 - `calibrate_depth.py` — cross-sample etch-depth calibration (see below); reuses `report._ols_fit`.
 - `pflm_ui.py` — Tkinter sample-tester GUI (sample library, run/stop, figure preview,
   depth-calibration panel).
