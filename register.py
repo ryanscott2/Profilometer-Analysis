@@ -863,6 +863,20 @@ def _block_bootstrap_margin(present, testable, best_pred, alt_pred, *, seed=2026
     return float(np.percentile(margins, 1.0))
 
 
+def _edge_margin_threshold(matched, expected):
+    """Minimum one-pitch-alias node-loss margin required to accept a finite index on one axis.
+
+    ``matched`` is the interior match count (~O(N^2) area) and ``expected`` the geometric edge
+    evidence for that axis (~O(N); the testable nodes where the best hypothesis and its nearest alias
+    disagree).  The gate is the SMALLER of the retired area rule (0.01*matched) and half the edge
+    evidence (0.5*expected), floored at 5: the edge term caps the requirement at O(N) so large grids
+    stay identifiable, while the min with the area term keeps the bar never stricter than before (no
+    recall loss on narrow arrays).  ``raw >= 0.5*expected`` forces a 3:1 edge supermajority, and the
+    independent block-bootstrap gate remains an AND-condition in the caller.
+    """
+    return max(5.0, min(0.01 * float(matched), 0.5 * float(expected)))
+
+
 def _register_uniform_lattice(scan, template, z0, valid, *, x_right_options=(-1, 1),
                               y_up_options=(1, -1), angles_deg=None,
                               allow_phase_only=False):
@@ -943,23 +957,29 @@ def _register_uniform_lattice(scan, template, z0, valid, *, x_right_options=(-1,
     for axis, pos in (("x", 2), ("y", 3)):
         alt = next((cnd for cnd in candidates if cnd[pos] != best[pos]), None)
         if alt is None:
-            evidence[axis] = (float("inf"), float("inf"), None)
+            evidence[axis] = (float("inf"), float("inf"), 0.0, None)
             continue
         alt_pred = _uniform_prediction(qu, qv, testable, alt[2], alt[3], a.nx, a.ny)
         raw_margin = float(alt[0] - best[0])
+        # Geometric maximum edge evidence for this axis: the testable lattice nodes where the best
+        # hypothesis and its nearest one-pitch alias DISAGREE (best predicts a pin where the alias
+        # predicts floor at the near termination, and vice-versa at the far one).  A perfectly clean
+        # grid makes every one of these nodes vote for `best`, so this count equals the raw_margin
+        # such a grid would produce -- and it scales with the physical edge length (~c*N), NOT the
+        # interior area (~N^2).
+        expected = float(np.count_nonzero(best_pred ^ alt_pred))
         boot_margin = _block_bootstrap_margin(
             present, testable, best_pred, alt_pred,
             seed=20260722 + (0 if axis == "x" else 1))
-        evidence[axis] = (raw_margin, boot_margin, alt)
+        evidence[axis] = (raw_margin, boot_margin, expected, alt)
 
-    # A one-pitch alias of a large N x N array differs along O(N) edge nodes while the interior
-    # contains O(N^2) matches, so a fraction-of-all-pins threshold would perversely get stricter as
-    # the array grows.  One percent plus the block-bootstrap guard retains ample independent edge
-    # support for the 100x100 fabrication grid without rejecting its mathematically expected ~2N
-    # margin after rotated-frame clipping.
-    min_raw = max(5, int(np.ceil(0.01 * matched)))
-    ambiguous = [axis for axis, (raw, boot, _alt) in evidence.items()
-                 if raw < min_raw or boot <= 0.0]
+    # geom-edge-margin (Phase 3): an axis is ambiguous unless the observed alias margin clears
+    # _edge_margin_threshold(matched, expected) AND the block-bootstrap lower bound (boot>0) holds.
+    # The threshold caps the requirement at O(N) edge evidence (fixing large grids the retired
+    # O(N^2) area rule wrongly rejected) while never being stricter than that old rule.  See
+    # selftest sections 15 and 22.
+    ambiguous = [axis for axis, (raw, boot, exp, _alt) in evidence.items()
+                 if raw < _edge_margin_threshold(matched, exp) or boot <= 0.0]
     if ambiguous:
         detail = ", ".join(
             f"{axis}: next alias +{evidence[axis][0]:g} node loss, "
