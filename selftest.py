@@ -970,11 +970,19 @@ def main():
         ck.check(_family_keys == {(1, 150.0), (1, 350.0)},
                  "calibration: same local band number at different pitches remains separate")
 
+        # passes×speed (interaction) is preferred whenever it fits with meaningful signal, even when a
+        # dose form has a lower AICc -- depth does not collapse to dose = passes/speed.
         _best, _ = cd.choose_recommended(
+            {"ok": True, "aicc": 8.0, "r2": 0.9},
+            {"ok": True, "aicc": 6.0, "adj_r2": 0.9},
+            {"ok": True, "aicc": 10.0, "adj_r2": 0.6})
+        ck.check(_best == "interaction", "calibration: passes×speed model preferred over dose forms")
+        # falls back to the lowest-AICc dose form when the interaction model is not estimable
+        _fb, _ = cd.choose_recommended(
             {"ok": True, "aicc": 12.0, "r2": 0.5},
             {"ok": True, "aicc": 8.0, "adj_r2": 0.4},
-            {"ok": True, "aicc": 10.0, "adj_r2": 0.6})
-        ck.check(_best == "log-dose", "calibration: model selection uses lowest AICc, not in-sample R²")
+            {"ok": False})
+        ck.check(_fb == "log-dose", "calibration: fallback to lowest-AICc dose form when no interaction fit")
         _none, _why = cd.choose_recommended(
             {"ok": True, "aicc": 1.0, "r2": 0.05},
             {"ok": True, "aicc": 2.0, "adj_r2": 0.05}, {"ok": False})

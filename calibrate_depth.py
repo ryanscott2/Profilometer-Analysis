@@ -519,10 +519,17 @@ def fit_interaction_ols(g, alpha=0.05):
 
 
 def choose_recommended(sat, logd, inter):
-    """Choose the smallest finite AICc among fits with meaningful explanatory signal.
+    """Recommend the passes×speed (interaction) model whenever it fits with meaningful signal.
 
-    Returning ``None`` deliberately suppresses inversion when every candidate is uninformative.
+    Etch depth does NOT collapse to dose = passes/speed (the same ratio gives very different depth),
+    so the passes×speed model is the honest form. The dose-only fits (saturating, log-dose) are kept
+    only as a fallback when the interaction model is not estimable (too few points, or only one of
+    passes/speed swept). ``None`` still suppresses inversion when nothing is informative.
     """
+    if (inter.get("ok") and np.isfinite(inter.get("aicc", np.inf))
+            and np.isfinite(inter.get("adj_r2", np.nan)) and inter["adj_r2"] >= MIN_PREDICTIVE_R2):
+        return "interaction", (f"passes×speed model (adj R²={inter['adj_r2']:.2f}); "
+                               f"depth does not collapse to dose")
     candidates = []
     for key, fit in (("saturating", sat), ("log-dose", logd), ("interaction", inter)):
         if not fit.get("ok") or not np.isfinite(fit.get("aicc", np.inf)):
@@ -717,7 +724,7 @@ def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude
                  array_row_count=len(gated), allow_legacy_qc=allow_legacy_qc)
     # The report is the primary deliverable; isolate each figure so one bad panel can't abort the
     # whole run (and the already-written report + other figures survive).
-    for fn in (fig_depth_vs_dose, fig_parity, fig_heatmap):
+    for fn in (fig_depth_3d, fig_parity, fig_heatmap):
         try:
             fn(out_dir, per_band, targets)
         except Exception as e:                           # pragma: no cover - defensive
@@ -899,49 +906,54 @@ def _grid(n):
     return nrows, ncols
 
 
-def fig_depth_vs_dose(out_dir, per_band, targets):
-    """Per-band depth vs dose with the recommended dose-only curve and target lines."""
+def fig_depth_3d(out_dir, per_band, targets):
+    """Per-band 3-D etch depth = f(passes, speed): measured points + the recommended-model surface
+    + a target-depth plane. Passes and speed are on separate axes because depth does not collapse to
+    dose = passes/speed. Bands that swept only one of passes/speed fall back to a depth-vs-dose view."""
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the '3d' projection)
     bands = list(per_band)
     nrows, ncols = _grid(len(bands))
     colors = _sample_colors(per_band)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 4.8 * nrows), squeeze=False)
+    fig = plt.figure(figsize=(6.8 * ncols, 5.4 * nrows))
     for idx, b in enumerate(bands):
-        ax = axes[idx // ncols][idx % ncols]
-        R = per_band[b]; g = R["g"]; sat = R["sat"]; rk = R["rec_key"]
+        R = per_band[b]; g = R["g"]; rk = R["rec_key"]
+        P = g["passes"].to_numpy(float); S = g["speed"].to_numpy(float)
+        both = (P.min() < P.max()) and (S.min() < S.max())
+        if not both:                                         # only one factor swept -> 2-D dose view
+            ax = fig.add_subplot(nrows, ncols, idx + 1)
+            for s, gs in g.groupby("sample"):
+                ax.plot(gs["dose_ratio"], gs["depth_um"], "o", ms=6, mec="white", color=colors[s],
+                        ls="none", label=str(s))
+            for t in targets:
+                ax.axhline(t, color="crimson", ls="--", lw=1)
+            ax.set_xlabel("dose = passes / speed"); ax.set_ylabel("depth (µm)")
+            ax.set_title(R["label"] + "  (single factor swept)", fontsize=9); ax.grid(alpha=0.3)
+            if idx == 0:
+                ax.legend(fontsize=7)
+            continue
+        ax = fig.add_subplot(nrows, ncols, idx + 1, projection="3d")
+        if rk in ("saturating", "log-dose", "interaction"):  # recommended-model surface
+            pg = np.linspace(P.min(), P.max(), 24); sg = np.linspace(S.min(), S.max(), 24)
+            PG, SG = np.meshgrid(pg, sg)
+            ZG = _predict(rk, R["sat"], R["logd"], R["inter"], dose=PG / SG, passes=PG, speed=SG)
+            if np.ndim(ZG) and np.isfinite(ZG).any():
+                ax.plot_surface(PG, SG, ZG, cmap="viridis", alpha=0.4, linewidth=0, antialiased=True)
         for s, gs in g.groupby("sample"):
-            ax.plot(gs["dose_ratio"], gs["depth_um"], "o", ms=6, mew=0.5, mec="white",
-                    color=colors[s], ls="none", label=str(s), alpha=0.85)
-        if rk == "saturating" and sat.get("ok"):
-            xr = np.linspace(g["dose_ratio"].min(), g["dose_ratio"].max(), 200)
-            yc = _sat(xr, sat["a"], sat["k"])
-            ax.plot(xr, yc, "k-", lw=1.8, label=f"saturating (R²={sat['r2']:.2f})")
-            band = 1.96 * sat["resid_sd"]
-            ax.fill_between(xr, yc - band, yc + band, color="k", alpha=0.12, lw=0)
-            ax.axhline(sat["a"], color="0.5", ls=":", lw=1)
-            ax.text(0.98, 0.06, f"plateau a≈{sat['a']:.0f} µm", transform=ax.transAxes,
-                    ha="right", va="bottom", fontsize=8, color="0.35")
-        elif rk == "log-dose" and R["logd"].get("ok"):
-            xr = np.linspace(g["dose_ratio"].min(), g["dose_ratio"].max(), 200)
-            yc = _predict("log-dose", sat, R["logd"], R["inter"], dose=xr)
-            ax.plot(xr, yc, "k-", lw=1.8,
-                    label=f"log-dose (adj-R²={R['logd']['adj_r2']:.2f})")
-        for t in targets:
-            ax.axhline(t, color="crimson", ls="--", lw=1)
-            # x in axes fraction, y in data units -> label sits just inside the left edge (the
-            # get_yaxis_transform idiom used in run_sample.make_param_summary)
-            ax.text(0.01, t, f" {t:g} µm", transform=ax.get_yaxis_transform(),
-                    color="crimson", fontsize=7, va="bottom")
-        ax.set_xscale("log")
-        ax.set_title(R["label"], fontsize=9)
-        ax.set_xlabel("dose = passes / speed (log axis)")
-        ax.set_ylabel("etch depth (µm)")
-        ax.grid(alpha=0.3)
-        ax.legend(fontsize=7)
-    for idx in range(len(bands), nrows * ncols):
-        axes[idx // ncols][idx % ncols].axis("off")
-    fig.suptitle("Etch depth vs dose per band", y=1.0)
+            ax.scatter(gs["passes"], gs["speed"], gs["depth_um"], s=34, depthshade=False,
+                       color=colors[s], edgecolor="white", linewidths=0.4, label=str(s))
+        for t in targets:                                    # translucent target-depth plane
+            pg2, sg2 = np.meshgrid([P.min(), P.max()], [S.min(), S.max()])
+            ax.plot_surface(pg2, sg2, np.full(pg2.shape, float(t)), color="crimson",
+                            alpha=0.12, linewidth=0)
+        ax.set_xlabel("passes", labelpad=8); ax.set_ylabel("speed (mm/s)", labelpad=8)
+        ax.set_zlabel("depth (µm)", labelpad=6)
+        ax.set_title(R["label"], fontsize=9); ax.view_init(elev=22, azim=-60)
+        if idx == 0:
+            ax.legend(fontsize=7, loc="upper left")
+    fig.suptitle("Etch depth = f(passes, speed) per band  (surface = recommended model, "
+                 "red plane = target)", y=1.0)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
-    p = out_dir / "depth_vs_dose.png"
+    p = out_dir / "depth_vs_passes_speed_3d.png"
     fig.savefig(p, dpi=170, bbox_inches="tight"); plt.close(fig)
     print(f"Wrote {p}")
 
