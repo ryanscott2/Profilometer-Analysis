@@ -38,6 +38,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Rectangle
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the '3d' projection)
 
 sys.path.insert(0, str(Path(__file__).parent))
 from dxf_geometry import read_design, validate_equivalent_cells
@@ -406,6 +407,11 @@ def analyze_sample(vk4_dir, out_dir, dxf_path, cell_csv, *, make_qc=False, jobs=
     # measurements.csv, qc/) are regenerated under legacy/ ahead of the planned refactor.
     save_sample_overview(scan, template, placements, out_dir / "figures" / "cell_overview.png")
     save_sample_heightmap(scan, out_dir / "figures" / "sample_heightmap.png")
+    # 3D centre-5x5 height map per array; repeating cells get per-cell subfolders (all cells).
+    _multi = len({(p.cell_row, p.cell_col) for p in placements}) > 1
+    write_3d_pin_maps(out_dir / "figures",
+                      [((f"cell_x{p.cell_col}_y{p.cell_row}" if _multi else None), scan, p)
+                       for p in placements], template)
     make_param_summary(df, out_dir)          # per-cell median depth & Ø-oversizing vs params
     make_param_depth_scatter(df, out_dir)    # same, with every array scattered around the median
     make_radial_overlays(template, placements, params, res_by_cell, out_dir,
@@ -969,17 +975,13 @@ def build_snapshot_montage(tiles, template, *, res_um=2.0, gutter_px=24):
                 gutter_px=gutter_px)
 
 
-def _annotate_snapshot_panels(ax, boxes, canvas_h, *, flag_phase):
+def _annotate_snapshot_panels(ax, boxes, canvas_h):
     """Label each tiled panel with its snapshot name (Center / TopLeft / ...) in a boxed callout
     above the panel, so the reader can tell which crop is which. Adds headroom above the panels so
-    the labels are never clipped; on the height map, also flags a phase-only tile (position not
-    absolute). ``canvas_h`` is the composited canvas height in pixels."""
+    the labels are never clipped. ``canvas_h`` is the composited canvas height in pixels."""
     ax.set_ylim(-0.03 * canvas_h, canvas_h * 1.16)          # headroom for the labels above panels
     for b in boxes:
-        pl = b["placement"]
-        flag = ("" if (not flag_phase or pl.absolute_origin)
-                else f"\n(phase-only; {pl.ambiguous_axes.upper()} index not absolute)")
-        ax.text(0.5 * (b["c0"] + b["c1"]), b["r1"] + 0.02 * canvas_h, f"{b['label']}{flag}",
+        ax.text(0.5 * (b["c0"] + b["c1"]), b["r1"] + 0.02 * canvas_h, b["label"],
                 color="black", ha="center", va="bottom", fontsize=12, weight="bold", clip_on=False,
                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.6", alpha=0.9))
 
@@ -998,11 +1000,9 @@ def save_snapshot_heightmap(tiles, template, path, *, res_um=2.0, gutter_px=24, 
     fig, ax = plt.subplots(figsize=(max(8.0, 5.5 * len(boxes)), 8.0))
     im = ax.imshow(canvas, origin="lower", cmap="viridis", vmin=0, vmax=vmax, aspect="equal")
     ax.set_xticks([]); ax.set_yticks([])
-    _annotate_snapshot_panels(ax, boxes, canvas.shape[0], flag_phase=True)
+    _annotate_snapshot_panels(ax, boxes, canvas.shape[0])
     plt.colorbar(im, ax=ax, shrink=0.85, label="height above local floor (µm)")
-    ax.set_title("Sample height — tiled snapshots (design orientation)\n"
-                 "(separate captures; inter-panel spacing is presentation only, "
-                 "not a spatial mosaic)", fontsize=11)
+    ax.set_title("Sample height — tiled snapshots", fontsize=12)
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=200, bbox_inches="tight"); plt.close(fig)
     print(f"Wrote {path}")
@@ -1022,13 +1022,94 @@ def save_snapshot_overview(tiles, template, path, *, res_um=2.0, gutter_px=24, m
     imi = ax.imshow(icanvas, origin="lower", cmap="gray",
                     vmin=m["ivmin"], vmax=m["ivmax"], aspect="equal")
     ax.set_xticks([]); ax.set_yticks([])
-    _annotate_snapshot_panels(ax, boxes, icanvas.shape[0], flag_phase=False)
+    _annotate_snapshot_panels(ax, boxes, icanvas.shape[0])
     plt.colorbar(imi, ax=ax, shrink=0.85, label="intensity")
-    ax.set_title("Sample intensity — tiled snapshots (design orientation, same tiling as height)",
-                 fontsize=11)
+    ax.set_title("Sample intensity — tiled snapshots", fontsize=12)
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=200, bbox_inches="tight"); plt.close(fig)
     print(f"Wrote {path}")
+
+
+# ------------------------------------------------------ 3D centre-block maps #
+def _center_block_box(scan, placement, array, block=5, margin_um=None):
+    """Design-space bbox (x0, x1, y0, y1) covering the ``block``x``block`` pins at the CENTRE of
+    ``array`` that are visible in ``scan``. For a fully-captured array (raster cell) this is the
+    array's geometric centre; for a phase-only snapshot (no absolute centre) it centres on the
+    visible pins. Fewer pins are used near a frame edge. ``None`` if < 4 pins of the block are in
+    frame."""
+    allc = array.centers_um
+    cols, rows = placement.dxf_to_px(allc[:, 0], allc[:, 1])
+    H, W = scan.height_raw.shape
+    inb = (cols >= 0) & (cols < W) & (rows >= 0) & (rows < H)
+    if int(inb.sum()) < 4:
+        return None
+    vx, vy = allc[inb, 0], allc[inb, 1]
+    px, py = array.pitch_x_um, array.pitch_y_um
+    cx = vx[np.argmin(np.abs(vx - np.median(vx)))]       # snap centre to the nearest visible pin
+    cy = vy[np.argmin(np.abs(vy - np.median(vy)))]
+    hw = block / 2.0 - 0.3                                # 5 -> 2.2 pitches: keeps +-2, drops +-3
+    sel = (np.abs(vx - cx) <= hw * px) & (np.abs(vy - cy) <= hw * py)
+    if int(sel.sum()) < 4:
+        return None
+    r = array.diameter_um / 2.0
+    m = margin_um if margin_um is not None else 0.3 * min(px, py)
+    sx, sy = vx[sel], vy[sel]
+    return (sx.min() - r - m, sx.max() + r + m, sy.min() - r - m, sy.max() + r + m)
+
+
+def save_3d_pin_map(scan, placement, template, array, path, *, res_um=2.0, block=5):
+    """Render a 3D height surface of the centre ``block``x``block`` pins of ``array`` to ``path``.
+
+    Height is design-oriented (via the registration transform) and referenced to the local trench
+    floor (floor = 0). The axes are rendered at TRUE physical aspect (one micron is the same length
+    on x, y and z), so pin height/taper read at real proportions. Returns True if a map was written,
+    False when too little of the block is in frame."""
+    box = _center_block_box(scan, placement, array, block=block)
+    if box is None:
+        return False
+    valid = scan.height_raw != 0
+    z, ext = _resample_cell(scan.height_um, placement, template, valid, res_um=res_um, box=box)
+    if not np.isfinite(z).any():
+        return False
+    z = z - np.nanpercentile(z, 20)                      # local trench floor -> 0
+    x0, x1, y0, y1 = ext
+    ny, nx = z.shape
+    xx, yy = np.meshgrid(np.linspace(x0, x1, nx), np.linspace(y0, y1, ny))
+    zf = np.nan_to_num(z, nan=0.0)                        # scan-edge gaps drop to the floor
+    vmax = np.nanpercentile(z, 99.5)
+    vmax = float(vmax) if np.isfinite(vmax) and vmax > 0 else 1.0
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection="3d")
+    surf = ax.plot_surface(xx, yy, zf, cmap="viridis", vmin=0, vmax=vmax,
+                           rcount=160, ccount=160, linewidth=0, antialiased=True)
+    ax.set_xlabel("x (µm)"); ax.set_ylabel("y (µm)"); ax.set_zlabel("height above floor (µm)")
+    ax.set_title(f"3D height — D{array.diameter_um:g} P{array.pitch_um:g}", fontsize=12)
+    ax.view_init(elev=38, azim=-55)
+    ax.zaxis.set_major_locator(plt.MaxNLocator(5))        # avoid z-ticks crowding the colorbar
+    dz = max(1e-6, float(np.nanmax(zf) - np.nanmin(zf)))
+    ax.set_box_aspect((x1 - x0, y1 - y0, dz))             # TRUE physical aspect (1 µm == 1 µm on z)
+    fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.12)       # height also on the z-axis; no dup label
+    fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150); plt.close(fig)
+    return True
+
+
+def write_3d_pin_maps(figures_dir, items, template, *, res_um=2.0):
+    """Write a 3D centre-5x5 height map per array for each item into ``figures_dir/3D height map/``.
+
+    ``items`` : list of ``(subdir, scan, placement)`` -- ``subdir`` is a per-cell / per-snapshot
+    folder name (e.g. ``cell_x2_y1`` or ``Center``), or ``None`` to write straight into the root
+    (single cell). One PNG per array, named ``array{id}_D{d}_P{p}.png``."""
+    root = Path(figures_dir) / "3D height map"
+    n = 0
+    for sub, scan, placement in items:
+        d = root / sub if sub else root
+        for a in template.arrays:
+            fname = f"array{a.array_id:02d}_D{a.diameter_um:g}_P{a.pitch_um:g}.png"
+            if save_3d_pin_map(scan, placement, template, a, d / fname, res_um=res_um):
+                n += 1
+    print(f"Wrote {n} 3D centre-5×5 height maps -> {root}")
+    return n
 
 
 def _save_snapshot_provenance(figures_dir, snapshots, dxf_path, passes, speed):
@@ -1159,8 +1240,10 @@ def analyze_multi_snapshot(snapshots, out_dir, dxf_path, *, passes=0, speed=floa
     montage = build_snapshot_montage(tiles, template)
     save_snapshot_heightmap(tiles, template, out_dir / "figures" / "sample_heightmap.png",
                             montage=montage)
-    save_snapshot_overview(tiles, template, out_dir / "figures" / "cell_overview.png",
+    save_snapshot_overview(tiles, template, out_dir / "figures" / "intensity_map.png",
                            montage=montage)
+    write_3d_pin_maps(out_dir / "figures",
+                      [(t["label"], t["scan"], t["placement"]) for t in tiles], template)
 
     n_dose = df[["passes", "speed"]].drop_duplicates().shape[0]
     if n_dose < 2:

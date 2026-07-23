@@ -74,10 +74,13 @@ corner that captures pin terminations can resolve an absolute origin), measures 
 each, and renders a **side-by-side tiled montage** under the usual figure names:
 
 - `figures/sample_heightmap.png` — each snapshot's floor-referenced, design-oriented height crop
-  tiled side by side, annotated by snapshot name (a phase-only tile is flagged). Per-tile floor
-  levelling lets separate captures with different absolute Z share one honest colour scale; the
-  panels are **not** a spatial mosaic (inter-panel spacing is presentation only).
-- `figures/cell_overview.png` — the same snapshots' intensity, tiled in the identical layout.
+  tiled side by side and labelled by snapshot name. Per-tile floor levelling lets separate captures
+  with different absolute Z share one honest colour scale. The panels are independent captures, not
+  a spatial mosaic (their relative position is unknown).
+- `figures/intensity_map.png` — the same snapshots' intensity, tiled in the identical layout.
+- `figures/3D height map/<snapshot>/array{id}_D{d}_P{p}.png` — a true-aspect 3D height surface of
+  the **centre 5×5 pins** of each array, per snapshot. Diameter/pitch (and every geometry) come
+  from the DXF, never the filename.
 - `legacy/measurements.csv` — one row per array per snapshot, tagged with a `snapshot` column plus
   the per-snapshot `reg_method` / `absolute_origin` / `ambiguous_axes`.
 

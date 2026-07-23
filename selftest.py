@@ -1452,6 +1452,20 @@ def main():
             return out
         ck.check(_sig(_m) == _sig(_m_rev),
                  "#23E montage panels are identical regardless of snapshot input order")
+
+        # (F) 3D centre-5x5 height map: a well-formed centre block + a rendered surface file.
+        from run_sample import save_3d_pin_map, _center_block_box
+        _b3 = _center_block_box(_corner, _tp[0], _marr)
+        ck.check(_b3 is not None and _b3[1] > _b3[0] and _b3[3] > _b3[2]
+                 and (_b3[1] - _b3[0]) <= 6 * _marr.pitch_x_um,
+                 "#23F centre-5x5 block box is well-formed and ~5 pitches wide")
+        _td3 = Path(tempfile.mkdtemp())
+        try:
+            _ok3 = save_3d_pin_map(_corner, _tp[0], _mcell, _marr, _td3 / "a.png")
+            ck.check(bool(_ok3) and (_td3 / "a.png").is_file(),
+                     "#23F 3D centre-5x5 height map renders to a file")
+        finally:
+            shutil.rmtree(_td3, ignore_errors=True)
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"multi-disjoint-snapshot path raised: {e!r}")
 
