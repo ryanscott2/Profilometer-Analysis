@@ -125,7 +125,7 @@ def make_depth_dose(df, out_dir, colors):
         ax.legend(fontsize=9)
     ax.set_xlabel("dose proxy = passes / speed")
     ax.set_ylabel("etch depth (µm)   [pin top − clean floor]")
-    ax.set_title("Etch depth vs dose (reliable pins)")
+    ax.set_title("Etch depth vs dose")
     fig.tight_layout()
     fig.savefig(out_dir / "figures" / "depth_vs_dose.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -188,8 +188,7 @@ def make_per_row(df, out_dir, colors):
                 axes[1][j].plot(r["speed"], r["diameter_um"], "o", color=c, mfc=mfc,
                                 ms=7, mew=1.3, ls="none")
         dd = f"{drawn_d[0]:g}–{drawn_d[-1]:g}" if drawn_d else "?"
-        axes[0][j].set_title(f"band {band}\ndrawn Ø {dd} | target {target_d:g} | "
-                             f"pitch {pitch_nom:g} µm", fontsize=9)
+        axes[0][j].set_title(f"band {band} — Ø {dd}, pitch {pitch_nom:g} µm", fontsize=9)
         axes[0][j].set_xlabel("speed (mm/s)"); axes[1][j].set_xlabel("speed (mm/s)")
         if j == 0:
             axes[0][j].set_ylabel("depth (µm)")
@@ -198,7 +197,7 @@ def make_per_row(df, out_dir, colors):
             axes[1][j].axhline(bd, color="grey", ls="--", lw=0.6, alpha=0.5)
         if np.isfinite(target_d):
             axes[1][j].axhline(target_d, color="g", ls="-.", lw=1.1)
-    fig.suptitle("Per-band: depth (top) and mid diameter (bottom) vs speed", y=0.99)
+    fig.suptitle("Per-band depth and mid-diameter vs speed", y=0.99)
     fig.tight_layout(rect=[0, 0.05, 1, 0.96])
     _legend(fig, colors)
     fig.savefig(out_dir / "figures" / "per_row.png", dpi=300, bbox_inches="tight")
@@ -231,7 +230,7 @@ def make_diameter_fit(df, out_dir, colors):
         ax = axes[0][j]
         g = d[d.band == band]
         if not len(g):
-            ax.set_title(f"band {band} (no data)"); continue
+            ax.set_title(f"band {band} — no data"); continue
         tgt = g.target_diameter_um.iloc[0]
         xr = np.array([g.drawn_diameter_um.min() * 0.9, g.drawn_diameter_um.max() * 1.1])
         ax.plot(xr, xr, color="grey", ls="--", lw=0.8, label="measured = drawn")
@@ -252,7 +251,7 @@ def make_diameter_fit(df, out_dir, colors):
         if j == 0:
             ax.set_ylabel("measured Ø (µm)  ▲ top (open)  ● mid (filled)")
         ax.legend(fontsize=7, loc="upper left")
-    fig.suptitle("Measured vs drawn diameter with linear fit (colour = passes)", y=1.0)
+    fig.suptitle("Measured vs drawn diameter with linear fit", y=1.0)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(out_dir / "figures" / "diameter_fit.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -283,14 +282,13 @@ def make_grid_overlays(results, out_dir):
             gx, gy = np.meshgrid(xs, ys)
             ax.plot(gx.ravel(), gy.ravel(), "r+", ms=4, mew=0.7)
         ax.set_title(f"c{sample.cell_id} b{sample.band}c{sample.col} "
-                     f"D{sample.nominal_diameter_um:g}\nP{sample.passes} S{sample.speed:g}"
+                     f"D{sample.nominal_diameter_um:g} P{sample.passes} S{sample.speed:g}"
                      + ("" if reliable else "  ⚠"),
                      fontsize=6, color=("black" if reliable else "firebrick"))
         ax.set_xticks([]); ax.set_yticks([])
     for idx in range(n, nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
-    fig.suptitle("Known pin grid on each array  (red + = design pin centres; "
-                 "⚠ = flagged)", y=1.0, fontsize=12)
+    fig.suptitle("Known pin grid on each array", y=1.0, fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.985])
     fig.savefig(out_dir / "figures" / "grid_overlays.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -459,7 +457,7 @@ def make_diameter_model(df, out_dir):
         lim = [min(lo_hi), max(lo_hi)]
         axes[0].plot(lim, lim, "k--", lw=0.8, alpha=0.6)
     axes[0].set_xlabel("model-predicted top Ø (µm)"); axes[0].set_ylabel("measured top Ø (µm)")
-    axes[0].set_title("Diameter model parity (per-band OLS on drawn, passes, speed)")
+    axes[0].set_title("Diameter model parity")
     axes[0].legend(fontsize=8); axes[0].grid(alpha=0.3)
     axes[1].axhline(0, color="grey", lw=0.8)
     axes[1].set_xlabel("model-predicted top Ø (µm)"); axes[1].set_ylabel("residual measured-predicted (µm)")

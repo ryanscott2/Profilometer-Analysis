@@ -926,8 +926,7 @@ def fig_depth_vs_dose(out_dir, per_band, targets):
         ax.legend(fontsize=7)
     for idx in range(len(bands), nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
-    fig.suptitle("Etch depth vs dose per band (colour = sample; curve = recommended dose-only fit)",
-                 y=1.0)
+    fig.suptitle("Etch depth vs dose per band", y=1.0)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     p = out_dir / "depth_vs_dose.png"
     fig.savefig(p, dpi=170, bbox_inches="tight"); plt.close(fig)
@@ -961,7 +960,7 @@ def fig_parity(out_dir, per_band, targets=None):        # targets unused; accept
         lim = [min(lo_hi), max(lo_hi)]
         axes[0].plot(lim, lim, "k--", lw=0.8, alpha=0.6)
     axes[0].set_xlabel("model-predicted depth (µm)"); axes[0].set_ylabel("measured depth (µm)")
-    axes[0].set_title("Depth model parity (per-band recommended model)")
+    axes[0].set_title("Depth model parity")
     axes[0].legend(fontsize=8); axes[0].grid(alpha=0.3)
     axes[1].axhline(0, color="grey", lw=0.8)
     axes[1].set_xlabel("model-predicted depth (µm)"); axes[1].set_ylabel("residual measured−predicted (µm)")
@@ -1011,7 +1010,7 @@ def fig_heatmap(out_dir, per_band, targets):
         ax.plot(g["speed"], g["passes"], "o", mfc="none", mec="crimson", ms=7, mew=1.2,
                 label="measured cells")
         ax.set_xlabel("scan speed (mm/s)"); ax.set_ylabel("passes")
-        ax.set_title(f"{R['label']}\npredicted depth ({rk}); white = target contour", fontsize=9)
+        ax.set_title(f"{R['label']} — predicted depth", fontsize=9)
         ax.legend(fontsize=7, loc="upper left")
     for idx in range(len(invertible), nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
