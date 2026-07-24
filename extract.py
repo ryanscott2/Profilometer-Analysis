@@ -142,16 +142,37 @@ class PinFinResult:
     # units, i.e. same reference as floor_um so prof-floor_um is height above the clean floor)
     rc: object = None
     prof: object = None
+    # actual registered pin centres in thumbnail px (col,row), for the alignment overlay only (not
+    # written to CSV).  Set for an oblique/triangular lattice, where a reconstructed rectangular
+    # cross-grid would not sit on the staggered pins; None for a rectangular grid (uses grid_*).
+    pin_centers_thumb: object = None
 
     def as_row(self) -> dict:
         d = self.__dict__.copy()
         for k in ("grid_phase", "thumb", "thumb_down", "grid_px_px", "grid_py_px",
-                  "rc", "prof"):
+                  "rc", "prof", "pin_centers_thumb"):
             d.pop(k, None)
         return d
 
 
 # ================================ core maths (ported from v1 extract.py) ==== #
+def _is_oblique_lattice(array, tol=0.03):
+    """True when the array's primitive basis is non-axis-aligned (triangular/oblique).
+
+    Axis-aligned pitches (a square/rectangular grid) support the usual X/Y-pitch QC; an oblique
+    lattice does not, so a couple of pitch-based QC comparisons are skipped for it."""
+    lv = getattr(array, "lattice_vectors", None)
+    if lv is None:
+        return False
+    lv = np.asarray(lv, float)
+
+    def axisness(v):
+        L = float(np.hypot(v[0], v[1]))
+        return (min(abs(float(v[0])), abs(float(v[1]))) / L) if L > 0 else 1.0
+
+    return axisness(lv[0]) >= tol or axisness(lv[1]) >= tol
+
+
 def _nearest_pin_um(shape, centers_local, pxu, pyu):
     """Distance (um) from every pixel to the nearest registered pin centre.
 
@@ -485,7 +506,11 @@ def extract_array(scan, placement, array, sample, *,
     meas_pitch_um = 0.5 * (meas_pitch_x_um + meas_pitch_y_um)
     pitch_x_um, pitch_y_um = known_px * pxu, known_py * pyu
     pitch_um = 0.5 * (pitch_x_um + pitch_y_um)
-    if abs(meas_pitch_um - pitch_um) > 0.25 * pitch_um and periodicity > 0.15:
+    # The autocorrelation QC compares the measured X/Y period to the design pitch.  On an oblique
+    # (triangular) lattice the X/Y autocorrelation periods are NOT the nearest-neighbour pitch
+    # (staggered rows), so this axis-aligned comparison is meaningless there -- skip the flag.
+    if (not _is_oblique_lattice(array)
+            and abs(meas_pitch_um - pitch_um) > 0.25 * pitch_um and periodicity > 0.15):
         flags.append(f"pitch meas {meas_pitch_um:.0f} vs design {pitch_um:.0f}")
 
     # --- mean pin by stacking the patches centred on each KNOWN pin (from the DXF lattice).
@@ -498,7 +523,11 @@ def extract_array(scan, placement, array, sample, *,
     rmax = 0.5 * pitch_um * 1.05
     rc, prof = _radial_profile(cell_c, pyu, pxu, rmax)
 
-    n_cells = sample.nx * sample.ny * lattice.get("coverage_frac", 1.0)
+    # Count visible pins.  An oblique (triangular) array does not fill its index box, so nx*ny
+    # overcounts -> use the actual pin count.  Rectangular arrays keep the exact prior nx*ny formula
+    # (byte-identical even for an intentionally-incomplete grid where n_pins != nx*ny).
+    n_cells = ((array.n_pins if _is_oblique_lattice(array) else sample.nx * sample.ny)
+               * lattice.get("coverage_frac", 1.0))
 
     # --- PRIMARY: classify pin / clean-floor / debris from the KNOWN DXF pin centres, and
     # take the floor and pin-top HEIGHTS from those classified pixel populations (robust to
@@ -567,6 +596,10 @@ def extract_array(scan, placement, array, sample, *,
 
     down = max(1, int(round(min(known_px, known_py) / 4)))
     thumb = np.where(valid, z0, np.nan)[::down, ::down]
+    # For an oblique/triangular lattice the alignment overlay must mark the ACTUAL pin centres --
+    # a reconstructed rectangular cross-grid (grid_*) would fall between the staggered pins.
+    pin_centers_thumb = (np.asarray(lattice["centers_local"], float) / down
+                         if _is_oblique_lattice(array) and len(lattice["centers_local"]) else None)
 
     res = PinFinResult(
         pitch_um=pitch_um, pitch_x_um=pitch_x_um, pitch_y_um=pitch_y_um,
@@ -582,7 +615,8 @@ def extract_array(scan, placement, array, sample, *,
         pin_sat_frac=pin_sat_frac,
         grid_phase=(lattice["phase"][0], lattice["phase"][1]),
         grid_px_px=float(known_px), grid_py_px=float(known_py),
-        thumb=thumb, thumb_down=down, rc=rc, prof=prof, **base,
+        thumb=thumb, thumb_down=down, rc=rc, prof=prof,
+        pin_centers_thumb=pin_centers_thumb, **base,
     )
     if make_qc:
         _qc(crop, z0, valid, cell_c, rc, prof, lattice, known_px, known_py,

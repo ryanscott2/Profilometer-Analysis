@@ -596,19 +596,54 @@ def _assign_grid_indices(cells, Pxpx, Pypx):
 
 
 # ------------------------------------------- marker-free DXF-pattern fallback #
+def _lattice_is_oblique(lattice_vectors, tol=0.03):
+    """True when a stored primitive basis is genuinely non-axis-aligned (triangular/oblique).
+
+    A square/rectangular grid has an axis-aligned basis ([[px,0],[0,py]]); a triangular or otherwise
+    oblique lattice does not.  The two are registered by different solvers, so the whole markerless
+    path branches on this."""
+    if lattice_vectors is None:
+        return False
+    lv = np.asarray(lattice_vectors, float)
+
+    def axisness(v):
+        L = float(np.hypot(v[0], v[1]))
+        return (min(abs(float(v[0])), abs(float(v[1]))) / L) if L > 0 else 1.0
+
+    return axisness(lv[0]) >= tol or axisness(lv[1]) >= tol
+
+
+def _lattice_min_step(basis):
+    """Shortest primitive translation of the lattice (its physical nearest-neighbour spacing)."""
+    a1, a2 = np.asarray(basis, float)
+    return float(min(np.hypot(*a1), np.hypot(*a2),
+                     np.hypot(*(a1 - a2)), np.hypot(*(a1 + a2))))
+
+
 def _uniform_lattice_alias_reason(template):
     """Describe a complete uniform lattice that needs finite-edge registration.
 
-    A single complete rectangular pin array has no internal absolute-phase feature: translating
-    it by one pitch retains the same interior.  Such arrays bypass the generic whole-pattern
-    matcher and are registered by :func:`_register_uniform_lattice`, which accepts an absolute
-    origin only when observed pin terminations identify both finite array indices.  Multi-array or
-    intentionally incomplete patterns are aperiodic and remain eligible for whole-pattern NCC.
+    A single complete pin array has no internal absolute-phase feature: translating it by one
+    lattice step retains the same interior.  Such arrays bypass the generic whole-pattern matcher
+    and are registered by :func:`_register_uniform_lattice` (which delegates oblique lattices to
+    :func:`_register_oblique_lattice`), accepting an absolute origin only when observed pin
+    terminations identify both finite array indices.  Multi-array or intentionally incomplete
+    patterns are aperiodic and remain eligible for whole-pattern NCC.
     """
     if len(template.arrays) != 1:
         return None
     a = template.arrays[0]
-    if a.nx < 2 or a.ny < 2 or a.n_pins != a.nx * a.ny:
+    if a.nx < 2 or a.ny < 2:
+        return None
+    if _lattice_is_oblique(getattr(a, "lattice_vectors", None)):
+        # A triangular/oblique lattice does not fill its index box (n_pins != nx*ny), so the
+        # rectangular completeness test does not apply -- but any periodic lattice still aliases
+        # under whole-pattern NCC, so route it to the finite-edge / phase-only solver.
+        if a.n_pins < 4:
+            return None
+        return (f"markerless DXF is a uniform oblique lattice (D{a.diameter_um:g} um, "
+                f"pitch {a.pitch_um:g} um); its interior has pitch-equivalent origins")
+    if a.n_pins != a.nx * a.ny:
         return None
     return (f"markerless DXF is a complete uniform {a.nx}x{a.ny} lattice "
             f"(D{a.diameter_um:g} um, pitch {a.pitch_x_um:g}x{a.pitch_y_um:g} um); "
@@ -890,6 +925,13 @@ def _register_uniform_lattice(scan, template, z0, valid, *, x_right_options=(-1,
     ``uniform-phase`` instead of claiming an absolute origin.
     """
     a = template.arrays[0]
+    if _lattice_is_oblique(getattr(a, "lattice_vectors", None)):
+        # A triangular/oblique lattice needs the general (non-orthogonal) solver.  The rectangular
+        # code below stays exactly as-is so square-grid behaviour is unchanged.
+        return _register_oblique_lattice(
+            scan, template, z0, valid, x_right_options=x_right_options,
+            y_up_options=y_up_options, angles_deg=angles_deg,
+            allow_phase_only=allow_phase_only)
     if not np.isclose(a.pitch_x_um, a.pitch_y_um, rtol=1e-6, atol=1e-6):
         raise RegistrationAmbiguityError(
             "Finite-edge markerless registration currently requires equal X/Y lattice pitch.")
@@ -1023,6 +1065,308 @@ def _register_uniform_lattice(scan, template, z0, valid, *, x_right_options=(-1,
         y_up=yu, x_right=xr, rotation_deg=float(angle), score=float(score),
         method=("uniform-phase" if ambiguous else "uniform-edge"), cell_row=1, cell_col=1,
         absolute_origin=not bool(ambiguous), ambiguous_axes="".join(ambiguous))]
+
+
+# ---------------------------------------- markerless OBLIQUE (triangular) lattice #
+# A triangular / hexagonal (or any non-orthogonal) array cannot be described by two independent
+# axis pitches, so the rectangular finite-edge solver above does not apply.  These functions are the
+# general-basis analogue: coherence is measured along the two RECIPROCAL basis directions, nodes are
+# laid on the true primitive basis, and finite-index scoring uses the DXF's ACTUAL occupied lattice
+# index set (a sheared parallelogram) instead of an nx*ny rectangle.  For an axis-aligned basis this
+# reduces to exactly the rectangular formulation, so no square-grid behaviour changes.
+def _fit_oblique_pose(centers_xy_um, basis, angle_limits=(-5.0, 5.0), min_components=9):
+    """Fit stage rotation + lattice phase for an arbitrary primitive ``basis`` (rows a1, a2).
+
+    Generalises :func:`_fit_uniform_lattice`: coherence and phase are taken along the two reciprocal
+    basis vectors (unit period in fractional-index units) rather than two orthogonal axes with a
+    single pitch.  ``basis`` is the design basis already reflected for the trial x_right/y_up, so the
+    fitted rotation composes with that reflection exactly as ``CellPlacement.dxf_to_px`` does.
+    Returns ``(angle_deg, phase_frac (2,), inlier_centers)``.
+    """
+    from scipy.optimize import minimize_scalar
+
+    A = np.asarray(basis, float)
+    Ainv = np.linalg.inv(A)
+    step = _lattice_min_step(A)
+    xy = np.asarray(centers_xy_um, float)
+    min_components = max(6, int(min_components))
+    if len(xy) < min_components:
+        raise RegistrationAmbiguityError(
+            f"Only {len(xy)} isolated pin components were found; at least {min_components} are "
+            "required to fit a markerless lattice reliably.")
+    lo, hi = map(float, angle_limits)
+    if not np.isfinite(lo + hi) or hi <= lo:
+        raise ValueError("uniform-lattice angle limits must be finite and increasing")
+
+    def _frac(angle_deg, pts):
+        th = np.deg2rad(angle_deg); c, s = np.cos(th), np.sin(th)
+        xr = c * pts[:, 0] + s * pts[:, 1]            # rotate points by -angle into the design frame
+        yr = -s * pts[:, 0] + c * pts[:, 1]
+        return np.column_stack([xr, yr]) @ Ainv       # fractional lattice indices (period 1)
+
+    def _coh(angle_deg, pts=xy):
+        f = _frac(angle_deg, pts)
+        zu = np.mean(np.exp(2j * np.pi * f[:, 0]))
+        zv = np.mean(np.exp(2j * np.pi * f[:, 1]))
+        return 0.5 * (abs(zu) + abs(zv))
+
+    coarse = np.linspace(lo, hi, max(41, int(np.ceil((hi - lo) / 0.05)) + 1))
+    a0 = float(coarse[int(np.argmax([_coh(a) for a in coarse]))])
+    half = max(0.06, 1.5 * (coarse[1] - coarse[0]))
+    bounds = (max(lo, a0 - half), min(hi, a0 + half))
+    angle = float(minimize_scalar(lambda a: -_coh(float(a)), bounds=bounds,
+                                  method="bounded", options={"xatol": 1e-5}).x)
+
+    def _phase_and_residual(pts, angle_deg):
+        f = _frac(angle_deg, pts)
+        zu = np.mean(np.exp(2j * np.pi * f[:, 0])); zv = np.mean(np.exp(2j * np.pi * f[:, 1]))
+        pu = float(np.angle(zu) / (2 * np.pi)) % 1.0
+        pv = float(np.angle(zv) / (2 * np.pi)) % 1.0
+        ru = (f[:, 0] - pu + 0.5) % 1.0 - 0.5         # fractional residual to nearest node
+        rv = (f[:, 1] - pv + 0.5) % 1.0 - 0.5
+        dr = np.column_stack([ru, rv]) @ A            # -> physical distance (um)
+        return np.array([pu, pv]), np.hypot(dr[:, 0], dr[:, 1]), 0.5 * (abs(zu) + abs(zv))
+
+    phase, residual, coherence = _phase_and_residual(xy, angle)
+    inlier = residual <= 0.24 * step
+    if inlier.sum() < min_components or inlier.mean() < 0.55 or coherence < 0.55:
+        raise RegistrationAmbiguityError(
+            f"Pin components do not support one reliable {step:g} um oblique lattice "
+            f"({int(inlier.sum())}/{len(xy)} inliers, coherence {coherence:.2f}). Check the DXF "
+            "pitch, tile stitching, and whether the scan contains more than one lattice phase.")
+    pts = xy[inlier]
+    angle = float(minimize_scalar(lambda a: -_coh(float(a), pts), bounds=bounds,
+                                  method="bounded", options={"xatol": 1e-6}).x)
+    phase, residual, coherence = _phase_and_residual(pts, angle)
+    pts = pts[residual <= 0.18 * step]
+    min_final = 6 if coherence >= 0.80 else 9
+    if len(pts) < min_final or coherence < 0.70:
+        raise RegistrationAmbiguityError(
+            f"Lattice phase remained unstable after robust fitting ({len(pts)} inliers, "
+            f"coherence {coherence:.2f}).")
+    phase, _residual, _coherence = _phase_and_residual(pts, angle)
+    return angle, phase, pts
+
+
+def _oblique_node_grid(pin_mask, valid, array, xppx, yppx, angle_deg, basis, phase_frac):
+    """Sample presence/absence at every testable oblique-lattice node that maps into the image.
+
+    Analogue of :func:`_uniform_node_grid` for a general basis.  Returns ``(qi, qj, testable,
+    present, AR)`` where ``qi``/``qj`` are integer index ranges, ``testable``/``present`` are 2-D
+    boolean arrays indexed ``[qj, qi]``, and ``AR`` (rows = a1,a2 rotated into the scan) maps a
+    fractional index to scan micrometres."""
+    H, W = pin_mask.shape
+    A = np.asarray(basis, float)
+    th = np.deg2rad(angle_deg); c, s = np.cos(th), np.sin(th)
+    AR = A @ np.array([[c, s], [-s, c]])              # design->scan: r_um = (phase + [i,j]) @ AR
+    Ainv = np.linalg.inv(A)
+    Rneg = np.array([[c, -s], [s, c]])               # scan_um @ Rneg @ Ainv - phase -> fractional
+    corners_um = np.array([[0, 0], [W, 0], [0, H], [W, H]], float) * np.array([xppx, yppx])
+    fc = (corners_um @ Rneg) @ Ainv - phase_frac
+    qi = np.arange(int(np.floor(fc[:, 0].min())) - 1, int(np.ceil(fc[:, 0].max())) + 2)
+    qj = np.arange(int(np.floor(fc[:, 1].min())) - 1, int(np.ceil(fc[:, 1].max())) + 2)
+    QI, QJ = np.meshgrid(qi, qj)                      # shape (len(qj), len(qi))
+    world = np.stack([QI + phase_frac[0], QJ + phase_frac[1]], axis=-1) @ AR
+    col = world[..., 0] / xppx; row = world[..., 1] / yppx
+
+    radius = 0.5 * float(array.diameter_um)
+    outer = radius * np.array([[0.0, 0.0], [1.05, 0.0], [-1.05, 0.0],
+                               [0.0, 1.05], [0.0, -1.05], [0.74, 0.74],
+                               [0.74, -0.74], [-0.74, 0.74], [-0.74, -0.74]])
+    testable = np.ones(QI.shape, bool)
+    for dx, dy in outer:
+        cc = np.rint(col + dx / xppx).astype(int); rr = np.rint(row + dy / yppx).astype(int)
+        inside = (cc >= 0) & (cc < W) & (rr >= 0) & (rr < H)
+        sample = np.zeros(QI.shape, bool); sample[inside] = valid[rr[inside], cc[inside]]
+        testable &= sample
+    inner = radius * np.array([[0.0, 0.0], [0.48, 0.0], [-0.48, 0.0],
+                               [0.0, 0.48], [0.0, -0.48], [0.34, 0.34],
+                               [0.34, -0.34], [-0.34, 0.34], [-0.34, -0.34]])
+    votes = np.zeros(QI.shape, np.int16)
+    for dx, dy in inner:
+        cc = np.rint(col + dx / xppx).astype(int); rr = np.rint(row + dy / yppx).astype(int)
+        inside = (cc >= 0) & (cc < W) & (rr >= 0) & (rr < H)
+        hit = np.zeros(QI.shape, bool); hit[inside] = pin_mask[rr[inside], cc[inside]]
+        votes += hit
+    present = testable & (votes >= 5)
+    return qi, qj, testable, present, AR
+
+
+def _oblique_indices(centers_um, basis):
+    """Integer lattice indices (0-based) of DXF pins under ``basis`` (rows a1,a2).
+
+    With ``basis`` rows a1,a2, a pin ``c = [i,j] @ basis`` so ``[i,j] = c @ inv(basis)``.  Indices
+    are taken RELATIVE to the first pin (``round(frac - frac[0])``) before the 0-basing, so the
+    shared fractional offset of the design origin from the lattice cannot destabilise rounding: a pin
+    whose fractional index lands near ...+0.5 would otherwise round inconsistently and shear the whole
+    index set (a half-step centring error that smears the mean pin)."""
+    Ainv = np.linalg.inv(np.asarray(basis, float))
+    frac = np.asarray(centers_um, float) @ Ainv
+    rel = np.rint(frac - frac[0]).astype(int)        # exact integer offsets from pin 0
+    return rel - rel.min(axis=0)                      # (N,2) 0-based indices
+
+
+def _register_oblique_lattice(scan, template, z0, valid, *, x_right_options=(-1, 1),
+                              y_up_options=(1, -1), angles_deg=None, allow_phase_only=False):
+    """Register one finite, markerless OBLIQUE (e.g. triangular) uniform array.
+
+    Mirrors :func:`_register_uniform_lattice` but on a general primitive basis: it fits pose,
+    enumerates every finite integer-translation hypothesis of the DXF's actual lattice-index set,
+    scores each on independent nodes, and requires both lattice axes to beat their nearest one-step
+    alias (area rule AND block-bootstrap lower bound).  With ``allow_phase_only`` an unresolved index
+    yields a centred pitch-equivalent ``uniform-phase`` placement instead of a false absolute origin.
+    """
+    a = template.arrays[0]
+    A0 = np.asarray(a.lattice_vectors, float)         # design-frame primitive basis (rows a1, a2)
+    xr = int(x_right_options[0]); yu = int(y_up_options[0])
+    A = A0 * np.array([xr, yu], float)                # reflect basis; pose fit aligns THIS to the scan
+    xppx, yppx = float(scan.x_um_per_px), float(scan.y_um_per_px)
+    pitch_px = 0.5 * (np.hypot(*A0[0]) / xppx + np.hypot(*A0[1]) / yppx)
+    pin_mask = _adaptive_pin_mask(z0, valid, pitch_px)
+    centers = _uniform_component_centers(pin_mask, a, xppx, yppx)
+    if angles_deg is None:
+        limits = (-5.0, 5.0)
+    else:
+        av = np.asarray(tuple(angles_deg), float)
+        if av.size < 2:
+            centre = float(av[0]) if av.size else 0.0
+            limits = (centre - 0.1, centre + 0.1)
+        else:
+            limits = (float(av.min()), float(av.max()))
+    angle, phase, _inliers = _fit_oblique_pose(
+        centers, A, limits, min_components=(6 if allow_phase_only else 9))
+    qi, qj, testable, present, AR = _oblique_node_grid(
+        pin_mask, valid, a, xppx, yppx, angle, A, phase)
+    n_present = int(present.sum())
+    present_i = np.flatnonzero(present.any(axis=0))   # qi columns holding a present node
+    present_j = np.flatnonzero(present.any(axis=1))   # qj rows holding a present node
+    phase_patch_ok = (n_present >= 6 and min(len(present_i), len(present_j)) >= 2
+                      and max(len(present_i), len(present_j)) >= 3)
+    absolute_patch_ok = (n_present >= 9 and len(present_i) >= 3 and len(present_j) >= 3)
+    if not (absolute_patch_ok or (allow_phase_only and phase_patch_ok)):
+        raise RegistrationAmbiguityError(
+            f"Only {n_present} testable pins spanning {len(present_i)}x{len(present_j)} lattice "
+            "lines were found; absolute finite-edge registration needs a 3x3 patch, while "
+            "phase-only registration needs at least a 2x3 patch.")
+
+    # DXF occupied lattice-index set (design basis; reflection preserves integer indices).
+    S = _oblique_indices(a.centers_um, A0)
+    Sj = int(S[:, 1].max()) + 1; Si = int(S[:, 0].max()) + 1
+    Smask = np.zeros((Sj, Si), bool)                 # [sj, si] to match present/testable [qj, qi]
+    Smask[S[:, 1], S[:, 0]] = True
+    Hn, Wn = present.shape
+    pbox = (int(present_i.min()), int(present_i.max()),
+            int(present_j.min()), int(present_j.max()))  # present bbox in grid-column/row indices
+
+    def _predict(lo_i, lo_j):
+        """2-D mask (over the node grid) of nodes a hypothesis with the DXF (0,0) pin at node
+        (lo_i, lo_j) predicts to hold a pin."""
+        pred = np.zeros((Hn, Wn), bool)
+        cc = lo_i - int(qi[0]); rr = lo_j - int(qj[0])          # where Smask[0,0] lands in the grid
+        tc0, tc1 = max(0, cc), min(Wn, cc + Si)
+        tr0, tr1 = max(0, rr), min(Hn, rr + Sj)
+        if tc1 <= tc0 or tr1 <= tr0:
+            return pred
+        pred[tr0:tr1, tc0:tc1] = Smask[tr0 - rr:tr1 - rr, tc0 - cc:tc1 - cc]
+        return pred
+
+    candidates = []
+    for lo_i in range(int(qi[0]) - Si + 1, int(qi[-1]) + 1):
+        if lo_i - int(qi[0]) > pbox[1] or lo_i - int(qi[0]) + Si - 1 < pbox[0]:
+            continue                                            # S footprint cannot cover any present col
+        for lo_j in range(int(qj[0]) - Sj + 1, int(qj[-1]) + 1):
+            if lo_j - int(qj[0]) > pbox[3] or lo_j - int(qj[0]) + Sj - 1 < pbox[2]:
+                continue
+            pred = _predict(lo_i, lo_j)
+            pt = pred & testable
+            matched = int((pred & present).sum())
+            total = int(pt.sum())
+            missing = total - matched
+            extra = n_present - matched
+            candidates.append((missing + extra, -matched, lo_i, lo_j, total, matched))
+    if not candidates:
+        raise RegistrationAmbiguityError(
+            "No finite oblique-lattice hypothesis overlaps the observed pins.")
+    candidates.sort()
+    best = candidates[0]
+    _err, _negmatch, best_i, best_j, total, matched = best
+    recall = matched / max(1, n_present)
+    precision = matched / max(1, total)
+    min_matched = 6 if allow_phase_only and not absolute_patch_ok else 9
+    if matched < min_matched or recall < 0.75 or precision < 0.70:
+        raise RegistrationAmbiguityError(
+            f"The best finite-array hypothesis explains only {matched}/{n_present} observed and "
+            f"{matched}/{total} predicted testable pins (recall {recall:.2f}, precision "
+            f"{precision:.2f}); the scan does not support this DXF reliably.")
+
+    best_pred = _predict(best_i, best_j)
+    evidence = {}
+    for axis, pos in (("i", 2), ("j", 3)):           # nearest alias one lattice step along a1 / a2
+        alt = next((cnd for cnd in candidates if cnd[pos] != best[pos]), None)
+        if alt is None:
+            evidence[axis] = (float("inf"), float("inf"), 0.0)
+            continue
+        alt_pred = _predict(alt[2], alt[3])
+        raw_margin = float(alt[0] - best[0])
+        expected = float(np.count_nonzero(best_pred ^ alt_pred))
+        boot_margin = _block_bootstrap_margin(
+            present, testable, best_pred, alt_pred,
+            seed=20260722 + (0 if axis == "i" else 1))
+        evidence[axis] = (raw_margin, boot_margin, expected)
+
+    ambiguous = [axis for axis, (raw, boot, exp) in evidence.items()
+                 if raw < _edge_margin_threshold(matched, exp) or boot <= 0.0]
+    if ambiguous and not allow_phase_only:
+        detail = ", ".join(f"{axis}: next alias +{evidence[axis][0]:g} node loss, "
+                           f"bootstrap 1% bound {evidence[axis][1]:g}" for axis in ambiguous)
+        raise RegistrationAmbiguityError(
+            "Uniform markerless oblique lattice phase was found, but the finite array index is not "
+            f"identifiable along {','.join(ambiguous)} ({detail}). Capture at least one physical "
+            "pin-termination edge plus roughly one step of valid floor in both lattice directions, "
+            "enable phase-only registration, or provide a trusted manual origin.")
+    if ambiguous:                                    # centre a pitch-equivalent representative
+        obs_i = qi[present.any(axis=0)]; obs_j = qj[present.any(axis=1)]
+        target_i = int(round(0.5 * (obs_i[0] + obs_i[-1] - (Si - 1))))
+        target_j = int(round(0.5 * (obs_j[0] + obs_j[-1] - (Sj - 1))))
+        pool = [cnd for cnd in candidates
+                if ("i" in ambiguous or cnd[2] == best_i)
+                and ("j" in ambiguous or cnd[3] == best_j)]
+        optimum = min((cnd[0], cnd[1]) for cnd in pool)
+        pool = [cnd for cnd in pool if (cnd[0], cnd[1]) == optimum]
+        best = min(pool, key=lambda cnd:
+                   ((cnd[2] - target_i) ** 2 if "i" in ambiguous else 0)
+                   + ((cnd[3] - target_j) ** 2 if "j" in ambiguous else 0))
+        _err, _negmatch, best_i, best_j, total, matched = best
+
+    # Origin = scan pixel of CAD (0,0).  Solve it from the FULL pin correspondence (each DXF pin k
+    # sits at node index (best_i,best_j)+S[k]) rather than assuming CAD (0,0) itself lands on a
+    # lattice node -- for an oblique array the design-origin corner generally does not, which would
+    # otherwise leave a half-step (half-pitch) offset that lands every pin on the trench floor.
+    node_idx = np.array([best_i, best_j], float) + S
+    node_px = ((phase + node_idx) @ AR) / np.array([xppx, yppx])   # fitted scan (col,row) of each pin
+    c = np.asarray(a.centers_um, float)
+    thc = np.deg2rad(angle); cc, ss = np.cos(thc), np.sin(thc)
+    cx = xr * c[:, 0]; cy = yu * c[:, 1]                           # dxf_to_px offset (origin excluded)
+    tcol = (cc * cx - ss * cy) / xppx
+    trow = (ss * cx + cc * cy) / yppx
+    origin_col = float(np.mean(node_px[:, 0] - tcol))
+    origin_row = float(np.mean(node_px[:, 1] - trow))
+    # Report ambiguity in scan x/y vocabulary.  Both lattice axes unresolved => the position is free
+    # in the whole plane ("xy").  A single unresolved oblique axis is labelled by its dominant scan
+    # component (an approximation: a lone oblique axis is not purely x or y).
+    if len(ambiguous) >= 2:
+        amb_str = "xy"
+    elif len(ambiguous) == 1:
+        vec = A0[0] if ambiguous[0] == "i" else A0[1]
+        amb_str = "x" if abs(vec[0]) >= abs(vec[1]) else "y"
+    else:
+        amb_str = ""
+    score = 2.0 * matched / max(1, total + n_present)
+    return [CellPlacement(
+        1, origin_col, origin_row, xppx, yppx,
+        y_up=yu, x_right=xr, rotation_deg=float(angle), score=float(score),
+        method=("uniform-phase" if ambiguous else "uniform-edge"), cell_row=1, cell_col=1,
+        absolute_origin=not bool(ambiguous), ambiguous_axes=amb_str)]
 
 
 def _marker_feature(z0, valid, pitch_px):

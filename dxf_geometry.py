@@ -93,6 +93,12 @@ class PinArray:
     y0_um: float
     x1_um: float
     y1_um: float
+    lattice_vectors: "np.ndarray | None" = None
+    #   (2,2) primitive translation vectors [a1; a2] (um) of the pin lattice, so every pin sits at
+    #   origin + i*a1 + j*a2 for integers i,j.  Axis-aligned ([[px,0],[0,py]]) for the usual
+    #   rectangular grid; genuinely oblique for a triangular/hex lattice.  ``nx``/``ny`` are the
+    #   integer index extents along a1/a2 (== the unique-line counts for a rectangular grid).  This
+    #   lets registration/extraction treat any Bravais lattice -- not just a square one -- correctly.
 
     @property
     def width_um(self) -> float:
@@ -440,6 +446,100 @@ def _nn_spacing(xy):
     return float(np.median(d[:, 1]))
 
 
+# ------------------------------------------------- general lattice basis ---- #
+# Not every pin array is a square (axis-aligned rectangular) grid: a triangular / hexagonal layout
+# packs alternate rows a half-pitch apart, so its two primitive translation vectors are NOT
+# orthogonal.  Projecting such a lattice onto independent x/y grid lines (``_unique_axis``) mis-reads
+# it as a half-filled rectangle (wrong pitch, ``n_pins != nx*ny``).  We therefore fit the actual
+# primitive basis (a1,a2) and only keep the axis-aligned unique-line path when the array really IS a
+# filled rectangular grid, so existing square layouts are unchanged bit-for-bit.
+RECT_FILL_MIN = 0.85        # filled rectangular grid: n_pins ~ nx*ny (a triangular grid fills ~0.5)
+AXIS_ALIGNED_TOL = 0.03     # min(|vx|,|vy|)/|v| below this => an axis-aligned (rectangular) basis vec
+LATTICE_RESID_FRAC = 0.12   # max per-pin index residual (fraction of a lattice step) for a clean fit
+
+
+def _gauss_reduce(a, b):
+    """Lagrange/Gauss lattice reduction -> the two shortest primitive vectors of the same lattice."""
+    a = np.array(a, float); b = np.array(b, float)
+    for _ in range(100):
+        if a @ a > b @ b:
+            a, b = b, a
+        m = round((a @ b) / (a @ a)) if (a @ a) > 0 else 0
+        b2 = b - m * a
+        if np.allclose(b2, b):
+            break
+        b = b2
+    if a @ a > b @ b:
+        a, b = b, a
+    return a, b
+
+
+def _axis_aligned_basis(a1, a2, tol=AXIS_ALIGNED_TOL):
+    """True when (a1,a2) is an axis-aligned rectangular basis (one ~x, one ~y)."""
+    def axisness(v):
+        L = float(np.hypot(*v))
+        return (min(abs(float(v[0])), abs(float(v[1]))) / L) if L > 0 else 1.0
+    return axisness(a1) < tol and axisness(a2) < tol
+
+
+def _fit_lattice_basis(xy):
+    """Detect the primitive lattice vectors of a regular 2-D point set (ANY Bravais lattice).
+
+    Returns ``dict(a1, a2, indices, resid_max)`` where ``indices`` are the integer per-pin lattice
+    indices (``xy = origin + i*a1 + j*a2``), or ``None`` when the points are not one clean lattice.
+    Robust to square, rectangular and oblique/triangular layouts alike.
+    """
+    from scipy.spatial import cKDTree
+    xy = np.asarray(xy, float)
+    if len(xy) < 4:
+        return None
+    tree = cKDTree(xy)
+    k = min(len(xy), 7)
+    d, idx = tree.query(xy, k=k)
+    nn = float(np.median(d[:, 1]))
+    if not (np.isfinite(nn) and nn > 0):
+        return None
+    vecs = []                                        # short neighbour displacements, sign-canonical
+    for i in range(len(xy)):
+        for jj in range(1, k):
+            v = xy[idx[i, jj]] - xy[i]
+            if np.hypot(v[0], v[1]) <= 1.35 * nn:
+                if v[1] < -1e-9 or (abs(v[1]) <= 1e-9 and v[0] < 0):
+                    v = -v                           # fold +v and -v into one cluster
+                vecs.append(v)
+    if len(vecs) < 2:
+        return None
+    vecs = np.asarray(vecs, float)
+    q = np.round(vecs / (nn / 4.0)).astype(int)      # cluster near-identical short vectors
+    _uniq, inv, cnt = np.unique(q, axis=0, return_inverse=True, return_counts=True)
+    means = np.array([vecs[inv == u].mean(axis=0) for u in range(len(_uniq))])
+    order = np.argsort(-cnt)
+    means = means[order]
+    a1 = means[0]                                     # most common short vector
+    a2 = None
+    for m in means[1:]:                               # shortest common vector not parallel to a1
+        cross = abs(float(a1[0] * m[1] - a1[1] * m[0]))
+        if cross > 0.2 * float(np.hypot(*a1) * np.hypot(*m)):     # angle from a1 > ~11.5 deg
+            a2 = m
+            break
+    if a2 is None:
+        return None
+    a1, a2 = _gauss_reduce(a1, a2)
+    M = np.column_stack([a1, a2])                     # xy - origin = M @ [i, j]^T
+    if abs(float(np.linalg.det(M))) < 1e-9:
+        return None
+    o = xy[np.lexsort((xy[:, 0], xy[:, 1]))[0]]       # bottom-left pin as the index origin
+    frac = (xy - o) @ np.linalg.inv(M).T              # fractional lattice indices (step = 1.0)
+    ij = np.round(frac)
+    resid_max = float(np.abs(frac - ij).max())        # deviation from a node, in lattice-step units
+    if resid_max > LATTICE_RESID_FRAC:
+        return None
+    ij = ij.astype(int)
+    if len(np.unique(ij, axis=0)) != len(ij):        # two pins share a node -> not a clean lattice
+        return None
+    return dict(a1=a1, a2=a2, indices=ij, resid_max=resid_max)
+
+
 def _build_arrays(pins_um, origin_um):
     """pins_um: (N,3) [x,y,r] in um (absolute). origin_um: (ox,oy) marker origin um.
     Return list[PinArray] with coordinates relative to origin_um (band/col unset)."""
@@ -466,17 +566,33 @@ def _build_arrays(pins_um, origin_um):
             uy = _unique_axis(bxy[:, 1], nn)
             px = float(np.median(np.diff(ux))) if len(ux) > 1 else float(nn)
             py = float(np.median(np.diff(uy))) if len(uy) > 1 else float(nn)
+            nx, ny = len(ux), len(uy)
+            lat_vecs = np.array([[px, 0.0], [0.0, py]], float)   # axis-aligned (rectangular) default
+            # A filled rectangular grid has n_pins ~ nx*ny; a triangular/oblique lattice fills only
+            # part of its index box, so ONLY then do we fit a general primitive basis.  This keeps
+            # every existing square/rectangular array on the exact unique-line pitch/nx/ny it had.
+            if len(bxy) < RECT_FILL_MIN * nx * ny:
+                fit = _fit_lattice_basis(bxy)
+                if fit is not None and not _axis_aligned_basis(fit["a1"], fit["a2"]):
+                    a1, a2 = fit["a1"], fit["a2"]
+                    ij = fit["indices"]
+                    nx = int(ij[:, 0].max() - ij[:, 0].min() + 1)   # index extents along a1, a2
+                    ny = int(ij[:, 1].max() - ij[:, 1].min() + 1)
+                    px = float(np.hypot(a1[0], a1[1]))              # |a1|,|a2| (== NN pitch for a
+                    py = float(np.hypot(a2[0], a2[1]))             #  triangular lattice) as the scale
+                    lat_vecs = np.array([a1, a2], float)
             rel = bxy - np.asarray(origin_um)
             arrays.append(PinArray(
                 array_id=-1, band=-1, col=-1,
                 diameter_um=float(np.mean(gdia[sel])),
                 diameter_std_um=float(np.std(gdia[sel])),
                 pitch_x_um=px, pitch_y_um=py,
-                nx=len(ux), ny=len(uy), n_pins=int(sel.sum()),
+                nx=nx, ny=ny, n_pins=int(sel.sum()),
                 centers_um=rel,
                 cx_um=float(rel[:, 0].mean()), cy_um=float(rel[:, 1].mean()),
                 x0_um=float(rel[:, 0].min()), y0_um=float(rel[:, 1].min()),
                 x1_um=float(rel[:, 0].max()), y1_um=float(rel[:, 1].max()),
+                lattice_vectors=lat_vecs,
             ))
     return arrays
 
