@@ -274,13 +274,19 @@ def make_grid_overlays(results, out_dir):
         ax.imshow(thumb, origin="lower", cmap="viridis",
                   vmin=np.nanpercentile(thumb, 2), vmax=np.nanpercentile(thumb, 98))
         d = res.thumb_down
-        pxf, pyf = res.grid_px_px / d, res.grid_py_px / d
-        ph_c, ph_r = res.grid_phase[1] / d, res.grid_phase[0] / d
-        if pxf > 1 and pyf > 1:
-            xs = np.arange(ph_c % pxf, W, pxf)
-            ys = np.arange(ph_r % pyf, H, pyf)
-            gx, gy = np.meshgrid(xs, ys)
-            ax.plot(gx.ravel(), gy.ravel(), "r+", ms=4, mew=0.7)
+        pc = getattr(res, "pin_centers_thumb", None)
+        if pc is not None and len(pc):
+            # oblique/triangular lattice: mark the actual registered pin centres (a reconstructed
+            # rectangular grid would not sit on the staggered pins)
+            ax.plot(pc[:, 0], pc[:, 1], "r+", ms=4, mew=0.7)
+        else:
+            pxf, pyf = res.grid_px_px / d, res.grid_py_px / d
+            ph_c, ph_r = res.grid_phase[1] / d, res.grid_phase[0] / d
+            if pxf > 1 and pyf > 1:
+                xs = np.arange(ph_c % pxf, W, pxf)
+                ys = np.arange(ph_r % pyf, H, pyf)
+                gx, gy = np.meshgrid(xs, ys)
+                ax.plot(gx.ravel(), gy.ravel(), "r+", ms=4, mew=0.7)
         ax.set_title(f"c{sample.cell_id} b{sample.band}c{sample.col} "
                      f"D{sample.nominal_diameter_um:g} P{sample.passes} S{sample.speed:g}"
                      + ("" if reliable else "  ⚠"),

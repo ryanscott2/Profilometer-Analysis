@@ -25,8 +25,8 @@ import pandas as pd
 
 import accel
 from dxf_geometry import read_design
-from register import (RegistrationAmbiguityError, _dealias_origin, _overlap_score,
-                      _register_by_pattern, rasterize_cell_pins, register_scan,
+from register import (RegistrationAmbiguityError, _dealias_origin, _lattice_is_oblique,
+                      _overlap_score, _register_by_pattern, rasterize_cell_pins, register_scan,
                       register_sample, scan_feature)
 from extract import ArraySample, extract_array
 from synth import SynthScan, synth_scan
@@ -1474,6 +1474,98 @@ def main():
             shutil.rmtree(_td3, ignore_errors=True)
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"multi-disjoint-snapshot path raised: {e!r}")
+
+    # ---------------------- 24. non-square (triangular) lattice: read + register + measure #
+    print("\n[24] non-square TRIANGULAR lattice: geometry + markerless registration + extraction")
+    try:
+        _tri = (
+            ("072326 D50 P100 TRIANGULAR.dxf", 50.0, 100.0, 2900,
+             "c3abc09a3f8cbf28f5d0f28e637661e0d5a62fbefb1f3c5ffabb33f19e1c42f8"),
+            ("072326 D100 P150 TRIANGULAR.dxf", 95.0, 150.0, 1254,
+             "4e5886b3cffb5b852ee7425495dd60a37810220faff6d64315e7227c8e615bda"),
+            ("072326 D300 P350 TRIANGULAR.dxf", 300.0, 350.0, 208,
+             "0e3d0c3dda4a376a693a68b370fab0922fd4b8148f99a6215cd7022ae7baff8c"),
+        )
+        for _name, _dia, _pitch, _npins, _sha in _tri:
+            _path = _resolve_dxf(_name, "triangular")
+            print(f"    {_name} source (read-only): {_path}")
+            _design = read_design(_path)
+            _cell = _design.cells[0]
+            _arr = _cell.arrays[0]
+            _lv = np.asarray(_arr.lattice_vectors, float)
+            ck.check(_canonical_dxf_sha256(_path) == _sha,
+                     f"#24 {_name}: fixture content is unchanged (LF/CRLF equivalent)")
+            ck.check(not _design.is_unit_cell and _design.n_markers == 0
+                     and len(_design.cells) == 1 and _cell.marker_polygon_um is None,
+                     f"#24 {_name}: parsed as one markerless cell")
+            ck.check(len(_cell.arrays) == 1 and _arr.n_pins == _cell.n_pins == _npins
+                     and abs(_arr.diameter_um - _dia) <= 1.0,
+                     f"#24 {_name}: single {_npins}-pin array, drawn D{_dia:g} um")
+            # NON-square lattice: the primitive basis is oblique and all six nearest neighbours sit
+            # at the pitch -- i.e. |a1| == |a2| == min(|a1-a2|, |a1+a2|) == pitch (a triangular
+            # lattice), whereas a square grid would give an axis-aligned basis with |a1-a2| = sqrt2*p.
+            _steps = [np.hypot(*_lv[0]), np.hypot(*_lv[1]),
+                      min(np.hypot(*(_lv[0] - _lv[1])), np.hypot(*(_lv[0] + _lv[1])))]
+            ck.check(_lattice_is_oblique(_lv)
+                     and max(abs(s - _pitch) for s in _steps) <= 1e-3
+                     and abs(_arr.pitch_um - _pitch) <= 1e-6,
+                     f"#24 {_name}: oblique (triangular) primitive basis, NN pitch {_pitch:g} um")
+
+            _scale = 10.0
+            _org = (60.0, 60.0)
+            _ang = 1.5
+            _p = _pitch / _scale
+            # (A) full-array markerless scan at a stage rotation -> absolute finite-edge lock
+            _full, _ = synth_scan(_cell, x_um_per_px=_scale, y_um_per_px=_scale, origin_px=_org,
+                                  marker=False, rotation_deg=_ang, depth_um=30.0, floor_um=60.0,
+                                  seed=740 + int(_dia))
+            _, _, _, _fv, _fz = scan_feature(_full)
+            _fp = _register_by_pattern(_full, _cell, _fz, _fv,
+                                       x_right_options=(1,), y_up_options=(1,))
+            ck.check(len(_fp) == 1 and _fp[0].method == "uniform-edge" and _fp[0].absolute_origin,
+                     f"#24 {_name}: full triangular array resolves an absolute finite-edge origin")
+            if _fp:
+                ck.check(max(abs(_fp[0].origin_col - _org[0]),
+                             abs(_fp[0].origin_row - _org[1])) <= 1.5
+                         and abs(_fp[0].rotation_deg - _ang) <= 0.05,
+                         f"#24 {_name}: absolute origin + {_ang:g} deg rotation recovered")
+
+            # (B) deep-interior FOV crop -> phase-only lock (position not absolute), yet the visible
+            # pins still yield accurate diameter/depth via the aligned oblique lattice.
+            _tf, _ = synth_scan(_cell, x_um_per_px=_scale, y_um_per_px=_scale, origin_px=_org,
+                                marker=False, depth_um=30.0, floor_um=60.0, taper_frac=0.2,
+                                seed=760 + int(_dia))
+            _allc = _arr.centers_um
+            _cx = _org[0] + _allc[:, 0].mean() / _scale
+            _cy = _org[1] + _allc[:, 1].mean() / _scale
+            _fov = int(2600 / _scale)
+            _H, _W = _tf.height_raw.shape
+            _c0, _c1 = max(0, int(_cx - _fov / 2)), min(_W, int(_cx + _fov / 2))
+            _r0, _r1 = max(0, int(_cy - _fov / 2)), min(_H, int(_cy + _fov / 2))
+            _sub = SynthScan(_tf.height_raw[_r0:_r1, _c0:_c1], _tf.intensity[_r0:_r1, _c0:_c1],
+                             _scale, _scale, _tf.z_um_per_digit)
+            _sp = register_sample(_sub, _cell, mirror_x=False)
+            ck.check(len(_sp) == 1 and _sp[0].method == "uniform-phase"
+                     and not _sp[0].absolute_origin and _sp[0].ambiguous_axes == "xy",
+                     f"#24 {_name}: interior crop -> honest phase-only lock (ambiguous xy)")
+            _ss = ArraySample(
+                filename="tri", vk4_stem="tri", cell_id=1, array_id=_arr.array_id,
+                band=_arr.band, col=_arr.col, passes=1, speed=100.0,
+                nominal_diameter_um=_arr.diameter_um, target_diameter_um=_arr.diameter_um,
+                nominal_pitch_um=_arr.pitch_um, nominal_pitch_x_um=_arr.pitch_x_um,
+                nominal_pitch_y_um=_arr.pitch_y_um, nx=_arr.nx, ny=_arr.ny,
+                cx_um=_arr.cx_um, cy_um=_arr.cy_um)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                _tr = extract_array(_sub, _sp[0], _arr, _ss, make_qc=False)
+            ck.check(abs(_tr.diameter_um - _dia) <= 5.0 and abs(_tr.depth_um - 30.0) <= 4.0
+                     and abs(_tr.pitch_um - _pitch) <= 1e-6 and 0 < _tr.n_cells < _arr.n_pins,
+                     f"#24 {_name}: triangular crop yields accurate D/depth (mid {_tr.diameter_um:.1f}, "
+                     f"depth {_tr.depth_um:.1f}) from the aligned lattice")
+            ck.check(_tr.pin_centers_thumb is not None and len(_tr.pin_centers_thumb) > 3,
+                     f"#24 {_name}: overlay marks actual triangular pin centres (not a square grid)")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"triangular-lattice path raised: {e!r}")
 
     df.to_csv(OUT / "synth_measurements.csv", index=False)
     print(f"\nWrote synthetic measurements + plots to {OUT}")
