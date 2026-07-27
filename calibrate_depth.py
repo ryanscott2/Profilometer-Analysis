@@ -716,7 +716,8 @@ def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude
         rec_key, rec_why = choose_recommended(sat, logd, inter)
         mixed = fit_mixedlm(g, alpha=alpha)
         per_band[b] = dict(g=g, sat=sat, logd=logd, inter=inter, rec_key=rec_key,
-                           rec_why=rec_why, mixed=mixed, label=_fmt_band(b, g, band_meta))
+                           rec_why=rec_why, mixed=mixed, label=_fmt_band(b, g, band_meta),
+                           label_short=_fmt_band_short(b, g, band_meta))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     write_report(out_dir, samples, gate_rep, units, per_band, targets, alpha,
@@ -762,6 +763,21 @@ def _fmt_band(b, g, band_meta=None):
                 f"drawn Ø present {drng} µm, n={len(g)})")
     pitch = g["nominal_pitch_um"].dropna().iloc[0] if g["nominal_pitch_um"].notna().any() else float("nan")
     return f"band {source_band} @ {pitch:g} µm pitch (drawn Ø {drng} µm, n={len(g)})"
+
+
+def _fmt_band_short(b, g, band_meta=None):
+    """Figure-title form of :func:`_fmt_band`: ``Band 1 — Ø 47.5–52.5 µm, pitch = 100 µm``. The full
+    label (drawn Ø actually present, n) stays in the text report, where there is room for it."""
+    source_band = b[0] if isinstance(b, tuple) else b
+    if band_meta and source_band in band_meta:            # user-defined band: declared range/pitch
+        dmin, dmax, pitch = band_meta[source_band]
+        drng = f"{dmin:g}–{dmax:g}"
+    else:
+        ds = sorted(g["drawn_diameter_um"].dropna().unique())
+        drng = f"{ds[0]:g}–{ds[-1]:g}" if ds else "?"
+        pitch = (g["nominal_pitch_um"].dropna().iloc[0]
+                 if g["nominal_pitch_um"].notna().any() else float("nan"))
+    return f"Band {source_band} — Ø {drng} µm, pitch = {pitch:g} µm"
 
 
 def _short_band(b):
@@ -947,12 +963,14 @@ def fig_depth_3d(out_dir, per_band, targets):
             pg2, sg2 = np.meshgrid([P.min(), P.max()], [S.min(), S.max()])
             ax.plot_surface(pg2, sg2, np.full(pg2.shape, float(t)), color="crimson",
                             alpha=0.12, linewidth=0)
-        ax.set_xlabel("passes", labelpad=8); ax.set_ylabel("speed (mm/s)", labelpad=8)
-        ax.set_zlabel("depth (µm)", labelpad=6)
-        ax.set_title(R["label"], fontsize=9); ax.view_init(elev=22, azim=-60)
+        ax.set_xlabel("passes", labelpad=8, fontsize=13)
+        ax.set_ylabel("speed (mm/s)", labelpad=8, fontsize=13)
+        ax.set_zlabel("depth (µm)", labelpad=6, fontsize=13)
+        ax.tick_params(labelsize=12)
+        ax.set_title(R["label_short"], fontsize=14); ax.view_init(elev=22, azim=-60)
         if idx == 0:
-            ax.legend(fontsize=7, loc="upper left")
-    fig.suptitle("Etch depth = f(passes, speed) per band", y=1.0)
+            ax.legend(fontsize=10, loc="upper left")
+    fig.suptitle("Etch depth = f(passes, speed) per band", y=1.0, fontsize=15)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     p = out_dir / "depth_vs_passes_speed_3d.png"
     fig.savefig(p, dpi=170, bbox_inches="tight"); plt.close(fig)
@@ -978,13 +996,14 @@ def fig_depth_vs_dose(out_dir, per_band, targets):
                     ls="none", label=str(s))
         for t in targets:
             ax.axhline(t, color="crimson", ls="--", lw=1)
-        ax.set_xlabel("dose = passes / speed"); ax.set_ylabel("depth (µm)")
-        ax.set_title(R["label"], fontsize=9); ax.grid(alpha=0.3)
+        ax.set_xlabel("dose = passes / speed", fontsize=13); ax.set_ylabel("depth (µm)", fontsize=13)
+        ax.tick_params(labelsize=12)
+        ax.set_title(R["label_short"], fontsize=14); ax.grid(alpha=0.3)
         if idx == 0:
-            ax.legend(fontsize=7)
+            ax.legend(fontsize=10)
     for idx in range(len(bands), nrows * ncols):             # blank any unused grid cell
         axes[idx // ncols][idx % ncols].axis("off")
-    fig.suptitle("Etch depth vs dose", y=1.0)
+    fig.suptitle("Etch depth vs dose", y=1.0, fontsize=15)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     p = out_dir / "depth_vs_dose.png"
     fig.savefig(p, dpi=170, bbox_inches="tight"); plt.close(fig)
@@ -1017,12 +1036,16 @@ def fig_parity(out_dir, per_band, targets=None):        # targets unused; accept
     if lo_hi:
         lim = [min(lo_hi), max(lo_hi)]
         axes[0].plot(lim, lim, "k--", lw=0.8, alpha=0.6)
-    axes[0].set_xlabel("model-predicted depth (µm)"); axes[0].set_ylabel("measured depth (µm)")
-    axes[0].set_title("Depth model parity")
-    axes[0].legend(fontsize=8); axes[0].grid(alpha=0.3)
+    axes[0].set_xlabel("model-predicted depth (µm)", fontsize=13)
+    axes[0].set_ylabel("measured depth (µm)", fontsize=13)
+    axes[0].set_title("Depth model parity", fontsize=15)
+    axes[0].legend(fontsize=11); axes[0].grid(alpha=0.3)
     axes[1].axhline(0, color="grey", lw=0.8)
-    axes[1].set_xlabel("model-predicted depth (µm)"); axes[1].set_ylabel("residual measured−predicted (µm)")
-    axes[1].set_title("residuals"); axes[1].grid(alpha=0.3)
+    axes[1].set_xlabel("model-predicted depth (µm)", fontsize=13)
+    axes[1].set_ylabel("residual measured−predicted (µm)", fontsize=13)
+    axes[1].set_title("residuals", fontsize=15); axes[1].grid(alpha=0.3)
+    for _a in axes:
+        _a.tick_params(labelsize=12)
     fig.tight_layout()
     p = out_dir / "depth_parity.png"
     fig.savefig(p, dpi=170); plt.close(fig)
@@ -1062,17 +1085,20 @@ def fig_heatmap(out_dir, per_band, targets):
         P, S = np.meshgrid(p_grid, s_grid)
         Z = _predict(rk, R["sat"], R["logd"], R["inter"], dose=P / S, passes=P, speed=S)
         pcm = ax.pcolormesh(s_grid, p_grid, Z.T, shading="auto", cmap="viridis")
-        fig.colorbar(pcm, ax=ax, label="predicted depth (µm)")
+        cb = fig.colorbar(pcm, ax=ax)
+        cb.set_label("predicted depth (µm)", fontsize=13); cb.ax.tick_params(labelsize=12)
         cs = ax.contour(s_grid, p_grid, Z.T, levels=levels, colors="white", linewidths=1.5)
-        ax.clabel(cs, fmt=lambda v: f"{v:g} µm", fontsize=8)
+        ax.clabel(cs, fmt=lambda v: f"{v:g} µm", fontsize=11)
         ax.plot(g["speed"], g["passes"], "o", mfc="none", mec="crimson", ms=7, mew=1.2,
                 label="measured cells")
-        ax.set_xlabel("scan speed (mm/s)"); ax.set_ylabel("passes")
-        ax.set_title(f"{R['label']} — predicted depth", fontsize=9)
-        ax.legend(fontsize=7, loc="upper left")
+        ax.set_xlabel("scan speed (mm/s)", fontsize=13); ax.set_ylabel("passes", fontsize=13)
+        ax.tick_params(labelsize=12)
+        ax.set_title(R["label_short"], fontsize=14)
+        ax.legend(fontsize=10, loc="upper left")
     for idx in range(len(invertible), nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
-    fig.suptitle("Predicted etch depth over passes × speed, with target-depth contours", y=1.0)
+    fig.suptitle("Predicted etch depth over passes × speed, with target-depth contours", y=1.0,
+                 fontsize=15)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     p = out_dir / "depth_heatmap.png"
     fig.savefig(p, dpi=170, bbox_inches="tight"); plt.close(fig)
