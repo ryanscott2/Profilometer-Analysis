@@ -473,6 +473,12 @@ def _resample_cell(field, placement, template, valid, res_um=2.0, box=None):
     return out.reshape(ny, nx), (x0, x1, y0, y1)
 
 
+def _cb(cb, label, fontsize=14):
+    """Label a cell-report colorbar at the report's type size (label + tick labels together)."""
+    cb.set_label(label, fontsize=fontsize); cb.ax.tick_params(labelsize=fontsize)
+    return cb
+
+
 def _overlay_design(ax, template, res_by_array, box=None):
     """Red pin + alignment-marker outlines, dashed array dividers, per-array D/P + discrepancy."""
     if np.isfinite(template.marker_size_um):                             # markerless cells have none
@@ -487,7 +493,7 @@ def _overlay_design(ax, template, res_by_array, box=None):
         txt = f"D{a.diameter_um:g} P{a.pitch_um:g}"
         if r is not None and np.isfinite(r.diameter_um) and a.diameter_um:
             txt += f" {100*(r.diameter_um-a.diameter_um)/a.diameter_um:+.0f}%"
-        ax.text(a.x0_um - 10, a.y1_um + 26, txt, color="red", fontsize=6.5,
+        ax.text(a.x0_um - 10, a.y1_um + 26, txt, color="red", fontsize=10.5,
                 va="bottom", ha="left")
     x0, x1, y0, y1 = box if box is not None else _cell_content_box(template)
     ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
@@ -518,14 +524,15 @@ def render_cell_report(scan, placement, template, res_by_array, params, path, bo
     im = ax0.imshow(zdisp, origin="lower", extent=ext, cmap="viridis", vmin=0, vmax=vmax,
                     aspect="equal")
     _overlay_design(ax0, template, res_by_array, box=box)
-    plt.colorbar(im, ax=ax0, shrink=0.85, label="height above floor (µm)")
-    ax0.set_title("Height above floor")
+    _cb(plt.colorbar(im, ax=ax0, shrink=0.85), "height above floor (µm)")
+    ax0.set_title("Height above floor", fontsize=16)
     if inten is not None:
         im1 = ax1.imshow(inten, origin="lower", extent=ext, cmap="gray", aspect="equal",
                          vmin=np.nanpercentile(inten, 2), vmax=np.nanpercentile(inten, 98))
-        plt.colorbar(im1, ax=ax1, shrink=0.85, label="intensity")   # keeps x-axes aligned
+        _cb(plt.colorbar(im1, ax=ax1, shrink=0.85), "intensity")    # keeps x-axes aligned
     _overlay_design(ax1, template, res_by_array, box=box)
-    ax1.set_title("Intensity")
+    ax1.set_title("Intensity", fontsize=16)
+    ax0.tick_params(labelsize=14); ax1.tick_params(labelsize=14)    # ax1 shares ax0's axes
 
     axr = fig.add_subplot(gs[:, 1]); axr.axis("off")
 
@@ -536,7 +543,7 @@ def render_cell_report(scan, placement, template, res_by_array, params, path, bo
     title = (f"Unit cell (row {placement.cell_row}, col {placement.cell_col})   —   {lp}\n"
              f"cell marker in sample: x = {cx:.2f} mm, y = {cy:.2f} mm   ·   "
              f"registration {placement.score:.2f}")
-    axr.text(0.0, 1.0, title, transform=axr.transAxes, va="top", fontsize=13, weight="bold")
+    axr.text(0.0, 1.0, title, transform=axr.transAxes, va="top", fontsize=17, weight="bold")
 
     def _f(v):
         return f"{v:.1f}" if np.isfinite(v) else "—"
@@ -554,12 +561,13 @@ def render_cell_report(scan, placement, template, res_by_array, params, path, bo
     _th = min(0.82, 0.09 * (len(rows_t) + 1))            # scale height with #rows (no tall stretch)
     tbl = axr.table(cellText=rows_t, colLabels=col_labels, cellLoc="center",
                     bbox=[0.0, 0.80 - _th, 1.0, _th])
-    tbl.auto_set_font_size(False); tbl.set_fontsize(8)
+    tbl.auto_set_font_size(False); tbl.set_fontsize(12)
+    tbl.auto_set_column_width(col=list(range(len(col_labels))))   # headers need it at this size
     for c in range(len(col_labels)):
         tbl[0, c].set_facecolor("#dddddd"); tbl[0, c].set_text_props(weight="bold")
     axr.text(0.0, 0.86, "Ø floor is '—' where redeposition debris buries the pin base "
              "(see debris%); Ø top/nom are the reliable measures.",
-             transform=axr.transAxes, va="top", fontsize=8, style="italic", color="0.3")
+             transform=axr.transAxes, va="top", fontsize=12, style="italic", color="0.3")
 
     fig.tight_layout()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -990,14 +998,15 @@ def build_snapshot_montage(tiles, template, *, res_um=2.0, gutter_px=24):
                 gutter_px=gutter_px)
 
 
-def _annotate_snapshot_panels(ax, boxes, canvas_h):
+def _annotate_snapshot_panels(ax, boxes, canvas_h, *, fontsize=12):
     """Label each tiled panel with its snapshot name (Center / TopLeft / ...) in a boxed callout
     above the panel, so the reader can tell which crop is which. Adds headroom above the panels so
     the labels are never clipped. ``canvas_h`` is the composited canvas height in pixels."""
     ax.set_ylim(-0.03 * canvas_h, canvas_h * 1.16)          # headroom for the labels above panels
     for b in boxes:
         ax.text(0.5 * (b["c0"] + b["c1"]), b["r1"] + 0.02 * canvas_h, b["label"],
-                color="black", ha="center", va="bottom", fontsize=12, weight="bold", clip_on=False,
+                color="black", ha="center", va="bottom", fontsize=fontsize, weight="bold",
+                clip_on=False,
                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.6", alpha=0.9))
 
 
@@ -1082,7 +1091,9 @@ def save_3d_pin_map(scan, placement, template, array, path, *, res_um=2.0, block
     Height is design-oriented (via the registration transform) and referenced to the local trench
     floor (floor = 0). The axes are rendered at TRUE physical aspect (one micron is the same length
     on x, y and z), so pin height/taper read at real proportions. Returns True if a map was written,
-    False when too little of the block is in frame."""
+    False when too little of the block is in frame.
+
+    Drawn as a presentation figure throughout: low camera, tight framing, large type, 300 dpi."""
     box = _center_block_box(scan, placement, array, block=block)
     if box is None:
         return False
@@ -1097,24 +1108,28 @@ def save_3d_pin_map(scan, placement, template, array, path, *, res_um=2.0, block
     zf = np.nan_to_num(z, nan=0.0)                        # scan-edge gaps drop to the floor
     vmax = np.nanpercentile(z, 99.5)
     vmax = float(vmax) if np.isfinite(vmax) and vmax > 0 else 1.0
-    fig = plt.figure(figsize=(9, 6))
+    fig = plt.figure(figsize=(10, 6.5))
     ax = fig.add_subplot(111, projection="3d")
     surf = ax.plot_surface(xx, yy, zf, cmap="viridis", vmin=0, vmax=vmax,
                            rcount=160, ccount=160, linewidth=0, antialiased=True)
-    ax.set_xlabel("x (µm)", labelpad=18); ax.set_ylabel("y (µm)", labelpad=18)  # clear the ticks
+    ax.set_xlabel("x (µm)", labelpad=18, fontsize=14)     # labelpad clears the ticks
+    ax.set_ylabel("y (µm)", labelpad=18, fontsize=14)
     ax.set_zlabel("")                                     # height shown on the colorbar (no overlap)
-    ax.set_title(f"3D height — D{array.diameter_um:g} P{array.pitch_um:g}", fontsize=12)
-    ax.view_init(elev=28, azim=-55)
+    ax.set_title(f"3D height — D{array.diameter_um:g} P{array.pitch_um:g}", fontsize=17)
+    ax.view_init(elev=20, azim=-55)                       # low camera, so height reads at a glance
     ztop = float(np.nanmax(zf))
     ax.set_zlim(0, max(1.0, ztop)); ax.set_zticks([0, round(ztop)])  # only 0 + top tick (rest cramp)
+    ax.tick_params(labelsize=13)
     dz = max(1e-6, ztop - float(np.nanmin(zf)))
-    ax.set_box_aspect((x1 - x0, y1 - y0, dz), zoom=1.25)  # TRUE aspect, zoomed in to fill the frame
-    fig.colorbar(surf, ax=ax, shrink=0.5, pad=0.22, label="height above floor (µm)")
-    if param_label:                                       # laser-parameter info box, bottom-left
-        ax.text2D(0.02, 0.02, param_label, transform=ax.transAxes, fontsize=11, va="bottom",
-                  ha="left", bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="0.5", alpha=0.9))
+    # TRUE aspect (1 µm is the same length on x, y, z), zoomed in to fill the frame.
+    ax.set_box_aspect((x1 - x0, y1 - y0, dz), zoom=1.4)
+    cb = fig.colorbar(surf, ax=ax, shrink=0.55, pad=0.22)
+    cb.set_label("height above floor (µm)", fontsize=14); cb.ax.tick_params(labelsize=13)
+    if param_label:                                       # laser-parameter info box, top-left
+        ax.text2D(0.02, 0.98, param_label, transform=ax.transAxes, fontsize=15, va="top", ha="left",
+                  bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="0.5", alpha=0.9))
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
+    fig.savefig(path, dpi=300, bbox_inches="tight"); plt.close(fig)
     return True
 
 
@@ -1123,8 +1138,9 @@ def write_3d_pin_maps(figures_dir, items, template, *, res_um=2.0):
 
     ``items`` : list of ``(subdir, scan, placement, param_label)`` -- ``subdir`` is a per-cell /
     per-snapshot folder name (e.g. ``cell_x2_y1`` or ``Center``), or ``None`` to write straight into
-    the root (single cell); ``param_label`` is the laser-parameter string shown in a bottom-left info
-    box (``""`` to omit). One PNG per array, named ``array{id}_D{d}_P{p}.png``."""
+    the root (single cell); ``param_label`` is the laser-parameter string shown in a top-left info
+    box (``""`` to omit). One PNG per array, named ``array{id}_D{d}_P{p}.png``. Every map is
+    presentation-styled (see :func:`save_3d_pin_map`), so any of them can go straight on a slide."""
     root = Path(figures_dir) / "3D height map"
     n = 0
     for sub, scan, placement, param_label in items:
@@ -1188,24 +1204,26 @@ def render_snapshot_cell_report(tiles, template, avg_by_array, dose_label, path,
     if m is None:
         return
     canvas, icanvas, boxes = m["canvas"], m["intensity"], m["boxes"]
-    fig = plt.figure(figsize=(19, 10))
+    fig = plt.figure(figsize=(21, 10))                    # wider: the table needs it at 12 pt
     gs = GridSpec(2, 2, width_ratios=[1.5, 1.0], figure=fig)
     axh = fig.add_subplot(gs[0, 0]); axi = fig.add_subplot(gs[1, 0])
     imh = axh.imshow(canvas, origin="lower", cmap="viridis", vmin=0, vmax=m["vmax"], aspect="equal")
-    axh.set_xticks([]); axh.set_yticks([]); axh.set_title("Height above floor — snapshots tiled")
-    _annotate_snapshot_panels(axh, boxes, canvas.shape[0])
-    plt.colorbar(imh, ax=axh, shrink=0.8, label="height above local floor (µm)")
+    axh.set_xticks([]); axh.set_yticks([])
+    axh.set_title("Height above floor — snapshots tiled", fontsize=16)
+    _annotate_snapshot_panels(axh, boxes, canvas.shape[0], fontsize=16)
+    _cb(plt.colorbar(imh, ax=axh, shrink=0.8), "height above local floor (µm)")
     if icanvas is not None and m["ivmax"] is not None:
         imi = axi.imshow(icanvas, origin="lower", cmap="gray",
                          vmin=m["ivmin"], vmax=m["ivmax"], aspect="equal")
-        _annotate_snapshot_panels(axi, boxes, icanvas.shape[0])
-        plt.colorbar(imi, ax=axi, shrink=0.8, label="intensity")
-    axi.set_xticks([]); axi.set_yticks([]); axi.set_title("Intensity — snapshots tiled")
+        _annotate_snapshot_panels(axi, boxes, icanvas.shape[0], fontsize=16)
+        _cb(plt.colorbar(imi, ax=axi, shrink=0.8), "intensity")
+    axi.set_xticks([]); axi.set_yticks([])
+    axi.set_title("Intensity — snapshots tiled", fontsize=16)
 
     axr = fig.add_subplot(gs[:, 1]); axr.axis("off")
     names = ", ".join(t["label"] for t in tiles)
     axr.text(0.0, 1.0, f"Averaged cell — {len(tiles)} snapshots ({names})   —   {dose_label}",
-             transform=axr.transAxes, va="top", fontsize=13, weight="bold")
+             transform=axr.transAxes, va="top", fontsize=17, weight="bold")
 
     def _f(v):
         return f"{v:.1f}" if np.isfinite(v) else "—"
@@ -1220,16 +1238,48 @@ def render_snapshot_cell_report(tiles, template, avg_by_array, dose_label, path,
                        f"{r.meas_pitch_um:.0f}/{a.pitch_um:g}", f"{100 * r.debris_fraction:.0f}"])
     col_labels = ["array (D/P)", "depth µm", "Ø top", "Ø nom", "Ø floor",
                   "pitch m/e", "debris%"]
+    tbl_bottom = 0.80
     if rows_t:
         _th = min(0.82, 0.09 * (len(rows_t) + 1))
+        tbl_bottom = 0.80 - _th
         tbl = axr.table(cellText=rows_t, colLabels=col_labels, cellLoc="center",
-                        bbox=[0.0, 0.80 - _th, 1.0, _th])
-        tbl.auto_set_font_size(False); tbl.set_fontsize(8)
+                        bbox=[0.0, tbl_bottom, 1.0, _th])
+        tbl.auto_set_font_size(False); tbl.set_fontsize(12)
+        tbl.auto_set_column_width(col=list(range(len(col_labels))))  # headers need it at this size
         for c in range(len(col_labels)):
             tbl[0, c].set_facecolor("#dddddd"); tbl[0, c].set_text_props(weight="bold")
     axr.text(0.0, 0.86, "Values are the mean over the snapshots (replicate views of one uniform "
              "cell); Ø top/nom are the reliable measures.",
-             transform=axr.transAxes, va="top", fontsize=8, style="italic", color="0.3")
+             transform=axr.transAxes, va="top", fontsize=12, style="italic", color="0.3")
+    # Mean radial pin profile in the space left under the table (one line per array geometry, same
+    # curve as figures/radial_overlays/). Skipped when a tall table leaves no room.
+    _ph = (tbl_bottom - 0.10) - 0.06
+    if _ph >= 0.22:
+        axp = axr.inset_axes([0.10, 0.06, 0.86, _ph])
+        drew = False
+        for a in sorted(template.arrays, key=lambda a: a.array_id):
+            r = avg_by_array.get(a.array_id)
+            if r is None or getattr(r, "rc", None) is None or getattr(r, "prof", None) is None:
+                continue
+            rc = np.asarray(r.rc, float); prof = np.asarray(r.prof, float)
+            if not np.isfinite(prof).any():
+                continue
+            floor = r.floor_um if np.isfinite(r.floor_um) else np.nanmin(prof)
+            z = prof - floor
+            depth = r.depth_um if np.isfinite(r.depth_um) else np.nanmax(z)
+            ln, = axp.plot(rc, z, "-", lw=1.8,
+                           label=f"D{a.diameter_um:g} P{a.pitch_um:g} — depth {depth:.0f} µm")
+            axp.axvline(a.diameter_um / 2, color=ln.get_color(), ls=":", lw=1.1)
+            drew = True
+        if drew:
+            axp.axhline(0, color="grey", lw=0.8)
+            axp.set_xlabel("radius from pin centre (µm)", fontsize=13)
+            axp.set_ylabel("mean height above floor (µm)", fontsize=13)
+            axp.set_title("Mean radial pin profile — averaged over snapshots "
+                          "(dotted = drawn radius)", fontsize=13)
+            axp.tick_params(labelsize=12); axp.grid(alpha=0.3); axp.legend(fontsize=12)
+        else:
+            axp.remove()
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=150); plt.close(fig)
     print(f"Wrote {path}")
