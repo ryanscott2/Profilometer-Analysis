@@ -189,8 +189,11 @@ if __name__ == "__main__":       # pragma: no cover
     design = read_design(next((here / "DXF").glob("*.dxf")))
     scan, truth = synth_scan(design.cells[0])
     fig, ax = plt.subplots(1, 2, figsize=(16, 7))
-    ax[0].imshow(scan.height_um, origin="lower", cmap="viridis"); ax[0].set_title("height")
-    ax[1].imshow(scan.intensity, origin="lower", cmap="gray"); ax[1].set_title("intensity")
+    ax[0].imshow(scan.height_um, origin="lower", cmap="viridis")
+    ax[1].imshow(scan.intensity, origin="lower", cmap="gray")
+    ax[0].set_title("height", fontsize=16); ax[1].set_title("intensity", fontsize=16)
+    for _a in ax:                                        # same +4-over-default type size as the
+        _a.tick_params(labelsize=14)                     # figures in run_sample.py / report.py
     out = here / "Results" / "synth_preview.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=120); print("wrote", out, "truth origin", truth["origins"])

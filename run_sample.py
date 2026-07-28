@@ -474,7 +474,7 @@ def _resample_cell(field, placement, template, valid, res_um=2.0, box=None):
 
 
 def _cb(cb, label, fontsize=14):
-    """Label a cell-report colorbar at the report's type size (label + tick labels together)."""
+    """Label a colorbar at the figure's presentation type size (label + tick labels together)."""
     cb.set_label(label, fontsize=fontsize); cb.ax.tick_params(labelsize=fontsize)
     return cb
 
@@ -497,7 +497,8 @@ def _overlay_design(ax, template, res_by_array, box=None):
                 va="bottom", ha="left")
     x0, x1, y0, y1 = box if box is not None else _cell_content_box(template)
     ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
-    ax.set_xlabel("x (µm, design)"); ax.set_ylabel("y (µm, design)")
+    ax.set_xlabel("x (µm, design)", fontsize=14)     # matches the report's 14 pt tick labels
+    ax.set_ylabel("y (µm, design)", fontsize=14)
 
 
 def render_cell_report(scan, placement, template, res_by_array, params, path, box=None):
@@ -538,8 +539,8 @@ def render_cell_report(scan, placement, template, res_by_array, params, path, bo
 
     cx = placement.origin_col * scan.x_um_per_px / 1000
     cy = placement.origin_row * scan.y_um_per_px / 1000
-    lp = (f"P{params.passes} S{params.speed:g}" if params and params.valid
-          else "laser params: (fill CSV/cell_params.csv)")
+    lp = (f"P{params.passes}_S{params.speed:g}" if params and params.valid   # P{p}_S{s}, as in
+          else "laser params: (fill CSV/cell_params.csv)")                   # the averaged report
     title = (f"Unit cell (row {placement.cell_row}, col {placement.cell_col})   —   {lp}\n"
              f"cell marker in sample: x = {cx:.2f} mm, y = {cy:.2f} mm   ·   "
              f"registration {placement.score:.2f}")
@@ -565,9 +566,6 @@ def render_cell_report(scan, placement, template, res_by_array, params, path, bo
     tbl.auto_set_column_width(col=list(range(len(col_labels))))   # headers need it at this size
     for c in range(len(col_labels)):
         tbl[0, c].set_facecolor("#dddddd"); tbl[0, c].set_text_props(weight="bold")
-    axr.text(0.0, 0.86, "Ø floor is '—' where redeposition debris buries the pin base "
-             "(see debris%); Ø top/nom are the reliable measures.",
-             transform=axr.transAxes, va="top", fontsize=12, style="italic", color="0.3")
 
     fig.tight_layout()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -602,18 +600,20 @@ def make_param_summary(df, out_dir):
             ax.plot(gg["speed"], gg[metric], "o-", color=colors[pas], ms=10, mew=1.2,
                     label=f"{pas} passes")
             for _, r in gg.iterrows():
-                ax.annotate(r["label"], (r["speed"], r[metric]), fontsize=7,
+                ax.annotate(r["label"], (r["speed"], r[metric]), fontsize=11,
                             textcoords="offset points", xytext=(6, 6), color="0.25")
         if ref[0] is not None:
             ax.axhline(ref[0], color="grey", ls="--", lw=1)
             if ref[1]:
                 ax.text(0.01, ref[0], " " + ref[1], transform=ax.get_yaxis_transform(),
-                        va="bottom", color="grey", fontsize=8)
-        ax.set_ylabel(ylab); ax.set_xscale("log"); ax.grid(alpha=0.3)
+                        va="bottom", color="grey", fontsize=12)
+        # +4 pt over the old literals / the inherited defaults, as in make_param_depth_scatter
+        ax.set_ylabel(ylab, fontsize=14); ax.tick_params(labelsize=14)
+        ax.set_xscale("log"); ax.grid(alpha=0.3)
     axes[0].set_xticks(speeds); axes[0].set_xticklabels([f"{s:g}" for s in speeds])
-    axes[1].set_xlabel("scan speed (mm/s, log axis)")
-    axes[0].legend(title="passes", fontsize=9)
-    axes[0].set_title("Laser-parameter effect on depth and diameter")
+    axes[1].set_xlabel("scan speed (mm/s, log axis)", fontsize=14)
+    axes[0].legend(title="passes", fontsize=13, title_fontsize=14)
+    axes[0].set_title("Laser-parameter effect on depth and diameter", fontsize=16)
     fig.tight_layout()
     p = Path(out_dir) / "figures" / "param_summary.png"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -667,20 +667,24 @@ def make_param_depth_scatter(df, out_dir):
         ax.plot(gg["speed"], gg["depth"], "o-", color=colors[pas], ms=10, mew=1.2,
                 mec="0.15", label=f"{pas} passes", zorder=3)
         for _, r in gg.iterrows():
-            ax.annotate(r["label"], (r["speed"], r["depth"]), fontsize=7, ha="center",
+            ax.annotate(r["label"], (r["speed"], r["depth"]), fontsize=11, ha="center",
                         textcoords="offset points", xytext=(0, 10), color="0.25", zorder=4)
 
+    # every font here is 4 pt above what it would otherwise be -- the annotations/legends over their
+    # earlier literals, the title/labels/ticks over the matplotlib defaults they used to inherit
+    # (12/10/10 pt) -- so the figure stays legible when dropped into a slide at reduced size.
     ax.axhline(55, color="grey", ls="--", lw=1)
     ax.text(0.01, 55, " design target 55 µm", transform=ax.get_yaxis_transform(),
-            va="bottom", color="grey", fontsize=8)
+            va="bottom", color="grey", fontsize=12)
     ax.set_xscale("log")
     ax.set_xticks(speeds); ax.set_xticklabels([f"{s:g}" for s in speeds])
-    ax.set_xlabel("scan speed (mm/s, log axis)")
-    ax.set_ylabel("etch depth (µm)")
+    ax.tick_params(labelsize=14)
+    ax.set_xlabel("scan speed (mm/s, log axis)", fontsize=14)
+    ax.set_ylabel("etch depth (µm)", fontsize=14)
     ax.grid(alpha=0.3)
-    ax.set_title("Etch depth vs laser parameters")
+    ax.set_title("Etch depth vs laser parameters", fontsize=16)
 
-    passes_leg = ax.legend(title="passes", fontsize=9, loc="upper right")
+    passes_leg = ax.legend(title="passes", fontsize=13, title_fontsize=14, loc="upper right")
     ax.add_artist(passes_leg)
     shape_handles = []
     for fam, (marker, _) in fam_style.items():
@@ -691,7 +695,7 @@ def make_param_depth_scatter(df, out_dir):
                                     ms=8, label=f"{fam} array (drawn Ø {lo:g}–{hi:g} µm)"))
     shape_handles.append(Line2D([], [], marker="o", ls="-", color="0.4", ms=9,
                                 label="cell median"))
-    ax.legend(handles=shape_handles, fontsize=8, loc="lower left", framealpha=0.9)
+    ax.legend(handles=shape_handles, fontsize=12, loc="lower left", framealpha=0.9)
 
     fig.tight_layout()
     p = Path(out_dir) / "figures" / "param_depth_scatter.png"
@@ -803,12 +807,12 @@ def make_radial_overlays(template, placements, params, res_by_cell, out_dir, set
             ax.axhline(0, color="grey", lw=0.8, ls="-")
             ax.axvline(a.diameter_um / 2, color="green", ls=":", lw=1.2,
                        label=f"drawn radius {a.diameter_um/2:g} µm")
-            ax.set_xlabel("radius from pin centre (µm)")
-            ax.set_ylabel("mean height above clean floor (µm)")
+            ax.set_xlabel("radius from pin centre (µm)", fontsize=14)
+            ax.set_ylabel("mean height above clean floor (µm)", fontsize=14)
             ax.set_title(f"Mean radial pin profile — Ø {a.diameter_um:g} µm, "
-                         f"pitch {a.pitch_um:g} µm")
-            ax.grid(alpha=0.3)
-            ax.legend(fontsize=7, ncol=2 if n_lines > 8 else 1)
+                         f"pitch {a.pitch_um:g} µm", fontsize=16)
+            ax.tick_params(labelsize=14); ax.grid(alpha=0.3)
+            ax.legend(fontsize=11, ncol=2 if n_lines > 8 else 1)
             fig.tight_layout()
             fname = f"a{a.array_id:02d}_D{a.diameter_um:g}_P{a.pitch_um:g}.png"
             fig.savefig(sdir / fname, dpi=170); plt.close(fig)
@@ -822,18 +826,27 @@ def _flip_lr(a):
 
 
 def save_sample_heightmap(scan, path, ds=4):
-    """Full-sample height map, flipped left-right to DESIGN orientation for presentation."""
+    """Full-sample height map, flipped left-right to DESIGN orientation for presentation.
+
+    x/y are physical distance in mm from the assembled raster's bottom-left corner (not stage
+    coordinates -- the assembled origin is arbitrary), so cell size and spacing can be read off
+    the axes directly."""
     valid = scan.height_raw != 0
     z = np.where(valid, scan.height_um, np.nan)[::ds, ::ds]
     z = _flip_lr(z)                                       # un-mirror for presentation
-    hh, ww = z.shape                                      # size the figure to the image aspect
-    fig_w = 11.0
-    fig, ax = plt.subplots(figsize=(fig_w, max(3.5, fig_w * hh / ww)))
-    im = ax.imshow(z, origin="lower", cmap="viridis",
+    hh, ww = z.shape
+    # mm extent from the DECIMATED pixel pitch; with aspect='equal' in mm the figure keeps true
+    # physical proportions even when the scan's x and y pitches differ
+    w_mm = ww * ds * scan.x_um_per_px / 1000.0
+    h_mm = hh * ds * scan.y_um_per_px / 1000.0
+    fig_w = 11.0                                          # size the figure to the physical aspect
+    fig, ax = plt.subplots(figsize=(fig_w, max(3.5, fig_w * h_mm / w_mm)))
+    im = ax.imshow(z, origin="lower", extent=(0.0, w_mm, 0.0, h_mm), aspect="equal", cmap="viridis",
                    vmin=np.nanpercentile(z, 2), vmax=np.nanpercentile(z, 98))
-    ax.set_title("Assembled sample height")
-    ax.set_xticks([]); ax.set_yticks([])
-    plt.colorbar(im, ax=ax, shrink=0.85, label="height (µm)")
+    ax.set_title("Assembled sample height", fontsize=16)
+    ax.set_xlabel("x (mm, design orientation)", fontsize=14); ax.set_ylabel("y (mm)", fontsize=14)
+    ax.tick_params(labelsize=14)
+    _cb(plt.colorbar(im, ax=ax, shrink=0.85), "height (µm)")
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=200, bbox_inches="tight"); plt.close(fig)
 
@@ -860,8 +873,8 @@ def save_sample_overview(scan, template, placements, path, ds=6):
         ax.plot(fx, fy, "c.", ms=0.5)
         cx, cy = p.dxf_to_px(ccx, ccy)
         ax.text((W - 1 - cx) / ds, cy / ds, f"({p.cell_row},{p.cell_col})",
-                color="yellow", ha="center", va="center", fontsize=11, weight="bold")
-    ax.set_title(f"{len(placements)} unit cells")
+                color="yellow", ha="center", va="center", fontsize=15, weight="bold")
+    ax.set_title(f"{len(placements)} unit cells", fontsize=16)
     ax.set_xticks([]); ax.set_yticks([])
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=170, bbox_inches="tight"); plt.close(fig)
@@ -998,13 +1011,16 @@ def build_snapshot_montage(tiles, template, *, res_um=2.0, gutter_px=24):
                 gutter_px=gutter_px)
 
 
-def _annotate_snapshot_panels(ax, boxes, canvas_h, *, fontsize=12):
+def _annotate_snapshot_panels(ax, boxes, canvas_h, *, fontsize=12, scale=1.0):
     """Label each tiled panel with its snapshot name (Center / TopLeft / ...) in a boxed callout
     above the panel, so the reader can tell which crop is which. Adds headroom above the panels so
-    the labels are never clipped. ``canvas_h`` is the composited canvas height in pixels."""
-    ax.set_ylim(-0.03 * canvas_h, canvas_h * 1.16)          # headroom for the labels above panels
+    the labels are never clipped. ``canvas_h`` is the composited canvas height in pixels.
+
+    ``scale`` converts canvas pixels to the axes' data units (mm/px when the montage is drawn on a
+    physical axis); the default 1.0 keeps the callouts in pixel coordinates."""
+    ax.set_ylim(-0.03 * canvas_h * scale, canvas_h * 1.16 * scale)   # headroom for the labels
     for b in boxes:
-        ax.text(0.5 * (b["c0"] + b["c1"]), b["r1"] + 0.02 * canvas_h, b["label"],
+        ax.text(0.5 * (b["c0"] + b["c1"]) * scale, (b["r1"] + 0.02 * canvas_h) * scale, b["label"],
                 color="black", ha="center", va="bottom", fontsize=fontsize, weight="bold",
                 clip_on=False,
                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.6", alpha=0.9))
@@ -1024,11 +1040,18 @@ def save_snapshot_heightmap(tiles, template, path, *, res_um=2.0, gutter_px=24, 
     hh, ww = canvas.shape                                 # size the figure to the image aspect so
     fig_w = max(8.0, 4.8 * len(boxes))                    # the colorbar tracks the plot, not empty space
     fig, ax = plt.subplots(figsize=(fig_w, max(3.2, fig_w * (1.22 * hh) / ww)))
-    im = ax.imshow(canvas, origin="lower", cmap="viridis", vmin=0, vmax=vmax, aspect="equal")
-    ax.set_xticks([]); ax.set_yticks([])
-    _annotate_snapshot_panels(ax, boxes, canvas.shape[0])
-    plt.colorbar(im, ax=ax, shrink=0.85, label="height above local floor (µm)")
-    ax.set_title("Sample height — tiled snapshots", fontsize=12)
+    # the canvas is composited at a uniform res_um per pixel, so an mm axis carries a true SCALE;
+    # the origin and the panel-to-panel offsets are presentation only (independent captures + a
+    # gutter), hence the 'within a panel' caveat on the x label
+    mm_px = res_um / 1000.0
+    im = ax.imshow(canvas, origin="lower", extent=(0.0, ww * mm_px, 0.0, hh * mm_px),
+                   cmap="viridis", vmin=0, vmax=vmax, aspect="equal")
+    ax.set_xlabel("x (mm — physical within a panel; panels are separate captures)", fontsize=14)
+    ax.set_ylabel("y (mm)", fontsize=14)
+    ax.tick_params(labelsize=14)
+    _annotate_snapshot_panels(ax, boxes, canvas.shape[0], scale=mm_px)
+    _cb(plt.colorbar(im, ax=ax, shrink=0.85), "height above local floor (µm)")
+    ax.set_title("Sample height — tiled snapshots", fontsize=16)
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=200, bbox_inches="tight"); plt.close(fig)
     print(f"Wrote {path}")
@@ -1051,8 +1074,8 @@ def save_snapshot_overview(tiles, template, path, *, res_um=2.0, gutter_px=24, m
                     vmin=m["ivmin"], vmax=m["ivmax"], aspect="equal")
     ax.set_xticks([]); ax.set_yticks([])
     _annotate_snapshot_panels(ax, boxes, icanvas.shape[0])
-    plt.colorbar(imi, ax=ax, shrink=0.85, label="intensity")
-    ax.set_title("Sample intensity — tiled snapshots", fontsize=12)
+    _cb(plt.colorbar(imi, ax=ax, shrink=0.85), "intensity")
+    ax.set_title("Sample intensity — tiled snapshots", fontsize=16)
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=200, bbox_inches="tight"); plt.close(fig)
     print(f"Wrote {path}")
@@ -1209,7 +1232,7 @@ def render_snapshot_cell_report(tiles, template, avg_by_array, dose_label, path,
     axh = fig.add_subplot(gs[0, 0]); axi = fig.add_subplot(gs[1, 0])
     imh = axh.imshow(canvas, origin="lower", cmap="viridis", vmin=0, vmax=m["vmax"], aspect="equal")
     axh.set_xticks([]); axh.set_yticks([])
-    axh.set_title("Height above floor — snapshots tiled", fontsize=16)
+    axh.set_title("Height above floor", fontsize=16)
     _annotate_snapshot_panels(axh, boxes, canvas.shape[0], fontsize=16)
     _cb(plt.colorbar(imh, ax=axh, shrink=0.8), "height above local floor (µm)")
     if icanvas is not None and m["ivmax"] is not None:
@@ -1218,11 +1241,12 @@ def render_snapshot_cell_report(tiles, template, avg_by_array, dose_label, path,
         _annotate_snapshot_panels(axi, boxes, icanvas.shape[0], fontsize=16)
         _cb(plt.colorbar(imi, ax=axi, shrink=0.8), "intensity")
     axi.set_xticks([]); axi.set_yticks([])
-    axi.set_title("Intensity — snapshots tiled", fontsize=16)
+    axi.set_title("Intensity", fontsize=16)
 
     axr = fig.add_subplot(gs[:, 1]); axr.axis("off")
-    names = ", ".join(t["label"] for t in tiles)
-    axr.text(0.0, 1.0, f"Averaged cell — {len(tiles)} snapshots ({names})   —   {dose_label}",
+    # snapshot count/names are dropped from the title -- each panel is already labelled with its
+    # snapshot name by _annotate_snapshot_panels, so nothing is lost
+    axr.text(0.0, 1.0, f"Averaged cell — {dose_label}",
              transform=axr.transAxes, va="top", fontsize=17, weight="bold")
 
     def _f(v):
@@ -1248,9 +1272,6 @@ def render_snapshot_cell_report(tiles, template, avg_by_array, dose_label, path,
         tbl.auto_set_column_width(col=list(range(len(col_labels))))  # headers need it at this size
         for c in range(len(col_labels)):
             tbl[0, c].set_facecolor("#dddddd"); tbl[0, c].set_text_props(weight="bold")
-    axr.text(0.0, 0.86, "Values are the mean over the snapshots (replicate views of one uniform "
-             "cell); Ø top/nom are the reliable measures.",
-             transform=axr.transAxes, va="top", fontsize=12, style="italic", color="0.3")
     # Mean radial pin profile in the space left under the table (one line per array geometry, same
     # curve as figures/radial_overlays/). Skipped when a tall table leaves no room.
     _ph = (tbl_bottom - 0.10) - 0.06
@@ -1305,11 +1326,11 @@ def make_snapshot_radial_overlays(template, avg_by_array, out_dir, dose_label=""
         ax.axhline(0, color="grey", lw=0.8)
         ax.axvline(a.diameter_um / 2, color="green", ls=":", lw=1.2,
                    label=f"drawn radius {a.diameter_um/2:g} µm")
-        ax.set_xlabel("radius from pin centre (µm)")
-        ax.set_ylabel("mean height above clean floor (µm)")
+        ax.set_xlabel("radius from pin centre (µm)", fontsize=14)
+        ax.set_ylabel("mean height above clean floor (µm)", fontsize=14)
         ax.set_title(f"Mean radial pin profile — Ø {a.diameter_um:g} µm, "
-                     f"pitch {a.pitch_um:g} µm")
-        ax.grid(alpha=0.3); ax.legend(fontsize=8)
+                     f"pitch {a.pitch_um:g} µm", fontsize=16)
+        ax.tick_params(labelsize=14); ax.grid(alpha=0.3); ax.legend(fontsize=12)
         fig.tight_layout()
         fig.savefig(root / f"a{a.array_id:02d}_D{a.diameter_um:g}_P{a.pitch_um:g}.png", dpi=170)
         plt.close(fig)
@@ -1460,7 +1481,7 @@ def analyze_multi_snapshot(snapshots, out_dir, dxf_path, *, passes=0, speed=floa
     _dose_tag = f"P{passes}_S{speed:g}" if passes > 0 else "averaged"
     avg_by_array = {aid: _average_results(rl, dose_label=_dose_tag) for aid, rl in by_array.items()}
     avg_by_array = {k: v for k, v in avg_by_array.items() if v is not None}
-    _dose_label = f"P{passes}  S{speed:g}" if passes > 0 else "laser params: unset"
+    _dose_label = _dose_tag if passes > 0 else "laser params: unset"   # P{passes}_S{speed} form
     cells_dir = out_dir / "figures" / "cells"; cells_dir.mkdir(parents=True, exist_ok=True)
     render_snapshot_cell_report(tiles, template, avg_by_array, _dose_label,
                                 cells_dir / "cell_averaged.png")
