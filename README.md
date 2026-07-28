@@ -76,7 +76,8 @@ each, and renders a **side-by-side tiled montage** under the usual figure names:
 - `figures/sample_heightmap.png` — each snapshot's floor-referenced, design-oriented height crop
   tiled side by side and labelled by snapshot name. Per-tile floor levelling lets separate captures
   with different absolute Z share one honest colour scale. The panels are independent captures, not
-  a spatial mosaic (their relative position is unknown).
+  a spatial mosaic (their relative position is unknown) — the mm x/y axes are therefore a *scale*
+  (true within a panel), not a position on the sample.
 - `figures/intensity_map.png` — the same snapshots' intensity, tiled in the identical layout.
 - `figures/3D height map/<snapshot>/array{id}_D{d}_P{p}.png` — a true-aspect 3D height surface of
   the **centre 5×5 pins** of each array, per snapshot, drawn presentation-style (low camera, large
@@ -208,7 +209,7 @@ Clean outputs live under `figures/`; the v1 plot set, `measurements.csv` and per
 | file | contents |
 |------|----------|
 | `legacy/measurements.csv` | one row per array per cell: base·mid·top Ø (`base_extrapolated` flag when the base crossing was buried), depth, **design** pitch (`pitch_*`) + scan-**measured** pitch (`meas_pitch_*`), drawn Ø, laser params, registration quality, `absolute_origin` / `ambiguous_axes`, reliability flags |
-| `figures/intensity_map.png`, `figures/sample_heightmap.png` | intensity/cell map + full-sample height map (design orientation) |
+| `figures/intensity_map.png`, `figures/sample_heightmap.png` | intensity/cell map + full-sample height map (design orientation; height map carries physical mm x/y axes) |
 | `figures/3D height map/[cell_x*_y*/]array*.png` | true-aspect 3D height surface of the centre 5×5 pins of each array (per unit cell for a tiled sample), presentation-styled at 300 dpi, with a passes/speed info box (top-left) |
 | `figures/cells/cell_x*_y*.png` | per-cell report: height/intensity with pin overlay + measured-vs-drawn table |
 | `figures/param_summary.png`, `figures/param_depth_scatter.png` | depth & mid-Ø oversizing vs laser passes/speed (reliable arrays; ◇ D300 □ D100 △ D50) |
