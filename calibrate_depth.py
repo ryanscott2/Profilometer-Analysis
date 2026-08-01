@@ -63,7 +63,14 @@ def discover_samples(results_dir, out_dir, include=None, exclude=None):
 
     ``include``/``exclude`` are lists of folder names (exact match); ``include`` (when given)
     whitelists, ``exclude`` blacklists. The output folder is skipped explicitly (it also has no
-    ``legacy/`` so it would self-skip anyway). Returns an ordered list of (name, csv_path)."""
+    ``legacy/`` so it would self-skip anyway). Returns an ordered list of (name, csv_path).
+
+    Descends ONE extra level into a wafer-row container (``Results/<date> Row n/<sample>/``, written
+    by ``run_row.py``) -- those samples are real datasets and would otherwise be invisible to depth
+    calibration. Their identity is the relative path ``'072426 Row 1/c1 D50 P100 P25_S400'``, which
+    is what ``include``/``exclude`` and the UI's cell-filter keys must use. Dot-directories are
+    skipped: a transient ``.<name>.staging-*`` in 'complete' state holds a full
+    ``legacy/measurements.csv`` that would otherwise pool as a phantom duplicate sample."""
     results_dir = Path(results_dir)
     out_resolved = Path(out_dir).resolve()
     inc = set(include) if include else None
@@ -72,16 +79,21 @@ def discover_samples(results_dir, out_dir, include=None, exclude=None):
     if not results_dir.is_dir():
         return found
     for sub in sorted(p for p in results_dir.iterdir() if p.is_dir()):
-        if sub.resolve() == out_resolved:
+        if sub.resolve() == out_resolved or sub.name.startswith("."):
             continue
-        csv = sub / MEAS_REL
-        if not csv.is_file():
-            continue
-        if inc is not None and sub.name not in inc:
-            continue
-        if sub.name in exc:
-            continue
-        found.append((sub.name, csv))
+        if (sub / MEAS_REL).is_file():
+            cands = [(sub.name, sub / MEAS_REL)]
+        else:                                    # a wafer-row container -> one level deeper
+            cands = [(f"{sub.name}/{c.name}", c / MEAS_REL)
+                     for c in sorted(p for p in sub.iterdir()
+                                     if p.is_dir() and not p.name.startswith("."))
+                     if (c / MEAS_REL).is_file()]
+        for name, csv in cands:
+            if inc is not None and name not in inc:
+                continue
+            if name in exc:
+                continue
+            found.append((name, csv))
     return found
 
 

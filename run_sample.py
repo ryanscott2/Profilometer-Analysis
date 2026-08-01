@@ -66,6 +66,9 @@ DEF_VK4_DIR = HERE / "VK4"
 DEF_CSV_DIR = HERE / "CSV"
 DEF_OUT_DIR = HERE / "Results"
 RESULTS_SENTINEL = ".pflm-results.json"
+# Marks a wafer-row CONTAINER (written by run_row.py): a plain folder holding several per-sample
+# datasets plus a rollup. It is never itself a transaction target -- see _contains_owned_datasets.
+ROW_SENTINEL = ".pflm-row.json"
 
 # Radial-average overlay figures are configured by CSV/radial_sets.csv: each row is one
 # comparison set -- a list of P{passes}_S{speed} labels whose mean-pin radial profiles are
@@ -154,6 +157,25 @@ def _looks_like_legacy_output(path):
             and (path / "figures").is_dir())
 
 
+def _contains_owned_datasets(path):
+    """True if ``path`` is a CONTAINER of other PFLM datasets (a wafer-row folder), not a dataset.
+
+    A transaction REPLACES its target: :func:`_commit_output_transaction` renames the entire
+    existing tree into the system temp dir and deletes it (:func:`_discard_dir`), because
+    ``os.replace`` cannot rename onto a non-empty directory. So a directory that CONTAINS other
+    results must never be a transaction target -- committing there would destroy every dataset
+    inside it while printing success. One-level scan; dot-directories are our own staging orphans
+    and are skipped."""
+    path = Path(path)
+    if (path / ROW_SENTINEL).is_file():
+        return True
+    try:
+        kids = [c for c in path.iterdir() if c.is_dir() and not c.name.startswith(".")]
+    except OSError:
+        return False
+    return any(_sentinel_valid(c) or _looks_like_legacy_output(c) for c in kids)
+
+
 def _validate_output_target(out_dir, protect=(), results_root=DEF_OUT_DIR):
     """Validate a dedicated owned dataset directory and return its resolved path.
 
@@ -175,6 +197,11 @@ def _validate_output_target(out_dir, protect=(), results_root=DEF_OUT_DIR):
             raise SystemExit(
                 f"refusing output dir {resolved}: it overlaps input path {sp}; keep Results and "
                 "raw VK4/DXF/CSV inputs in separate directories")
+    if resolved.exists() and _contains_owned_datasets(resolved):
+        raise SystemExit(
+            f"refusing to use {resolved} as an output dataset: it CONTAINS other PFLM results "
+            f"(it is a wafer-row container). A run replaces its whole output directory, which "
+            f"would destroy them. Target one of its subfolders instead.")
     if resolved.exists() and any(resolved.iterdir()):
         if not (_sentinel_valid(resolved, resolved, ("complete",))
                 or _looks_like_legacy_output(resolved)):
@@ -1371,7 +1398,7 @@ def _save_snapshot_provenance(figures_dir, snapshots, dxf_path, passes, speed):
 
 
 def analyze_multi_snapshot(snapshots, out_dir, dxf_path, *, passes=0, speed=float("nan"),
-                           cell_label="", make_qc=False, jobs=None):
+                           cell_label="", make_qc=False, jobs=None, results_root=None):
     """Analyze a set of DISJOINT snapshots (crops) of ONE uniform unit-cell DXF.
 
     ``snapshots`` : list of ``(vk4_path, label)``. Each is registered independently (phase-only for
@@ -1379,6 +1406,9 @@ def analyze_multi_snapshot(snapshots, out_dir, dxf_path, *, passes=0, speed=floa
     Writes ``legacy/measurements.csv`` (one row per array per snapshot, tagged with ``snapshot``),
     a per-snapshot report, and one side-by-side montage. Absolute pin position is never claimed.
     Returns ``(df, results, tiles)``.
+
+    ``results_root`` overrides the root that ``out_dir`` must live under (default ``Results/``);
+    ``run_row.py`` leaves it as ``None`` in production and the selftest points it at a temp dir.
     """
     snapshots = [(Path(p), str(lab)) for p, lab in snapshots]
     if not snapshots:
@@ -1390,7 +1420,7 @@ def analyze_multi_snapshot(snapshots, out_dir, dxf_path, *, passes=0, speed=floa
     stage_dir, final_out_dir = _prepare_output_transaction(
         out_dir,
         protect=(*[p for p, _ in snapshots], dxf_path),
-        results_root=DEF_OUT_DIR,
+        results_root=results_root or DEF_OUT_DIR,
     )
     out_dir = Path(stage_dir)
     design = read_design(dxf_path)
@@ -1496,14 +1526,19 @@ def analyze_multi_snapshot(snapshots, out_dir, dxf_path, *, passes=0, speed=floa
 
 
 def analyze_multi_snapshot_dir(vk4_dir, out_dir, dxf_path, *, passes=0, speed=float("nan"),
-                               cell_label="", make_qc=False, jobs=None):
-    """Convenience wrapper: discover snapshots in ``vk4_dir`` (non-raster ``*.vk4``) and analyze."""
+                               cell_label="", make_qc=False, jobs=None, results_root=None):
+    """Convenience wrapper: discover snapshots in ``vk4_dir`` (non-raster ``*.vk4``) and analyze.
+
+    NOTE this treats EVERY non-raster ``*.vk4`` in the folder as a snapshot of ONE uniform cell. A
+    flat folder holding several different wafer samples must NOT come through here -- see
+    ``run_row.py``, which passes an explicit per-sample snapshot list instead."""
     snaps = snapshots_from_dir(vk4_dir)
     if not snaps:
         raise SystemExit(f"No disjoint snapshot .vk4 files found in {vk4_dir} "
                          f"(a '_Y*_X*' raster belongs to the tiled mode -> use analyze_sample).")
     return analyze_multi_snapshot(snaps, out_dir, dxf_path, passes=passes, speed=speed,
-                                  cell_label=cell_label, make_qc=make_qc, jobs=jobs)
+                                  cell_label=cell_label, make_qc=make_qc, jobs=jobs,
+                                  results_root=results_root)
 
 
 def main():
