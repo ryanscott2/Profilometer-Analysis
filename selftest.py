@@ -1571,6 +1571,393 @@ def main():
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"triangular-lattice path raised: {e!r}")
 
+    # ------------------- 25. wafer-row batch runner: plan, dispatch, roll up #
+    print("\n[25] wafer-row runner: name/dose/map parsing, DXF pairing, skips, dispatch, rollup")
+    _scratch = None
+    try:
+        import json as _json
+        import shutil as _shutil                    # main()-local elsewhere; bind our own
+        import tempfile as _tempfile
+        import calibrate_depth
+        import laser_params
+        import run_sample
+        import wafer_map as wm
+        import run_row as rr
+        import row_report as rrep
+
+        # ---- A. VK4 filename grammar (pure) ----
+        ck.check(wm.parse_sample_id("072230_PFLMTIM_D50_11_Center") == (1, 1, "Center"),
+                 "#25A compact _{col}{row}_ token -> (col, row, label)")
+        ck.check(wm.parse_sample_id("072230_PFLMTIM_D300_64_Center") == (6, 4, "Center"),
+                 "#25A first digit is the COLUMN, second the ROW")
+        ck.check(wm.parse_sample_id("072230_PFLMTIM_D50_11_Center")[:2] == (1, 1)
+                 and wm.parse_sample_id("990101_X_D50_23_Center") == (2, 3, "Center"),
+                 "#25A the 6-digit date and the D-token are never read as a CR token")
+        ck.check(wm.parse_sample_id("072230_PFLMTIM_D50_11_Top_Left") == (1, 1, "Top_Left"),
+                 "#25A a multi-underscore snapshot label survives intact")
+        ck.check(wm.parse_sample_id("072230_PFLMTIM_D50_112_Center") is None
+                 and wm.parse_sample_id("072230_PFLMTIM_D50_1_Center") is None,
+                 "#25A 1 or >=3 digits is never split into col/row")
+        ck.check(wm.parse_sample_id("072230_PFLMTIM_D50_11") is None
+                 and wm.parse_sample_id("072230_11_D50_21_Center") is None,
+                 "#25A no snapshot label / two candidates -> refuse, never guess")
+        ck.check(wm.parse_sample_id("072230_PFLMTIM_D50_C10R2_Center") == (10, 2, "Center"),
+                 "#25A explicit C{col}R{row} escape hatch survives a >9-column wafer")
+
+        # ---- B. grouping (pure, name-only) ----
+        _names = [f"072230_PFLMTIM_D{d}_{c}{r}_{s}.vk4"
+                  for c, d in ((1, 50), (2, 100), (3, 300)) for r in (1, 2, 3)
+                  for s in ("Center", "TopLeft")]
+        _by_col, _other, _unp = wm.group_snapshots(_names, 1)
+        ck.check(sorted(_by_col) == [1, 2, 3] and all(len(v) == 2 for v in _by_col.values())
+                 and len(_other) == 12 and not _unp,
+                 "#25B 18 flat names -> 3 samples of 2 snapshots for row 1; 12 in other rows")
+        ck.check(all(lab in ("Center", "TopLeft") for v in _by_col.values() for _n, lab in v),
+                 "#25B 'Center' repeating ACROSS samples does not trigger the full-stem fallback")
+        _dupn = ["072230_X_D50_11_Center.vk4", "072230_Y_D50_11_Center.vk4"]
+        _dcol, _, _ = wm.group_snapshots(_dupn, 1)
+        ck.check(len(_dcol[1]) == 2 and len({lab for _n, lab in _dcol[1]}) == 2,
+                 "#25B colliding labels WITHIN one sample fall back to full stems, never merge")
+        _mix, _, _ = wm.group_snapshots(
+            ["072230_X_D50_11_Center.vk4"] + [f"072230_X_D100_21_{s}.vk4"
+                                              for s in ("TopLeft", "Center", "TopRight")], 1)
+        ck.check(len(_mix[1]) == 1 and [lab for _n, lab in _mix[2]] == ["Center", "TopLeft",
+                                                                        "TopRight"],
+                 "#25B 1 and 3 snapshots both group cleanly, ordered by SNAPSHOT_ORDER")
+        _, _, _bad = wm.group_snapshots(["notes.vk4", "foo_Y1_X1.vk4", "a_XX_Center.vk4"], 1)
+        ck.check(len(_bad) == 3 and all(r for _n, r in _bad),
+                 "#25B untokened names / raster tiles land in 'unparsed' WITH a reason")
+
+        # ---- C. dose + wafer map ----
+        ck.check(wm.parse_dose("S400_P25") == wm.parse_dose("P25_S400") == (25, 400.0, "P25_S400"),
+                 "#25C both token orders parse and canonicalise identically")
+        ck.check(wm.parse_dose("P26_S800") == (26, 800.0, "P26_S800")
+                 and wm.parse_dose("D50_P100_S400_P25") is None,
+                 "#25C fullmatch-anchored: an embedded dose is refused, not guessed")
+        ck.check(run_sample._parse_ps_label("S400_P25")[0] == 0
+                 and run_sample._parse_ps_label("D50_P100_S400_P25") == (100, 400.0),
+                 "#25C negative pin: run_sample._parse_ps_label reads S-first as passes=0 and a "
+                 "geometry pitch as the pass count (this is WHY the row path canonicalises first)")
+        ck.check(laser_params.parse_pxsy("S400_P25") is None,
+                 "#25C laser_params.parse_pxsy is P-first only")
+        _scratch = Path(_tempfile.mkdtemp(prefix="pflm-row-selftest-"))
+        _map_txt = ["row,col,laser,geometry,lattice,skip,note,dxf"]
+        for _r, _lat in ((1, "hex"), (2, "square")):
+            for _c, _g, _p in ((1, "D50 P100", 25), (2, "D50 P100", 20), (3, "D100 P150", 22),
+                               (4, "D100 P150", 16), (5, "D300 P350", 17), (6, "D300 P350", 13)):
+                _map_txt.append(f"{_r},{_c},S400_P{_p},{_g},{_lat},,,")
+        for _c in range(1, 7):
+            _map_txt.append(f'3,{_c},,,,1,"Stagger pattern incorrect, disregard",')
+        for _c, _g, _p in ((1, "D300 P350", 26), (2, "D300 P350", 34), (3, "D100 P150", 32),
+                           (4, "D100 P150", 44), (5, "D50 P100", 40), (6, "D50 P100", 50)):
+            _map_txt.append(f"4,{_c},P{_p}_S800,{_g},square,,,")
+        _mp = _scratch / "wafer_map.csv"
+        _mp.write_text("\n".join(_map_txt) + "\n", encoding="utf-8")
+        _ents, _meta, _probs = wm.read_wafer_map(_mp)
+        ck.check(len(_ents) == 24 and sum(e.skip for e in _ents) == 6 and not _probs,
+                 f"#25C the 24-line wafer map parses clean (got {len(_ents)} entries, "
+                 f"{len(_probs)} problems)")
+        ck.check([e.laser for e in _ents if e.row == 1] ==
+                 ["P25_S400", "P20_S400", "P22_S400", "P16_S400", "P17_S400", "P13_S400"],
+                 "#25C S-first row-1 doses canonicalise to the P-first pipeline form")
+        _dup = _scratch / "dup.csv"
+        _dup.write_text("row,col,laser,geometry,lattice\n1,3,P1_S1,D50 P100,hex\n"
+                        "1,3,P2_S1,D50 P100,hex\n", encoding="utf-8")
+        _, _, _dprob = wm.read_wafer_map(_dup)
+        ck.check(any("duplicate" in p and "2" in p and "3" in p for p in _dprob),
+                 "#25C a duplicate (row,col) is reported naming BOTH source lines")
+        _badf = _scratch / "bad.csv"
+        _badf.write_text("row,col,laser,geometry,lattice,skip\n1,1,nope,D50 P100,hex,\n"
+                         "1,2,P1_S1,D50 P100,neither,\n1,3,P1_S1,nope,hex,\n"
+                         "1,4,P1_S1,D50 P100,hex,maybe\n", encoding="utf-8")
+        _, _, _bprob = wm.read_wafer_map(_badf)
+        ck.check(len(_bprob) == 4 and all(any(k in p for k in ("laser", "lattice", "geometry",
+                                                               "skip")) for p in _bprob),
+                 f"#25C bad dose/lattice/geometry/skip each block, all reported together "
+                 f"(got {len(_bprob)})")
+
+        # ---- D. DXF resolution by CONTENT ----
+        _dxfdir = _scratch / "DXF"
+        _dxfdir.mkdir()
+        for _n in ("D50_P100_1cm2.dxf", "D100_P150_1cm2.dxf", "D300_P350_1cm2.dxf"):
+            _shutil.copy2(_resolve_dxf(_n, "markerless"), _dxfdir / _n)
+        for _n in ("072326 D50 P100 TRIANGULAR.dxf", "072326 D100 P150 TRIANGULAR.dxf",
+                   "072326 D300 P350 TRIANGULAR.dxf"):
+            _shutil.copy2(_resolve_dxf(_n, "triangular"), _dxfdir / _n)
+        for _n in ("071826_UVPFLM_D300.dxf", "072026_UVPFLM_D100D50.dxf"):
+            _shutil.copy2(_resolve_dxf(_n, "registration"), _dxfdir / _n)
+        _facts, _fprob = rr.index_dxf_dir(_dxfdir)
+        _sq = {f.name for f in _facts if f.is_wafer_candidate and f.lattice == "square"}
+        _tri = {f.name for f in _facts if f.is_wafer_candidate and f.lattice == "triangular"}
+        ck.check(len(_facts) == 8 and not _fprob and len(_sq) == 3 and len(_tri) == 3,
+                 f"#25D 8 drawings parsed; 3 markerless square + 3 triangular are candidates "
+                 f"(got {len(_sq)}sq/{len(_tri)}tri)")
+        ck.check(all(rr.lattice_kind(rr.read_design_cached(_dxfdir / _n).cells[0].arrays[0])
+                     == "triangular"
+                     for _n in ("072326 D50 P100 TRIANGULAR.dxf",
+                                "072326 D100 P150 TRIANGULAR.dxf",
+                                "072326 D300 P350 TRIANGULAR.dxf")),
+                 "#25D lattice_kind says 'triangular' for all three despite 60/60/120 deg bases")
+        _cands350 = [f for f in _facts if abs(f.pitch_um - 350) < 0.5 and f.lattice == "square"]
+        _wafer350 = [f for f in _cands350 if f.is_wafer_candidate]
+        ck.check(len(_cands350) == 2 and len(_wafer350) == 1,
+                 f"#25D the markerless predicate resolves the (350, square) collision "
+                 f"({len(_cands350)} match pitch+lattice, {len(_wafer350)} survives)")
+        _need1 = {(e.geometry, e.lattice) for e in _ents if e.row == 1 and not e.skip}
+        _map1, _mprob1, _ = rr.resolve_dxfs(_facts, _need1)
+        ck.check(not _mprob1 and len(_map1) == 3
+                 and all("TRIANGULAR" in Path(v).name for v in _map1.values()),
+                 "#25D row 1 (hex) resolves to the 3 TRIANGULAR drawings over 6 samples")
+        _need4 = {(e.geometry, e.lattice) for e in _ents if e.row == 4 and not e.skip}
+        _map4, _mprob4, _ = rr.resolve_dxfs(_facts, _need4)
+        ck.check(not _mprob4 and "P350" in Path(_map4[("D300 P350", "square")]).name.upper()
+                 and "P100" in Path(_map4[("D50 P100", "square")]).name.upper(),
+                 "#25D row 4 (square, REVERSED pairing) resolves per-line, not by column order")
+        _mx, _mxp, _ = rr.resolve_dxfs(_facts, {("D200 P250", "square")})
+        ck.check(not _mx and len(_mxp) == 1 and "D200 P250" in _mxp[0] and "square" in _mxp[0],
+                 "#25D an unmatched geometry is one blocking problem naming geometry + lattice")
+        _ov, _ovp, _ovw = rr.resolve_dxfs(
+            _facts, {("D50 P100", "square")},
+            explicit={("D50 P100", "square"): str(_dxfdir / "072326 D50 P100 TRIANGULAR.dxf")})
+        ck.check(not _ov and _ovp and "override rejected" in _ovp[0],
+                 "#25D a dxf= override with the wrong lattice is VERIFIED and rejected")
+        _nd, _ndp, _ndw = rr.resolve_dxfs(_facts, _need4)
+        ck.check(not _ndp and not any("295" in w or "Ø" in w for w in _ndw),
+                 "#25D a drawing deliberately undersized against its nominal label "
+                 "(D300_P350 draws 295 µm) is neither an error nor warning noise")
+        _tri_lie = _scratch / "DXF2"
+        _tri_lie.mkdir()
+        _shutil.copy2(_dxfdir / "D50_P100_1cm2.dxf", _tri_lie / "072326 D50 P100 TRIANGULAR.dxf")
+        _lf, _ = rr.index_dxf_dir(_tri_lie)
+        ck.check(any("TRIANGULAR" in w and "square" in w
+                     for w in rr.resolve_dxfs(_lf, {("D50 P100", "square")})[2]),
+                 "#25D a filename claiming TRIANGULAR over a square drawing IS warned about")
+
+        # ---- E. plan composition ----
+        _rnames = [f"072230_PFLMTIM_D{d}_{c}{r}_{s}.vk4"
+                   for c, d in ((1, 50), (2, 50), (3, 100), (4, 100), (5, 300), (6, 300))
+                   for r in (1, 2, 3) for s in ("Center", "TopLeft")]
+        _p1 = wm.plan_row(_ents, _rnames, _map1, 1, date_tag="072426")
+        ck.check(not _p1.blocking and len(_p1.ready) == 6
+                 and len({s.dxf for s in _p1.ready}) == 3,
+                 "#25E row 1 plans 6 ready samples over 3 distinct DXFs")
+        _p3 = wm.plan_row(_ents, _rnames, {}, 3, date_tag="072426")
+        ck.check(all(s.status == "skipped" for s in _p3.samples) and len(_p3.samples) == 6
+                 and not _p3.blocking,
+                 "#25E row 3 is six skipped samples with notes, and does not block")
+        _p1miss = wm.plan_row(_ents, [n for n in _rnames if "_41_" not in n], _map1, 1)
+        ck.check(sum(s.status == "no-vk4" for s in _p1miss.samples) == 1
+                 and len(_p1miss.ready) == 5 and not _p1miss.blocking,
+                 "#25E a missing column is 'no-vk4'; the other five still run")
+        _swapped = {(e.geometry, e.lattice): _map4.get((e.geometry, e.lattice), "x")
+                    for e in _ents if e.row == 4 and not e.skip}
+        _p4bad = wm.plan_row(
+            [wm.MapEntry(row=4, col=1, line=1, laser="P26_S800", passes=26, speed=800.0,
+                         geometry="D50 P100", nominal_d_um=50.0, nominal_p_um=100.0,
+                         lattice="square")],
+            ["072230_PFLMTIM_D300_14_Center.vk4"], {("D50 P100", "square"): "x"}, 4)
+        ck.check(_p4bad.blocking and _p4bad.samples[0].status == "name-mismatch"
+                 and "REVERSES" in _p4bad.samples[0].reason,
+                 "#25E a transposed map is caught by the VK4 D-token cross-check, before any run")
+        _p4ok = wm.plan_row(
+            [wm.MapEntry(row=4, col=1, line=1, laser="P26_S800", passes=26, speed=800.0,
+                         geometry="D50 P100", nominal_d_um=50.0, nominal_p_um=100.0,
+                         lattice="square")],
+            ["072230_PFLMTIM_D300_14_Center.vk4"], {("D50 P100", "square"): "x"}, 4,
+            strict_names=False)
+        ck.check(not _p4ok.blocking and _p4ok.samples[0].status == "ready" and _p4ok.warnings,
+                 "#25E strict_names=False downgrades the mismatch to a warning")
+        _outs = [s.out_name for s in _p1.samples]
+        ck.check(len(set(_outs)) == len(_outs)
+                 and not any(ch in n for n in _outs for ch in '[]?*<>:"|')
+                 and wm.row_out_name("072426", 1) == "072426 Row 1",
+                 "#25E sample folder names are unique and filesystem-safe; row name is as specified")
+
+        # ---- F. the driver on disk, with analyze stubbed ----
+        _root = _scratch / "Results"
+        _root.mkdir()
+        _rowdir = _root / wm.row_out_name("072426", 1)
+        _seen_kwargs = {}
+
+        def _stub(snapshots, out_dir, dxf_path, *, passes, speed, cell_label,
+                  make_qc=False, jobs=None, results_root=None):
+            _col = int(Path(out_dir).name.split()[0][1:])
+            _seen_kwargs[_col] = (passes, speed, cell_label)
+            if _col == 3:
+                raise SystemExit("No snapshots could be registered against the DXF.")
+            _st, _fin = run_sample._prepare_output_transaction(
+                out_dir, protect=(dxf_path,), results_root=results_root)
+            _arr = rr.read_design_cached(dxf_path).cells[0].arrays[0]
+            _rows = []
+            for _sid, (_pn, _lab) in enumerate(snapshots, start=1):
+                _r = {c: float("nan") for c in rrep.canonical_columns()}
+                _r.update(dict(filename=f"{_lab}", vk4_stem=_lab, cell_id=_sid, array_id=1,
+                               band=1, col=1, passes=passes, speed=speed,
+                               nominal_pitch_um=_arr.pitch_um, depth_um=10.0 + passes,
+                               dose_ratio=passes * 400.0 / speed,   # gates require it finite
+                               diameter_um=_arr.diameter_um + 1.0,
+                               top_diameter_um=_arr.diameter_um - 2.0,
+                               base_diameter_um=_arr.diameter_um + 4.0, taper_um=6.0,
+                               disc_mid_um=1.0, disc_top_um=-2.0, disc_base_um=4.0,
+                               drawn_diameter_um=_arr.diameter_um,
+                               nominal_diameter_um=_arr.diameter_um, debris_fraction=0.02,
+                               reg_score=0.8, flags="", reliable=True))
+                _r.update({"snapshot": _lab, "snapshot_id": _sid, "cell_label": cell_label})
+                _rows.append(_r)
+            _d = pd.DataFrame(_rows)
+            (_st / "legacy").mkdir(parents=True, exist_ok=True)
+            (_st / "figures").mkdir(parents=True, exist_ok=True)
+            _d.to_csv(_st / "legacy" / "measurements.csv", index=False)
+            (_st / "figures" / "run_manifest.json").write_text(
+                _json.dumps({"created": rr._now()}), encoding="utf-8")
+            run_sample._commit_output_transaction(_st, _fin)
+            return _d, [], []
+
+        for _n in _rnames:
+            (_scratch / _n).touch()
+        _paths = {_n: _scratch / _n for _n in _rnames}
+        _recs, _panels = rr.run_row(_p1, _rowdir, paths=_paths, results_root=_root,
+                                    analyze=_stub, capture_panels=False, meta={"map": str(_mp)})
+        _subs = sorted(p.name for p in _rowdir.iterdir()
+                       if p.is_dir() and not p.name.startswith("."))
+        ck.check(len(_subs) == 5 and all((_rowdir / s / "legacy" / "measurements.csv").is_file()
+                                         for s in _subs),
+                 f"#25F 5 of 6 samples committed as grandchildren of the Results root "
+                 f"(got {len(_subs)})")
+        ck.check(_seen_kwargs.get(1) == (25, 400.0, "P25_S400"),
+                 "#25F the driver passes passes/speed as explicit kwargs and the canonical dose")
+        _r3 = next(r for r in _recs if r.planned.entry.col == 3)
+        ck.check(_r3.status == "failed" and "SystemExit" in _r3.reason
+                 and sum(1 for r in _recs if r.produced_data) == 5,
+                 "#25F a SystemExit on sample 3 does not abort the row (SystemExit is not Exception)")
+        ck.check(not [p for p in _rowdir.iterdir() if "staging" in p.name],
+                 "#25F no .staging-* residue is left behind")
+        _written = rr.write_rollup(_recs, _p1, _rowdir,
+                                   {"map": str(_mp), "dxf_dir": str(_dxfdir), "vk4_dirs": []},
+                                   _panels)
+        ck.check(not run_sample._looks_like_legacy_output(_rowdir)
+                 and not (_rowdir / "legacy").exists() and not (_rowdir / "figures").exists(),
+                 "#25F the row container never gains legacy/ or figures/")
+        try:
+            run_sample._validate_output_target(_rowdir, results_root=_root)
+            _guarded = False
+        except SystemExit as _e:
+            _guarded = "CONTAINS other PFLM results" in str(_e)
+        ck.check(_guarded,
+                 "#25F the container is REFUSED as a transaction target (a commit there would "
+                 "delete every sample inside it)")
+        try:
+            run_sample._validate_output_target(_rowdir / _subs[0], results_root=_root)
+            _nested_ok = True
+        except SystemExit:
+            _nested_ok = False
+        ck.check(_nested_ok, "#25F regression pin: a normal single-sample dataset still validates")
+        _fake_orphan = _rowdir / f".{_subs[0]}.staging-zzz"
+        _shutil.copytree(_rowdir / _subs[0], _fake_orphan)
+        ck.check(len([n for n, _c in calibrate_depth.discover_samples(_root, _root / "etch depth")
+                      if n.startswith("072426 Row 1/")]) == 5,
+                 "#25F depth calibration finds the 5 nested samples and skips the dot-staging orphan")
+        _shutil.rmtree(_fake_orphan, ignore_errors=True)
+        ck.check(_json.loads((_rowdir / ".pflm-row.json").read_text(encoding="utf-8"))["row"] == 1,
+                 "#25F the row container marks itself before the first sample runs")
+
+        # ---- G. rollup + figures ----
+        _roll = rrep.build_rollup(_recs, row=1, date_tag="072426")
+        _expect = rrep.IDENT_COLS + rrep.canonical_columns() + rrep.MODE_EXTRAS
+        ck.check(list(_roll.columns)[:len(_expect)] == _expect,
+                 "#25G rollup column order is IDENT + canonical + mode extras, explicitly reindexed")
+        ck.check(len(_roll) == 11
+                 and not _roll[_roll["snapshot_id"] > 0].duplicated(
+                     subset=["sample", "snapshot", "array_id"]).any()
+                 and list(_roll["wafer_col"]) == sorted(_roll["wafer_col"]),
+                 "#25G 10 measured + 1 placeholder row; identities unique; sorted by wafer column")
+        _ph = _roll[_roll["wafer_col"] == 3]
+        ck.check(len(_ph) == 1 and not bool(_ph["reliable"].iloc[0])
+                 and not np.isfinite(_ph["depth_um"].iloc[0])
+                 and _ph["status"].iloc[0] == "failed",
+                 "#25G a failed sample is ONE placeholder row, reliable=False, NaN measurements")
+        _kept, _gate_rep = calibrate_depth.apply_gates(_roll.copy())
+        ck.check(len(_kept) == 10 and 3 not in set(_kept["wafer_col"]),
+                 "#25G the placeholder is dropped by the depth-calibration gates without error")
+        _empty = rrep.build_rollup([], row=1, date_tag="072426")
+        ck.check(_empty.empty and list(_empty.columns) == _expect,
+                 "#25G an empty rollup still carries the full schema (fail closed, write no CSV)")
+        _units = rrep.build_units(_roll)
+        ck.check(len(_units) == 6 and _units["lattice"].eq("hex").all()
+                 and np.isfinite(_units.loc[_units["wafer_col"] == 3, "phi_design"]).all(),
+                 "#25G one unit row per sample; the failed column keeps a design Phi from the map")
+        _figs = rrep.make_row_figures(_roll, _units, _rowdir / "row_figures", panels=None,
+                                      plan=_p1, records=_recs)
+        for _want in ("row_depth_vs_passes.png", "row_diameter_fidelity.png",
+                      "row_porosity.png", "row_summary_table.png"):
+            ck.check(any(p.name == _want for p in _figs),
+                     f"#25G {_want} is written even with one column entirely failed")
+        ck.check(not any(p.name == "row_montage.png" for p in _figs),
+                 "#25G the montage is SKIPPED (not faked) when no panels were captured")
+        # Drive the montage for real: captured panels for only SOME columns, so the missing one
+        # must become an all-NaN placeholder panel (np.nanpercentile over an all-NaN slice warns,
+        # hence simplefilter('error') -- this whole path is otherwise never exercised).
+        _rngm = np.random.default_rng(3)
+        _mpanels = [(int(c), f"c{int(c)}", "D50 P100", "P25_S400",
+                     (_rngm.random((40, 60)) * 20).astype(np.float32))
+                    for c in _units["wafer_col"] if int(c) not in (3, 6)]
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _mfig = rrep._fig_montage(_units, _mpanels, _rowdir / "row_figures" / "row_montage.png")
+        ck.check(_mfig is not None and _mfig.is_file(),
+                 "#25G the montage renders with captured panels, NaN-padding the missing columns")
+
+
+        ck.check("5/6 samples registered" in rrep.render_row_summary(_roll, _units, _recs, _p1),
+                 "#25G row_summary.txt states the true registered count")
+
+        # ---- H. regressions pinned from the adversarial review ----
+        try:
+            rr.validate_row_container(_rowdir / _subs[0])    # an existing single-sample dataset
+            _blocked = False
+        except SystemExit as _e:
+            _blocked = "SINGLE-sample result" in str(_e)
+        ck.check(_blocked,
+                 "#25H run_row REFUSES an existing single-sample dataset as a row container "
+                 "(before any sample commits inside it)")
+        _wf = _scratch / "warnword.csv"
+        _wf.write_text("row,col,laser,geometry,lattice\n1,1,WARNING,D50 P100,square\n",
+                       encoding="utf-8")
+        _, _, _wp = wm.read_wafer_map(_wf)
+        ck.check(_wp and not any(x.startswith("WARNING") for x in _wp),
+                 "#25H a map cell whose TEXT is 'WARNING' still blocks — classification is by "
+                 "leading marker, not substring")
+        _e1 = wm.MapEntry(row=1, col=1, line=1, laser="P1_S1", passes=1, speed=1.0,
+                          geometry="D50 P100", nominal_d_um=50.0, nominal_p_um=100.0,
+                          lattice="square")
+        ck.check(wm.plan_row([_e1], ["a_D50_11_Center.vk4", "a_D300_11_TopLeft.vk4"],
+                             {("D50 P100", "square"): "x"}, 1).samples[0].status == "name-mismatch",
+                 "#25H a MIXED VK4 D-token set is a mismatch — every snapshot must agree")
+        _orph = wm.plan_row([_e1], ["a_D50_11_Center.vk4", "a_D100_21_Center.vk4"],
+                            {("D50 P100", "square"): "x"}, 1)
+        ck.check(_orph.blocking and any("no line in the wafer map" in p for p in _orph.problems),
+                 "#25H a wafer column with VK4 files but no map line blocks instead of vanishing")
+        _qn = _scratch / "quoted.csv"
+        _qn.write_text('# date: 072426\nrow,col,laser,geometry,lattice,skip,note\n'
+                       '1,1,S400_P25,D50 P100,hex,,"first\n# not a comment"\n'
+                       '1,2,S400_P20,D50 P100,hex,,ok\n', encoding="utf-8")
+        _qe, _qm, _qp = wm.read_wafer_map(_qn)
+        ck.check(len(_qe) == 2 and not _qp and [x.line for x in _qe] == [4, 5]
+                 and "not a comment" in _qe[0].note,
+                 "#25H a quoted note containing a newline (whose continuation starts with '#') "
+                 "loses no record and keeps true line numbers")
+        _wide = rr.DxfFact(path="w.dxf", name="w.dxf", n_cells=1, n_arrays=1, is_unit_cell=False,
+                           marker_shape="", lattice="square", pitch_um=350.3, diameter_um=295.0,
+                           n_pins=100)
+        ck.check(rr.resolve_dxfs([_wide], {("D300 P350", "square")})[0]
+                 .get(("D300 P350", "square")) == "w.dxf",
+                 "#25H PITCH_TOL_UM is honoured: a drawing pitched 350.3 µm matches a declared 350")
+    except Exception as e:                                   # pragma: no cover
+        ck.check(False, f"wafer-row runner path raised: {e!r}")
+    finally:
+        if _scratch is not None:
+            __import__("shutil").rmtree(_scratch, ignore_errors=True)
+
     df.to_csv(OUT / "synth_measurements.csv", index=False)
     print(f"\nWrote synthetic measurements + plots to {OUT}")
     print(f"\n{'='*60}\n{ck.n - len(ck.fails)}/{ck.n} checks passed")
