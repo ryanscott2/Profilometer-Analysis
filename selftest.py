@@ -1952,6 +1952,41 @@ def main():
         ck.check(rr.resolve_dxfs([_wide], {("D300 P350", "square")})[0]
                  .get(("D300 P350", "square")) == "w.dxf",
                  "#25H PITCH_TOL_UM is honoured: a drawing pitched 350.3 µm matches a declared 350")
+
+        # ---- I. staggered (centered-rectangular) lattice, as drawn on the 072426 wafer ----
+        import types as _types
+
+        def _arr(a1, a2):
+            return _types.SimpleNamespace(lattice_vectors=np.array([a1, a2], float),
+                                          pitch_x_um=float(np.linalg.norm(a1)),
+                                          pitch_y_um=float(np.linalg.norm(a2)),
+                                          pitch_um=0.5 * (float(np.linalg.norm(a1))
+                                                          + float(np.linalg.norm(a2))))
+        _stag = _arr((0.0, 150.0), (-150.0, 75.0))          # rows at 150 um offset by half a period
+        ck.check(rr.lattice_kind(_stag) == "staggered"
+                 and rr.lattice_kind(_arr((0.0, 100.0), (-86.6025, 50.0))) == "triangular"
+                 and rr.lattice_kind(_arr((100.0, 0.0), (0.0, 100.0))) == "square",
+                 "#25I lattice_kind separates staggered from triangular and square (hex is the "
+                 "special case of a centered-rectangular lattice, so order matters)")
+        ck.check(abs(rr.lattice_pitch_um(_stag) - 150.0) < 1e-6
+                 and abs(_stag.pitch_um - 158.855) < 0.01,
+                 "#25I lattice_pitch_um gives the 150 µm PERIOD where PinArray.pitch_um would give "
+                 "the meaningless 158.9 µm mean of the two basis lengths")
+        ck.check(wm.parse_lattice("Stagger") == wm.parse_lattice("staggered") == "stagger"
+                 and wm.parse_lattice("Hex") == "hex" and wm.parse_lattice("neither") is None,
+                 "#25I the wafer map accepts stagger as a third lattice, distinct from hex")
+        _sf = rr.DxfFact(path="s50.dxf", name="s50.dxf", n_cells=1, n_arrays=1, is_unit_cell=False,
+                         marker_shape="", lattice="staggered", pitch_um=150.0, diameter_um=50.0,
+                         n_pins=1122)
+        _sf100 = rr.DxfFact(path="s100.dxf", name="s100.dxf", n_cells=1, n_arrays=1,
+                            is_unit_cell=False, marker_shape="", lattice="staggered",
+                            pitch_um=150.0, diameter_um=100.0, n_pins=1089)
+        _sm, _sp, _sw = rr.resolve_dxfs([_sf, _sf100], {("D50 P150", "stagger"),
+                                                        ("D100 P150", "stagger")})
+        ck.check(not _sp and _sm[("D50 P150", "stagger")] == "s50.dxf"
+                 and _sm[("D100 P150", "stagger")] == "s100.dxf" and len(_sw) == 2,
+                 "#25I two staggered drawings on the SAME period are separated by drawn diameter, "
+                 "with a warning, instead of being called ambiguous")
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"wafer-row runner path raised: {e!r}")
     finally:
