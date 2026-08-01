@@ -88,7 +88,7 @@ MIN_REG_SCORE = 0.5                            # mirrors the run_sample.analyze_
 
 # ================================================================ DXF resolution == #
 def lattice_kind(array, *, tol=0.03, ang_tol=0.02):
-    """``'square'|'rectangular'|'triangular'|'oblique'`` from a ``PinArray``'s primitive basis.
+    """``'square'|'rectangular'|'triangular'|'staggered'|'oblique'`` from a primitive basis.
 
     The design carries no lattice field -- ``pitch_x_um``/``pitch_y_um`` are both the
     nearest-neighbour pitch for a hex array too, so they cannot tell hex from square. The primitive
@@ -113,7 +113,36 @@ def lattice_kind(array, *, tol=0.03, ang_tol=0.02):
         return "square" if equal else "rectangular"
     if equal and abs(c - 0.5) <= ang_tol:
         return "triangular"
+    # Centered-rectangular ("staggered"/brick): rows at spacing |a| offset by half a period, i.e.
+    # one primitive vector is half the other plus a PERPENDICULAR component. Tested after the
+    # triangular case on purpose -- hex satisfies this too, as the special case where the offset
+    # makes every neighbour distance equal, and it must keep its own name.
+    for u, v in ((a1, a2), (a2, a1)):
+        nu = float(np.linalg.norm(u))
+        if nu <= 0:
+            continue
+        for off in (v - 0.5 * u, v + 0.5 * u):
+            if abs(float(off @ u)) <= ang_tol * nu * max(float(np.linalg.norm(off)), 1e-9):
+                return "staggered"
     return "oblique"
+
+
+def lattice_pitch_um(array):
+    """The nearest-neighbour period of a ``PinArray``'s lattice, in µm.
+
+    NOT ``PinArray.pitch_um``, which is the MEAN of the two primitive vector lengths. Those are
+    equal for a square or triangular lattice (so the mean is the period), but not for a staggered
+    one: a 150 µm staggered lattice has |a1| = 150 and |a2| = 167.7, averaging to a meaningless
+    158.9 that matches no declared pitch. The shortest lattice translation is the period in every
+    case."""
+    lv = getattr(array, "lattice_vectors", None)
+    if lv is None:
+        return float(array.pitch_um)
+    a1, a2 = np.asarray(lv, dtype=float)
+    cands = [a1, a2, a1 + a2, a1 - a2]
+    norms = [float(np.linalg.norm(v)) for v in cands]
+    good = [n for n in norms if n > 1e-9]
+    return min(good) if good else float(array.pitch_um)
 
 
 @dataclass(frozen=True)
@@ -198,15 +227,19 @@ def index_dxf_dir(dxf_dir, *, read=None):
         facts.append(DxfFact(
             path=str(p), name=p.name, n_cells=len(design.cells), n_arrays=len(cell.arrays),
             is_unit_cell=bool(design.is_unit_cell), marker_shape=cell.marker_shape or "",
-            lattice=lattice_kind(arr), pitch_um=float(arr.pitch_um),
+            lattice=lattice_kind(arr), pitch_um=lattice_pitch_um(arr),
             diameter_um=float(arr.diameter_um), n_pins=int(cell.n_pins),
             name_d=nd, name_p=np_, name_tri=ntri))
     return facts, problems
 
 
+#: wafer-map lattice word -> the word ``lattice_kind`` derives from the drawing's primitive basis
+_LATTICE_DXF_WORD = {"hex": "triangular", "square": "square", "stagger": "staggered"}
+
+
 def _lattice_to_dxf_word(lattice):
     """The wafer map says 'hex'; a drawing's primitive basis says 'triangular'. Same lattice."""
-    return "triangular" if lattice == "hex" else "square"
+    return _LATTICE_DXF_WORD.get(lattice, "square")
 
 
 def _verify_fact(fact, geometry, lattice):
@@ -269,7 +302,7 @@ def resolve_dxfs(facts, needed, *, explicit=None):
                                    n_cells=len(design.cells), n_arrays=len(cell.arrays),
                                    is_unit_cell=bool(design.is_unit_cell),
                                    marker_shape=cell.marker_shape or "",
-                                   lattice=lattice_kind(arr), pitch_um=float(arr.pitch_um),
+                                   lattice=lattice_kind(arr), pitch_um=lattice_pitch_um(arr),
                                    diameter_um=float(arr.diameter_um), n_pins=int(cell.n_pins),
                                    name_d=nd, name_p=np_, name_tri=ntri)
                 except Exception as e:
@@ -290,6 +323,17 @@ def resolve_dxfs(facts, needed, *, explicit=None):
         want_lat = _lattice_to_dxf_word(lattice)
         hits = [f for f in candidates
                 if f.lattice == want_lat and abs(f.pitch_um - want_p) <= PITCH_TOL_UM]
+        if len(hits) > 1:
+            # Two drawings can share a pitch AND a lattice: on this wafer the D50 and D100 STAGGERED
+            # cells were both drawn on the same 150 µm period. Diameter is normally only a
+            # tolerance, but here it is the sole discriminator, so fall back to it before declaring
+            # ambiguity -- and only if it leaves exactly one survivor.
+            narrowed = [f for f in hits if not _verify_fact(f, geometry, lattice)]
+            if len(narrowed) == 1:
+                warns.append(f"{geometry} / {lattice}: {len(hits)} drawings share that pitch and "
+                             f"lattice ({', '.join(f.name for f in hits)}); selected "
+                             f"{Path(narrowed[0].path).name} on drawn diameter")
+                hits = narrowed
         if not hits:
             seen = "; ".join(f"{f.name} (pitch {f.pitch_um:g}, {f.lattice}, Ø {f.diameter_um:g}, "
                              f"{f.n_arrays} array(s), marker {f.marker_shape or 'none'})"

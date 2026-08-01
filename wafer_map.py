@@ -84,6 +84,11 @@ _LATTICE_ALIASES = {
     "hex": "hex", "hexagonal": "hex", "triangular": "hex", "tri": "hex", "hexagon": "hex",
     "square": "square", "sq": "square", "rect": "square", "rectangular": "square",
     "grid": "square",
+    # A 'staggered' (brick / centered-rectangular) lattice: rows at spacing p, offset by p/2. Hex is
+    # the SPECIAL CASE of that where the offset makes every neighbour distance equal, so the two are
+    # different lattices and must never be aliased together.
+    "stagger": "stagger", "staggered": "stagger", "brick": "stagger",
+    "centered": "stagger", "centred": "stagger",
 }
 _TRUTHY = {"1", "true", "yes", "y", "x", "skip", "t"}
 _FALSY = {"", "0", "false", "no", "n", "f"}
@@ -145,8 +150,8 @@ def geometry_tokens(geometry):
 
 
 def parse_lattice(text):
-    """``'hex'`` | ``'square'`` from a user token, or None. 'triangular' is the DXF's word for the
-    same thing the wafer table calls 'Hex'."""
+    """``'hex'`` | ``'square'`` | ``'stagger'`` from a user token, or None. 'triangular' is the
+    DXF's word for the same thing the wafer table calls 'Hex'."""
     return _LATTICE_ALIASES.get(str(text or "").strip().casefold()) or None
 
 
@@ -277,7 +282,7 @@ class MapEntry:
     dxf: str = ""                               # explicit override, '' = resolve by content
 
 
-def parse_wafer_map_rows(dict_rows, *, base_dir=None):
+def parse_wafer_map_rows(dict_rows, *, base_dir=None, dxf_dir=None):
     """Parse ``[(line_no, {header: value})]`` -> ``(entries, problems)``. PURE.
 
     Every problem is collected and reported together -- a first-error-only parser makes fixing a
@@ -316,8 +321,16 @@ def parse_wafer_map_rows(dict_rows, *, base_dir=None):
             problems.append(f"line {line_no}: {e}")
             continue
         dxf = str(rec.get("dxf", "")).strip()
-        if dxf and base_dir is not None and not Path(dxf).is_absolute():
-            dxf = str((Path(base_dir) / dxf).resolve())
+        if dxf and not Path(dxf).is_absolute():
+            # A bare filename in the dxf= column almost always means "the one in the DXF folder",
+            # not "next to this CSV" -- try the declared dxf_dir first, then the map's own folder,
+            # and fall back to the map folder so the error names a definite path.
+            for cand in [Path(d) / dxf for d in (dxf_dir, base_dir) if d]:
+                if cand.is_file():
+                    dxf = str(cand.resolve())
+                    break
+            else:
+                dxf = str((Path(base_dir) / dxf).resolve()) if base_dir else dxf
 
         if skip:
             if not note:
@@ -345,7 +358,8 @@ def parse_wafer_map_rows(dict_rows, *, base_dir=None):
         lat_raw = str(rec.get("lattice", "")).strip()
         lattice = parse_lattice(lat_raw)
         if lattice is None:
-            problems.append(f"line {line_no}: lattice={lat_raw!r} — expected hex or square")
+            problems.append(f"line {line_no}: lattice={lat_raw!r} — expected hex, square "
+                            f"or stagger")
             continue
 
         entries.append(MapEntry(
@@ -395,7 +409,8 @@ def read_wafer_map(path):
     if unknown:
         problems.append(f"WARNING: {p.name}: ignoring unknown column(s) {unknown}")
     dict_rows = [(line_no, dict(zip(headers, rec))) for line_no, rec in body[1:]]
-    entries, more = parse_wafer_map_rows(dict_rows, base_dir=p.parent)
+    entries, more = parse_wafer_map_rows(dict_rows, base_dir=p.parent,
+                                        dxf_dir=meta.get("dxf_dir"))
     return entries, meta, problems + more
 
 
