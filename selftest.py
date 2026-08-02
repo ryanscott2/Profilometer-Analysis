@@ -1987,6 +1987,38 @@ def main():
                  and _sm[("D100 P150", "stagger")] == "s100.dxf" and len(_sw) == 2,
                  "#25I two staggered drawings on the SAME period are separated by drawn diameter, "
                  "with a warning, instead of being called ambiguous")
+
+        # ---- J. dose-robust pin evidence (the high-dose registration recovery) ----
+        import types as _types
+        import register as _rg
+        _val = np.ones((240, 240), bool)
+        _lo = np.zeros((240, 240))                       # 3 um pins on a quiet floor
+        _hi = np.zeros((240, 240))                       # 40 um pins + 6 um ejecta everywhere
+        _rr = np.random.default_rng(7)
+        for _y in range(20, 240, 40):
+            for _x in range(20, 240, 40):
+                _lo[_y-8:_y+8, _x-8:_x+8] = 3.0
+                _hi[_y-8:_y+8, _x-8:_x+8] = 40.0
+        _hi += (_rr.random((240, 240)) < 0.06) * 6.0     # ejecta: clears a fixed 2 um bar, not 20%
+        _mlo = _rg._adaptive_pin_mask(_lo, _val, 40.0)
+        _mhi = _rg._adaptive_pin_mask(_hi, _val, 40.0)
+        _pins_hi = np.zeros((240, 240), bool)
+        for _y in range(20, 240, 40):
+            for _x in range(20, 240, 40):
+                _pins_hi[_y-8:_y+8, _x-8:_x+8] = True
+        ck.check(_mlo.sum() > 0.5 * (_lo > 0).sum(),
+                 "#25J a low-relief scan still clears the 2 um noise floor — quiet cells are "
+                 "not thrown away by the dose-robust bar")
+        ck.check(float((_mhi & ~_pins_hi).sum()) / max(int(_mhi.sum()), 1) < 0.02
+                 and _mhi[_pins_hi].mean() > 0.9,
+                 "#25J on a high-relief scan the bar scales with the scan's own span, so ejecta "
+                 "is excluded while every real pin is kept")
+        _exp = np.pi * 8 * 8                             # one nominal pin's area, px
+        _arrstub = _types.SimpleNamespace(diameter_um=16.0)
+        ck.check(_rg.PIN_AREA_FLOOR_FRAC * _exp > 0.04 * _exp
+                 and _rg.PIN_AREA_FLOOR_FRAC <= 0.25 + 1e-9,
+                 "#25J the component area floor is a fraction of one pin's AREA, tightened from "
+                 "0.04 to 0.25 so a half-diameter pin survives but speckle does not")
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"wafer-row runner path raised: {e!r}")
     finally:
