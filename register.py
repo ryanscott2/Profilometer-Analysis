@@ -686,6 +686,18 @@ def _cell_pin_pattern(template, xppx, yppx, x_right, y_up, rot_deg, ds, margin_p
     return T, t0c, t0r, Ht, Wt
 
 
+#: Pin prominence, as a fraction of the scan's OWN leveled-height span, used alongside the fixed
+#: noise floor. The 2 um floor is a NOISE threshold; laser ejecta is not noise and scales with dose,
+#: so on a high-dose cell a fixed bar admits debris fragments as if they were pins. Scaling with the
+#: scan's own relief keeps the bar at "a real pin" on every cell.
+DOSE_ROBUST_PROM_FRAC = 0.20
+#: Component-area floor as a fraction of one nominal pin's area. A pin eroded to half its drawn
+#: DIAMETER still has ~25% of its area, so this keeps genuinely damaged pins while rejecting the
+#: ejecta speckle that the old 0.04 (= 20% of diameter) let through.
+PIN_AREA_FLOOR_FRAC = 0.25
+PIN_AREA_CEIL_FRAC = 1.6                    # unchanged: rejects bridged/merged pin pairs
+
+
 def _adaptive_pin_mask(z0, valid, pitch_px, min_prom_um=2.0):
     """Depth-robust pin map for the marker-free fallback: mark pixels raised above the LOCAL
     floor rather than a single global height threshold.
@@ -693,15 +705,27 @@ def _adaptive_pin_mask(z0, valid, pitch_px, min_prom_um=2.0):
     ``scan_feature``'s ``pin_mask`` (used by the marker path) thresholds the leveled height at a
     whole-scan percentile, so on a sample whose cells span a wide depth range the SHALLOW cells'
     pins never clear the global level and vanish. Here the background is a local (~1.5 pin-pitch)
-    mean, so a small fixed prominence catches pins at any absolute etch depth -- exactly the
-    cells the global mask drops. The marker path is untouched; this feeds the fallback only."""
+    mean, so a small prominence catches pins at any absolute etch depth -- exactly the cells the
+    global mask drops. The marker path is untouched; this feeds the fallback only.
+
+    The prominence bar is the LARGER of ``min_prom_um`` (a noise floor) and a fraction of the
+    scan's own relief. On a heavily-ablated cell the ejecta around each pin clears a fixed 2 um
+    bar, so the component set becomes part pins and part debris, and every statistic computed over
+    it -- coherence, inlier fraction -- is diluted by the debris rather than by any defect in the
+    lattice. Scaling the bar with the scan's own height span fixes the EVIDENCE instead of
+    weakening the fail-closed tests that consume it."""
     from scipy.ndimage import uniform_filter
     k = int(max(5, round(1.5 * pitch_px)))
     vf = valid.astype(np.float32)
     zf = np.where(valid, z0, 0.0).astype(np.float32)
     bg = (uniform_filter(zf, size=k, mode="nearest")
           / np.maximum(uniform_filter(vf, size=k, mode="nearest"), 1e-6))
-    return valid & ((z0 - bg) > min_prom_um)
+    rel = z0 - bg
+    if np.any(valid):
+        span = float(np.percentile(rel[valid], 95) - np.percentile(rel[valid], 5))
+        if np.isfinite(span) and span > 0:
+            min_prom_um = max(min_prom_um, DOSE_ROBUST_PROM_FRAC * span)
+    return valid & (rel > min_prom_um)
 
 
 def _uniform_component_centers(pin_mask, array, xppx, yppx):
@@ -709,8 +733,10 @@ def _uniform_component_centers(pin_mask, array, xppx, yppx):
 
     Connected components are used only to estimate lattice angle and phase.  Final finite-array
     scoring samples every expected lattice node directly, so a damaged or bridged component cannot
-    by itself create edge evidence.  The broad area window deliberately retains partial/eroded pin
-    tops while rejecting the many one-pixel prominence speckles seen in real VK4 height maps.
+    by itself create edge evidence.  The area window retains partial/eroded pin tops while
+    rejecting the prominence speckle seen in real VK4 height maps -- the floor is a fraction of one
+    pin's AREA, so a pin worn to half its drawn diameter (a quarter of its area) still counts while
+    ejecta fragments do not.
     """
     from scipy.ndimage import center_of_mass, label
 
@@ -719,8 +745,8 @@ def _uniform_component_centers(pin_mask, array, xppx, yppx):
         return np.empty((0, 2), float)
     areas = np.bincount(labels.ravel())[1:]
     expected = np.pi * (0.5 * array.diameter_um / xppx) * (0.5 * array.diameter_um / yppx)
-    keep = np.flatnonzero((areas >= max(3.0, 0.04 * expected))
-                          & (areas <= 1.6 * expected)) + 1
+    keep = np.flatnonzero((areas >= max(3.0, PIN_AREA_FLOOR_FRAC * expected))
+                          & (areas <= PIN_AREA_CEIL_FRAC * expected)) + 1
     if keep.size == 0:
         return np.empty((0, 2), float)
     rc = np.asarray(center_of_mass(pin_mask, labels, keep), float)
