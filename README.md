@@ -99,6 +99,100 @@ python run_sample.py --snapshots <vk4_dir> <out_dir> <dxf> P{passes}_S{speed}
 `snapshot montage: Center, TopLeft` when it detects disjoint snapshots, and Run routes to this mode
 automatically (the shared dose is the first `P{passes}_S{speed}` in the params box).
 
+## Workflow — a whole wafer row at once (`run_row.py`)
+
+A wafer carries a GRID of samples: each is one uniform-cell dataset (one pin geometry, one laser
+dose, one or more disjoint snapshots) — exactly the `--snapshots` unit above. `run_row.py` runs an
+entire wafer ROW in one command and rolls the results up.
+
+**VK4 naming.** Each file carries a compact `_{col}{row}_` token before its snapshot label — the
+FIRST digit is the wafer column, the SECOND is the wafer row:
+
+```
+072230_PFLMTIM_D50_11_Center.vk4      -> col 1, row 1, snapshot 'Center'
+072230_PFLMTIM_D50_13_TopLeft.vk4     -> col 1, row 3, snapshot 'TopLeft'
+```
+
+An explicit `C{col}R{row}` token also works, for a wafer wider than nine columns. A stem with no
+unambiguous token is never guessed at — it is listed as unparsed and blocks the run until it is
+renamed or `--allow-unparsed` is given.
+
+**`CSV/wafer_map.csv`** declares, per (row, col), the dose, the pin geometry and the lattice:
+
+```csv
+# date: 072426
+row,col,laser,geometry,lattice,skip,note,dxf
+1,1,S400_P25,D50 P100,hex,,,
+1,3,S400_P22,D100 P150,hex,,,
+3,1,,,,1,"Stagger pattern incorrect, disregard",
+4,1,P26_S800,D300 P350,square,,,
+```
+
+`laser` accepts either token order (`S400_P25` or `P26_S800`) and canonicalises to the P-first form
+the rest of the pipeline uses. Geometry is declared **per line and never inferred**: on this wafer
+the column→geometry pairing REVERSES between rows 1–2 and row 4. `skip` drops a row from the run
+while keeping the design point on record. `dxf` optionally names a drawing explicitly (still
+content-verified). Every problem in the file is reported at once, with line numbers.
+
+**DXF resolution is by CONTENT, not filename.** Each drawing is parsed and keyed on
+`(pitch, lattice)`, where the lattice comes from the primitive basis (90° between equal vectors =
+square, 60° = triangular/hex — `pitch_x_um`/`pitch_y_um` are equal for both and cannot tell them
+apart). Only single markerless uniform arrays are candidates, which resolves the collision between
+a wafer DXF and a legacy tiled design at the same pitch. Zero or ≥2 candidates is a blocking error
+naming every file considered; nothing is guessed. Drawn diameter is a ±15 % sanity tolerance, never
+a key — drawings are deliberately undersized against their nominal label (`D300_P350` draws 295 µm).
+
+Three cross-checks guard the one genuinely silent failure — a transposed map, where a
+right-pitch/wrong-diameter DXF registers cleanly and poisons every `drawn_diameter_um`: the VK4
+filename's `D` token must agree with the map (blocking; `--allow-name-mismatch` to override), the
+DXF filename's pitch/`TRIANGULAR` tokens must agree with its own content (warning), and after the
+run `median(diameter_um)/drawn_diameter_um` must land in [0.7, 1.6] (status `suspect`).
+
+```bash
+python run_row.py --row 1 --dry-run
+python run_row.py --row 1 --vk4 <dir> [<dir> ...] --dxf-dir <dir>
+```
+
+`--vk4` takes several folders, and a folder with no top-level `*.vk4` is searched recursively — so
+pointing at the PARENT of per-geometry folders works, which matters because one wafer row is spread
+across them. The full plan is printed before anything runs; `--dry-run` stops there. Exit codes:
+`0` all ready samples produced data, `1` partial row, `2` none succeeded, `3` plan blocked (nothing
+written). One sample failing never aborts the row — `SystemExit` is caught alongside `Exception`,
+because that is how registration failure is reported.
+
+Output layout — note the extra nesting level:
+
+```
+Results/072426 Row 1/                  <- a plain CONTAINER, never a transaction target
+    .pflm-row.json
+    c1 D50 P100 P25_S400/              <- a normal, fully transactional per-sample dataset
+    ...
+    row_measurements.csv               <- every sample's rows + wafer_col/geometry/lattice/laser
+    row_units.csv                      <- one row per sample (medians + design/achieved Φ)
+    row_summary.txt  row_manifest.json
+    row_figures/                       <- row_depth_vs_passes, row_diameter_fidelity,
+                                          row_porosity, row_summary_table, row_montage
+```
+
+**The container must never contain `figures/` or a `legacy/measurements.csv`.**
+`run_sample._looks_like_legacy_output` ANDs exactly those two conditions, and a transaction
+committed on the container would rename the whole subtree into `%TEMP%` and delete it — destroying
+every per-sample result while printing success. Hence the `row_*` names, plain atomic writes for
+the rollup, and `run_sample._contains_owned_datasets`, which refuses the container as an output
+target from the other side. A sample that failed to register keeps exactly one placeholder row in
+`row_measurements.csv` (all-NaN, `reliable=False`): a missing design point must never be a missing
+row. `row_measurements.csv` is built to be `pd.concat`ed across rows for a later hex-vs-square
+comparison.
+
+With two doses per geometry and a constant speed, no model is fitted — the figures connect the
+measured points and label the segment slope. Pool several rows with `calibrate_depth.py` for a fit;
+it descends one level into a row container, so the samples appear as
+`072426 Row 1/c1 D50 P100 P25_S400`.
+
+**From the UI:** select the wafer folder — the VK4 label shows `wafer map: 9 samples, rows 1,2,3`,
+a `wafer row` chip and a row picker appear in the toolbar, and Run drives `run_row.py` in one
+subprocess with the usual console/Stop plumbing.
+
 Inspect just the DXF geometry:
 
 ```bash
@@ -124,8 +218,8 @@ prevents Git from rewriting DXF bytes during checkout.
 |--------|----------|
 | `DXF/` | the fabrication DXF (one unit cell, or a larger tiled design) |
 | `VK4/` | Keyence profilometer scans (`*.vk4`) |
-| `CSV/` | `cell_params.csv` (per-cell laser settings) + `radial_sets.csv` (radial overlays) |
-| `Results/` | analysis outputs. Every run uses a dedicated `Results/<dataset name>/` child; direct runs default to `Results/direct/` |
+| `CSV/` | `cell_params.csv` (per-cell laser settings), `radial_sets.csv` (radial overlays), `wafer_map.csv` (per-sample dose/geometry/lattice for `run_row.py`) |
+| `Results/` | analysis outputs. Every run uses a dedicated `Results/<dataset name>/` child; direct runs default to `Results/direct/`. A wafer row adds one nesting level: `Results/<date> Row <n>/<sample>/` |
 
 ## Laser parameters CSV (`cell_params.csv`)
 
@@ -280,7 +374,13 @@ python calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
   `depth_vs_passes_speed_3d.png` (per-band 3-D depth = f(passes, speed): measured points + the
   recommended-model surface + a target-depth plane), `depth_parity.png`, and `depth_heatmap.png`
   (passes×speed predicted-depth heatmap with the target-depth contour — read off which (P, S) hits
-  the target).
+  the target). `depth_heatmap.png` (name kept for compatibility) is a **scatter of the measured
+  cells only** — one marker per cell-band median at its (scan speed, passes), coloured by measured
+  depth, with a **red dashed ring** on any cell whose depth landed within ±`TARGET_WINDOW_UM`
+  (5 µm) of a requested target, i.e. the 50–60 µm window for the default 55 µm target. There is
+  deliberately no model surface and no fitted contour: a colour field over the whole rectangle is a
+  picture of depths nobody measured, and most of it would be extrapolation. Everything on that
+  figure is a measurement; the fitted models and their caveats stay in `depth_calibration.txt`.
 
 **From the UI:** the *Depth calibration* panel (right column) lists the discovered samples
 (multi-select; none selected = all) in a two-column table — the sample name and an inline **cells**
@@ -304,7 +404,18 @@ at left).
 - `run_sample.py` — full-sample driver (assemble → register grid → measure → plots); also the
   `--snapshots` multi-snapshot mode (register each disjoint crop of one uniform cell independently →
   measure → tiled montage under the usual figure names).
+- `wafer_map.py` — wafer-row vocabulary: the VK4 `_{col}{row}_` filename grammar, the
+  `wafer_map.csv` reader, and `plan_row` (pure; stdlib only, so `pflm_ui.py` can import it without
+  pulling in numpy/pandas/matplotlib). Also owns the shared `safe_name` folder sanitiser.
+- `run_row.py` — wafer-row driver: content-based DXF resolution, preflight plan, one
+  `analyze_multi_snapshot` call per wafer column, error containment, rollup.
+- `row_report.py` — the row rollup: combined `row_measurements.csv`/`row_units.csv` schema and the
+  five cross-sample comparison figures.
 - `calibrate_depth.py` — cross-sample etch-depth calibration (see below); reuses `report._ols_fit`.
+- `figstyle.py` — house figure typography: named type-size roles (`TITLE`, `LABEL`, `TICK`,
+  `LEGEND`, `ANNOT`, …) and the `PLOT_RC` rc-context, all derived from one `BUMP` constant. Every
+  figure writer imports it, so a presentation-size change is a one-line edit rather than ~130
+  scattered literals.
 - `pflm_ui.py` — Tkinter sample-tester GUI (sample library, run/stop, figure preview,
   depth-calibration panel).
 - `synth.py`, `selftest.py` — synthetic scan generator and end-to-end validation.
