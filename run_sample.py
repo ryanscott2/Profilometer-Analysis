@@ -38,9 +38,12 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Rectangle
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
+from matplotlib.ticker import NullFormatter
+import matplotlib.patheffects as pe
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the '3d' projection)
 
 sys.path.insert(0, str(Path(__file__).parent))
+import figstyle as fs      # house type sizes -- one knob for every figure in the project
 from dxf_geometry import read_design, validate_equivalent_cells
 from assemble import assemble_tiles
 from register import RegistrationAmbiguityError, register_sample
@@ -500,10 +503,22 @@ def _resample_cell(field, placement, template, valid, res_um=2.0, box=None):
     return out.reshape(ny, nx), (x0, x1, y0, y1)
 
 
-def _cb(cb, label, fontsize=14):
+def _cb(cb, label, fontsize=fs.LABEL):
     """Label a colorbar at the figure's presentation type size (label + tick labels together)."""
     cb.set_label(label, fontsize=fontsize); cb.ax.tick_params(labelsize=fontsize)
     return cb
+
+
+def _image_cb(im, ax, label, *, size="4%", pad=0.16):
+    """Colorbar matched to the IMAGE height, for an ``aspect='equal'`` map.
+
+    ``plt.colorbar(ax=ax)`` sizes its axes from ax's box as it stands at creation time, but an
+    aspect-equal image is afterwards shrunk to fit inside that box -- leaving a bar visibly taller
+    than the picture it describes. An axes_grid1 divider is re-evaluated at draw time from the
+    final position, so the two match exactly (measured 1.000 vs 1.056 for the shrink= form)."""
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+    cax = make_axes_locatable(ax).append_axes("right", size=size, pad=pad)
+    return _cb(ax.figure.colorbar(im, cax=cax), label)
 
 
 def _overlay_design(ax, template, res_by_array, box=None):
@@ -520,12 +535,12 @@ def _overlay_design(ax, template, res_by_array, box=None):
         txt = f"D{a.diameter_um:g} P{a.pitch_um:g}"
         if r is not None and np.isfinite(r.diameter_um) and a.diameter_um:
             txt += f" {100*(r.diameter_um-a.diameter_um)/a.diameter_um:+.0f}%"
-        ax.text(a.x0_um - 10, a.y1_um + 26, txt, color="red", fontsize=10.5,
+        ax.text(a.x0_um - 10, a.y1_um + 26, txt, color="red", fontsize=fs.ANNOT_SM,
                 va="bottom", ha="left")
     x0, x1, y0, y1 = box if box is not None else _cell_content_box(template)
     ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
-    ax.set_xlabel("x (µm, design)", fontsize=14)     # matches the report's 14 pt tick labels
-    ax.set_ylabel("y (µm, design)", fontsize=14)
+    ax.set_xlabel("x (µm, design)", fontsize=fs.LABEL)
+    ax.set_ylabel("y (µm, design)", fontsize=fs.LABEL)
 
 
 def render_cell_report(scan, placement, template, res_by_array, params, path, box=None):
@@ -552,15 +567,15 @@ def render_cell_report(scan, placement, template, res_by_array, params, path, bo
     im = ax0.imshow(zdisp, origin="lower", extent=ext, cmap="viridis", vmin=0, vmax=vmax,
                     aspect="equal")
     _overlay_design(ax0, template, res_by_array, box=box)
-    _cb(plt.colorbar(im, ax=ax0, shrink=0.85), "height above floor (µm)")
-    ax0.set_title("Height above floor", fontsize=16)
+    _image_cb(im, ax0, "height above floor (µm)")
+    ax0.set_title("Height above floor", fontsize=fs.TITLE)
     if inten is not None:
         im1 = ax1.imshow(inten, origin="lower", extent=ext, cmap="gray", aspect="equal",
                          vmin=np.nanpercentile(inten, 2), vmax=np.nanpercentile(inten, 98))
-        _cb(plt.colorbar(im1, ax=ax1, shrink=0.85), "intensity")    # keeps x-axes aligned
+        _image_cb(im1, ax1, "intensity")            # matched height keeps the x-axes aligned
     _overlay_design(ax1, template, res_by_array, box=box)
-    ax1.set_title("Intensity", fontsize=16)
-    ax0.tick_params(labelsize=14); ax1.tick_params(labelsize=14)    # ax1 shares ax0's axes
+    ax1.set_title("Intensity", fontsize=fs.TITLE)
+    ax0.tick_params(labelsize=fs.TICK); ax1.tick_params(labelsize=fs.TICK)  # ax1 shares ax0
 
     axr = fig.add_subplot(gs[:, 1]); axr.axis("off")
 
@@ -571,7 +586,8 @@ def render_cell_report(scan, placement, template, res_by_array, params, path, bo
     title = (f"Unit cell (row {placement.cell_row}, col {placement.cell_col})   —   {lp}\n"
              f"cell marker in sample: x = {cx:.2f} mm, y = {cy:.2f} mm   ·   "
              f"registration {placement.score:.2f}")
-    axr.text(0.0, 1.0, title, transform=axr.transAxes, va="top", fontsize=17, weight="bold")
+    axr.text(0.0, 1.0, title, transform=axr.transAxes, va="top", fontsize=fs.HEADLINE,
+             weight="bold")
 
     def _f(v):
         return f"{v:.1f}" if np.isfinite(v) else "—"
@@ -589,7 +605,7 @@ def render_cell_report(scan, placement, template, res_by_array, params, path, bo
     _th = min(0.82, 0.09 * (len(rows_t) + 1))            # scale height with #rows (no tall stretch)
     tbl = axr.table(cellText=rows_t, colLabels=col_labels, cellLoc="center",
                     bbox=[0.0, 0.80 - _th, 1.0, _th])
-    tbl.auto_set_font_size(False); tbl.set_fontsize(12)
+    tbl.auto_set_font_size(False); tbl.set_fontsize(fs.TABLE)
     tbl.auto_set_column_width(col=list(range(len(col_labels))))   # headers need it at this size
     for c in range(len(col_labels)):
         tbl[0, c].set_facecolor("#dddddd"); tbl[0, c].set_text_props(weight="bold")
@@ -600,6 +616,67 @@ def render_cell_report(scan, placement, template, res_by_array, params, path, bo
 
 
 # ------------------------------------------------- laser-parameter summary #
+# Presentation feedback on this pair of figures (2026-08 review): the viridis pass-count ramp has
+# poor line-to-line contrast (its pale-yellow end all but vanishes on white), the lines were too
+# thin, the design-target rule was unreadable, and the log speed axis was confusing because
+# matplotlib labels the minor decade subdivisions ("3 x 10^2") alongside the plain 200/400/800
+# majors. The helpers below fix each of those once, for both figures.
+
+# Okabe-Ito, ordered dark -> warm so the ramp still reads as "more passes". High contrast on white
+# AND separable under the common colour-vision deficiencies, which a sequential map is not.
+_ORDINAL_COLORS = ("#0072B2", "#009E73", "#E69F00", "#CC79A7", "#D55E00", "#56B4E9", "#333333")
+_ORDINAL_DASHES = ((0, ()), (0, (6, 2)), (0, (2, 1.6)), (0, (8, 2, 1.5, 2)))
+PARAM_LINE_LW = 3.2                                  # was matplotlib's 1.5 default: "way too thin"
+
+
+def _passes_style(passes_vals):
+    """passes value -> (colour, dash). Redundant encoding: the dash still carries the series in
+    greyscale, or for a reader who cannot separate two of the hues."""
+    return {p: (_ORDINAL_COLORS[i % len(_ORDINAL_COLORS)],
+                _ORDINAL_DASHES[i % len(_ORDINAL_DASHES)])
+            for i, p in enumerate(passes_vals)}
+
+
+def _speed_log_axis(ax, speeds):
+    """Log speed axis labelled with the measured speeds ONLY.
+
+    matplotlib also labels a log axis's minor ticks, so '3 x 10^2' / '6 x 10^2' appear between the
+    explicit 200/400/800 majors and the axis reads as a muddle of two notations -- which is exactly
+    what made the log scaling easy to miss. Minor ticks stay (they show the compression), their
+    labels go."""
+    ax.set_xscale("log")
+    ax.set_xticks(list(speeds))
+    ax.set_xticklabels([f"{s:g}" for s in speeds])
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.tick_params(axis="x", which="minor", length=3)
+
+
+def _target_line(ax, depth_um=55.0):
+    """The design-target rule drawn to be READ: a dark dashed line plus a caption in the RIGHT
+    MARGIN, instead of the thin grey line and grey caption that got lost in the data.
+
+    The caption sits outside the axes because this rule crosses the middle of both figures -- at
+    presentation type size an in-axes caption lands on a data point wherever it is put. Both
+    figures save with bbox_inches='tight', so the margin text is never cropped."""
+    ax.axhline(depth_um, color="0.15", ls=(0, (7, 4)), lw=2.0, zorder=1.5)
+    ax.text(1.008, depth_um, f"design\ntarget\n{depth_um:g} µm",
+            transform=ax.get_yaxis_transform(), va="center", ha="left", fontsize=fs.NOTE,
+            color="0.1", clip_on=False)
+
+
+def _halo(lw=3.0):
+    """White outline so a point callout stays readable where it lands on the data."""
+    return [pe.withStroke(linewidth=lw, foreground="white")]
+
+
+def _cell_callout(ax, label, x, y, *, at_right):
+    """P{passes}_S{speed} callout on a cell marker. Points at the highest speed are labelled to the
+    LEFT: at the right-hand end of the axis an outward label runs off the figure."""
+    ax.annotate(label, (x, y), fontsize=fs.ANNOT, path_effects=_halo(), color="0.15", zorder=5,
+                textcoords="offset points",
+                xytext=(-8, 9) if at_right else (7, 9), ha="right" if at_right else "left")
+
+
 def make_param_summary(df, out_dir):
     """Single figure: how laser parameters (passes × speed) drive etch depth and mid-diameter
     oversizing. One marker per unit cell, each labelled with its P{passes}_S{speed} id, one
@@ -614,33 +691,35 @@ def make_param_summary(df, out_dir):
         depth=("depth_um", "median"), overs=("overs", "median")).reset_index()
 
     passes_vals = sorted(g["passes"].unique())
-    cmap = plt.get_cmap("viridis")
-    colors = {p: cmap(i / max(1, len(passes_vals) - 1)) for i, p in enumerate(passes_vals)}
+    style = _passes_style(passes_vals)
     speeds = sorted(g["speed"].unique())
 
     fig, axes = plt.subplots(2, 1, figsize=(11, 11), sharex=True)
-    for metric, ax, ylab, ref in [
-            ("depth", axes[0], "median etch depth (µm)", (55, "design target 55 µm")),
-            ("overs", axes[1], "mid-Ø oversizing  (meas − drawn)/drawn  (%)", (0, None))]:
+    s_max = max(speeds) if speeds else float("nan")
+    for metric, ax, ylab, target in [
+            ("depth", axes[0], "median etch depth (µm)", 55),
+            ("overs", axes[1], "mid-Ø oversizing  (meas − drawn)/drawn  (%)", None)]:
         for pas in passes_vals:
+            c, dash = style[pas]
             gg = g[g["passes"] == pas].sort_values("speed")
-            ax.plot(gg["speed"], gg[metric], "o-", color=colors[pas], ms=10, mew=1.2,
-                    label=f"{pas} passes")
-            for _, r in gg.iterrows():
-                ax.annotate(r["label"], (r["speed"], r[metric]), fontsize=11,
-                            textcoords="offset points", xytext=(6, 6), color="0.25")
-        if ref[0] is not None:
-            ax.axhline(ref[0], color="grey", ls="--", lw=1)
-            if ref[1]:
-                ax.text(0.01, ref[0], " " + ref[1], transform=ax.get_yaxis_transform(),
-                        va="bottom", color="grey", fontsize=12)
-        # +4 pt over the old literals / the inherited defaults, as in make_param_depth_scatter
-        ax.set_ylabel(ylab, fontsize=14); ax.tick_params(labelsize=14)
-        ax.set_xscale("log"); ax.grid(alpha=0.3)
-    axes[0].set_xticks(speeds); axes[0].set_xticklabels([f"{s:g}" for s in speeds])
-    axes[1].set_xlabel("scan speed (mm/s, log axis)", fontsize=14)
-    axes[0].legend(title="passes", fontsize=13, title_fontsize=14)
-    axes[0].set_title("Laser-parameter effect on depth and diameter", fontsize=16)
+            ax.plot(gg["speed"], gg[metric], marker="o", color=c, ls=dash, lw=PARAM_LINE_LW,
+                    ms=11, mew=1.2, mec="0.15", label=f"{pas} passes", zorder=3)
+            # Only the depth panel is labelled: the callout is (passes, speed), which colour and x
+            # position already give, and at this type size a second set collides in the lower panel.
+            if metric == "depth":
+                for _, r in gg.iterrows():
+                    _cell_callout(ax, r["label"], r["speed"], r[metric],
+                                  at_right=r["speed"] >= s_max)
+        if target is not None:
+            _target_line(ax, target)
+        else:
+            ax.axhline(0, color="0.35", ls="--", lw=1.2)
+        ax.set_ylabel(ylab, fontsize=fs.LABEL); ax.tick_params(labelsize=fs.TICK)
+        ax.margins(y=0.10)                               # headroom: callouts sit above their marker
+        _speed_log_axis(ax, speeds); ax.grid(alpha=0.3)
+    axes[1].set_xlabel("scan speed (mm/s) — log scale", fontsize=fs.LABEL)
+    axes[0].legend(title="passes", fontsize=fs.LEGEND_SM, title_fontsize=fs.LEGEND_SM)
+    axes[0].set_title("Laser-parameter effect on depth and diameter", fontsize=fs.TITLE)
     fig.tight_layout()
     p = Path(out_dir) / "figures" / "param_summary.png"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -667,9 +746,9 @@ def make_param_depth_scatter(df, out_dir):
         label=("cell_label", "first"), depth=("depth_um", "median")).reset_index()
 
     passes_vals = sorted(d["passes"].unique())
-    cmap = plt.get_cmap("viridis")
-    colors = {p: cmap(i / max(1, len(passes_vals) - 1)) for i, p in enumerate(passes_vals)}
+    style = _passes_style(passes_vals)
     speeds = sorted(d["speed"].unique())
+    s_max = max(speeds) if speeds else float("nan")
 
     # diamonds = D300, squares = D100, triangles = D50 family (by drawn Ø). Each family is
     # sub-dodged and every point jittered in log10(speed) space so the cloud reads symmetrically on
@@ -685,44 +764,45 @@ def make_param_depth_scatter(df, out_dir):
             if not len(sub):
                 continue
             x = sub["speed"].to_numpy() * 10.0 ** (dodge + rng.uniform(-jit, jit, len(sub)))
-            ax.plot(x, sub["depth_um"], marker=marker, ls="none", ms=5.5, mew=0.4,
-                    mfc=colors[pas], mec="white", alpha=0.55, zorder=2)
+            ax.plot(x, sub["depth_um"], marker=marker, ls="none", ms=6.5, mew=0.5,
+                    mfc=style[pas][0], mec="white", alpha=0.5, zorder=2)
 
     # per-passes line through the cell medians, drawn on top of its scatter
     for pas in passes_vals:
+        c, dash = style[pas]
         gg = med[med["passes"] == pas].sort_values("speed")
-        ax.plot(gg["speed"], gg["depth"], "o-", color=colors[pas], ms=10, mew=1.2,
-                mec="0.15", label=f"{pas} passes", zorder=3)
+        ax.plot(gg["speed"], gg["depth"], marker="o", color=c, ls=dash, lw=PARAM_LINE_LW,
+                ms=12, mew=1.2, mec="0.15", label=f"{pas} passes", zorder=3)
         for _, r in gg.iterrows():
-            ax.annotate(r["label"], (r["speed"], r["depth"]), fontsize=11, ha="center",
-                        textcoords="offset points", xytext=(0, 10), color="0.25", zorder=4)
+            _cell_callout(ax, r["label"], r["speed"], r["depth"], at_right=r["speed"] >= s_max)
 
-    # every font here is 4 pt above what it would otherwise be -- the annotations/legends over their
-    # earlier literals, the title/labels/ticks over the matplotlib defaults they used to inherit
-    # (12/10/10 pt) -- so the figure stays legible when dropped into a slide at reduced size.
-    ax.axhline(55, color="grey", ls="--", lw=1)
-    ax.text(0.01, 55, " design target 55 µm", transform=ax.get_yaxis_transform(),
-            va="bottom", color="grey", fontsize=12)
-    ax.set_xscale("log")
-    ax.set_xticks(speeds); ax.set_xticklabels([f"{s:g}" for s in speeds])
-    ax.tick_params(labelsize=14)
-    ax.set_xlabel("scan speed (mm/s, log axis)", fontsize=14)
-    ax.set_ylabel("etch depth (µm)", fontsize=14)
+    _target_line(ax, 55)
+    _speed_log_axis(ax, speeds)
+    ax.tick_params(labelsize=fs.TICK)
+    ax.set_xlabel("scan speed (mm/s) — log scale", fontsize=fs.LABEL)
+    ax.set_ylabel("etch depth (µm)", fontsize=fs.LABEL)
     ax.grid(alpha=0.3)
-    ax.set_title("Etch depth vs laser parameters", fontsize=16)
+    ax.set_title("Etch depth vs laser parameters", fontsize=fs.TITLE)
 
-    passes_leg = ax.legend(title="passes", fontsize=13, title_fontsize=14, loc="upper right")
-    ax.add_artist(passes_leg)
+    # ONE legend, not two in opposite corners (review: "move the legends together"). The pass-count
+    # series fill the first column and the marker vocabulary the second -- matplotlib fills a
+    # multi-column legend column-major, so each group is padded to the taller one's length.
+    pass_handles = [Line2D([], [], marker="o", color=style[pv][0], ls=style[pv][1],
+                           lw=PARAM_LINE_LW, ms=11, mec="0.15", label=f"{pv} passes")
+                    for pv in passes_vals]
     shape_handles = []
     for fam, (marker, _) in fam_style.items():
         if not (d["family"] == fam).any():
             continue
         lo, hi = d.loc[d["family"] == fam, "drawn_diameter_um"].agg(["min", "max"])
         shape_handles.append(Line2D([], [], marker=marker, ls="none", mfc="0.4", mec="white",
-                                    ms=8, label=f"{fam} array (drawn Ø {lo:g}–{hi:g} µm)"))
-    shape_handles.append(Line2D([], [], marker="o", ls="-", color="0.4", ms=9,
+                                    ms=9, label=f"{fam} array (drawn Ø {lo:g}–{hi:g} µm)"))
+    shape_handles.append(Line2D([], [], marker="o", ls="-", color="0.4", ms=10,
                                 label="cell median"))
-    ax.legend(handles=shape_handles, fontsize=12, loc="lower left", framealpha=0.9)
+    rows = max(len(pass_handles), len(shape_handles))
+    pad = lambda h: h + [Line2D([], [], ls="none", label=" ") for _ in range(rows - len(h))]
+    ax.legend(handles=pad(pass_handles) + pad(shape_handles), ncol=2, fontsize=fs.LEGEND_SM,
+              loc="upper right", framealpha=0.92, handlelength=2.8, columnspacing=1.4)
 
     fig.tight_layout()
     p = Path(out_dir) / "figures" / "param_depth_scatter.png"
@@ -825,7 +905,7 @@ def make_radial_overlays(template, placements, params, res_by_cell, out_dir, set
                 floor = res.floor_um if np.isfinite(res.floor_um) else np.nanmin(prof)
                 z = prof - floor
                 depth = res.depth_um if np.isfinite(res.depth_um) else np.nanmax(z)
-                ax.plot(rc, z, "-", lw=1.9, color=_combo_color(i, len(combos)),
+                ax.plot(rc, z, "-", lw=2.6, color=_combo_color(i, len(combos)),
                         label=f"{combo} — depth {depth:.0f} µm")
                 n_lines += 1
             if not n_lines:
@@ -834,12 +914,12 @@ def make_radial_overlays(template, placements, params, res_by_cell, out_dir, set
             ax.axhline(0, color="grey", lw=0.8, ls="-")
             ax.axvline(a.diameter_um / 2, color="green", ls=":", lw=1.2,
                        label=f"drawn radius {a.diameter_um/2:g} µm")
-            ax.set_xlabel("radius from pin centre (µm)", fontsize=14)
-            ax.set_ylabel("mean height above clean floor (µm)", fontsize=14)
+            ax.set_xlabel("radius from pin centre (µm)", fontsize=fs.LABEL)
+            ax.set_ylabel("mean height above clean floor (µm)", fontsize=fs.LABEL)
             ax.set_title(f"Mean radial pin profile — Ø {a.diameter_um:g} µm, "
-                         f"pitch {a.pitch_um:g} µm", fontsize=16)
-            ax.tick_params(labelsize=14); ax.grid(alpha=0.3)
-            ax.legend(fontsize=11, ncol=2 if n_lines > 8 else 1)
+                         f"pitch {a.pitch_um:g} µm", fontsize=fs.TITLE)
+            ax.tick_params(labelsize=fs.TICK); ax.grid(alpha=0.3)
+            ax.legend(fontsize=fs.LEGEND_SM, ncol=2 if n_lines > 8 else 1)
             fig.tight_layout()
             fname = f"a{a.array_id:02d}_D{a.diameter_um:g}_P{a.pitch_um:g}.png"
             fig.savefig(sdir / fname, dpi=170); plt.close(fig)
@@ -870,10 +950,11 @@ def save_sample_heightmap(scan, path, ds=4):
     fig, ax = plt.subplots(figsize=(fig_w, max(3.5, fig_w * h_mm / w_mm)))
     im = ax.imshow(z, origin="lower", extent=(0.0, w_mm, 0.0, h_mm), aspect="equal", cmap="viridis",
                    vmin=np.nanpercentile(z, 2), vmax=np.nanpercentile(z, 98))
-    ax.set_title("Assembled sample height", fontsize=16)
-    ax.set_xlabel("x (mm, design orientation)", fontsize=14); ax.set_ylabel("y (mm)", fontsize=14)
-    ax.tick_params(labelsize=14)
-    _cb(plt.colorbar(im, ax=ax, shrink=0.85), "height (µm)")
+    ax.set_title("Assembled sample height", fontsize=fs.TITLE)
+    ax.set_xlabel("x (mm, design orientation)", fontsize=fs.LABEL)
+    ax.set_ylabel("y (mm)", fontsize=fs.LABEL)
+    ax.tick_params(labelsize=fs.TICK)
+    _image_cb(im, ax, "height (µm)")
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=200, bbox_inches="tight"); plt.close(fig)
 
@@ -900,8 +981,8 @@ def save_sample_overview(scan, template, placements, path, ds=6):
         ax.plot(fx, fy, "c.", ms=0.5)
         cx, cy = p.dxf_to_px(ccx, ccy)
         ax.text((W - 1 - cx) / ds, cy / ds, f"({p.cell_row},{p.cell_col})",
-                color="yellow", ha="center", va="center", fontsize=15, weight="bold")
-    ax.set_title(f"{len(placements)} unit cells", fontsize=16)
+                color="yellow", ha="center", va="center", fontsize=fs.OVERLAY, weight="bold")
+    ax.set_title(f"{len(placements)} unit cells", fontsize=fs.TITLE)
     ax.set_xticks([]); ax.set_yticks([])
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=170, bbox_inches="tight"); plt.close(fig)
@@ -1038,7 +1119,7 @@ def build_snapshot_montage(tiles, template, *, res_um=2.0, gutter_px=24):
                 gutter_px=gutter_px)
 
 
-def _annotate_snapshot_panels(ax, boxes, canvas_h, *, fontsize=12, scale=1.0):
+def _annotate_snapshot_panels(ax, boxes, canvas_h, *, fontsize=fs.NOTE, scale=1.0):
     """Label each tiled panel with its snapshot name (Center / TopLeft / ...) in a boxed callout
     above the panel, so the reader can tell which crop is which. Adds headroom above the panels so
     the labels are never clipped. ``canvas_h`` is the composited canvas height in pixels.
@@ -1073,12 +1154,13 @@ def save_snapshot_heightmap(tiles, template, path, *, res_um=2.0, gutter_px=24, 
     mm_px = res_um / 1000.0
     im = ax.imshow(canvas, origin="lower", extent=(0.0, ww * mm_px, 0.0, hh * mm_px),
                    cmap="viridis", vmin=0, vmax=vmax, aspect="equal")
-    ax.set_xlabel("x (mm — physical within a panel; panels are separate captures)", fontsize=14)
-    ax.set_ylabel("y (mm)", fontsize=14)
-    ax.tick_params(labelsize=14)
+    ax.set_xlabel("x (mm — physical within a panel; panels are separate captures)",
+                  fontsize=fs.LABEL)
+    ax.set_ylabel("y (mm)", fontsize=fs.LABEL)
+    ax.tick_params(labelsize=fs.TICK)
     _annotate_snapshot_panels(ax, boxes, canvas.shape[0], scale=mm_px)
-    _cb(plt.colorbar(im, ax=ax, shrink=0.85), "height above local floor (µm)")
-    ax.set_title("Sample height — tiled snapshots", fontsize=16)
+    _image_cb(im, ax, "height above local floor (µm)")
+    ax.set_title("Sample height — tiled snapshots", fontsize=fs.TITLE)
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=200, bbox_inches="tight"); plt.close(fig)
     print(f"Wrote {path}")
@@ -1101,8 +1183,8 @@ def save_snapshot_overview(tiles, template, path, *, res_um=2.0, gutter_px=24, m
                     vmin=m["ivmin"], vmax=m["ivmax"], aspect="equal")
     ax.set_xticks([]); ax.set_yticks([])
     _annotate_snapshot_panels(ax, boxes, icanvas.shape[0])
-    _cb(plt.colorbar(imi, ax=ax, shrink=0.85), "intensity")
-    ax.set_title("Sample intensity — tiled snapshots", fontsize=16)
+    _image_cb(imi, ax, "intensity")
+    ax.set_title("Sample intensity — tiled snapshots", fontsize=fs.TITLE)
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=200, bbox_inches="tight"); plt.close(fig)
     print(f"Wrote {path}")
@@ -1162,21 +1244,23 @@ def save_3d_pin_map(scan, placement, template, array, path, *, res_um=2.0, block
     ax = fig.add_subplot(111, projection="3d")
     surf = ax.plot_surface(xx, yy, zf, cmap="viridis", vmin=0, vmax=vmax,
                            rcount=160, ccount=160, linewidth=0, antialiased=True)
-    ax.set_xlabel("x (µm)", labelpad=18, fontsize=14)     # labelpad clears the ticks
-    ax.set_ylabel("y (µm)", labelpad=18, fontsize=14)
+    ax.set_xlabel("x (µm)", labelpad=22, fontsize=fs.LABEL)   # labelpad clears the (larger) ticks
+    ax.set_ylabel("y (µm)", labelpad=22, fontsize=fs.LABEL)
     ax.set_zlabel("")                                     # height shown on the colorbar (no overlap)
-    ax.set_title(f"3D height — D{array.diameter_um:g} P{array.pitch_um:g}", fontsize=17)
+    ax.set_title(f"3D height — D{array.diameter_um:g} P{array.pitch_um:g}", fontsize=fs.HEADLINE)
     ax.view_init(elev=20, azim=-55)                       # low camera, so height reads at a glance
     ztop = float(np.nanmax(zf))
     ax.set_zlim(0, max(1.0, ztop)); ax.set_zticks([0, round(ztop)])  # only 0 + top tick (rest cramp)
-    ax.tick_params(labelsize=13)
+    ax.tick_params(labelsize=fs.TICK)
     dz = max(1e-6, ztop - float(np.nanmin(zf)))
     # TRUE aspect (1 µm is the same length on x, y, z), zoomed in to fill the frame.
     ax.set_box_aspect((x1 - x0, y1 - y0, dz), zoom=1.4)
     cb = fig.colorbar(surf, ax=ax, shrink=0.55, pad=0.22)
-    cb.set_label("height above floor (µm)", fontsize=14); cb.ax.tick_params(labelsize=13)
+    cb.set_label("height above floor (µm)", fontsize=fs.LABEL)
+    cb.ax.tick_params(labelsize=fs.TICK)
     if param_label:                                       # laser-parameter info box, top-left
-        ax.text2D(0.02, 0.98, param_label, transform=ax.transAxes, fontsize=15, va="top", ha="left",
+        ax.text2D(0.02, 0.98, param_label, transform=ax.transAxes, fontsize=fs.OVERLAY,
+                  va="top", ha="left",
                   bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="0.5", alpha=0.9))
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=300, bbox_inches="tight"); plt.close(fig)
@@ -1254,27 +1338,27 @@ def render_snapshot_cell_report(tiles, template, avg_by_array, dose_label, path,
     if m is None:
         return
     canvas, icanvas, boxes = m["canvas"], m["intensity"], m["boxes"]
-    fig = plt.figure(figsize=(21, 10))                    # wider: the table needs it at 12 pt
+    fig = plt.figure(figsize=(21, 10))                    # wider: the table needs it at table size
     gs = GridSpec(2, 2, width_ratios=[1.5, 1.0], figure=fig)
     axh = fig.add_subplot(gs[0, 0]); axi = fig.add_subplot(gs[1, 0])
     imh = axh.imshow(canvas, origin="lower", cmap="viridis", vmin=0, vmax=m["vmax"], aspect="equal")
     axh.set_xticks([]); axh.set_yticks([])
-    axh.set_title("Height above floor", fontsize=16)
-    _annotate_snapshot_panels(axh, boxes, canvas.shape[0], fontsize=16)
-    _cb(plt.colorbar(imh, ax=axh, shrink=0.8), "height above local floor (µm)")
+    axh.set_title("Height above floor", fontsize=fs.TITLE)
+    _annotate_snapshot_panels(axh, boxes, canvas.shape[0], fontsize=fs.TITLE)
+    _image_cb(imh, axh, "height above local floor (µm)")
     if icanvas is not None and m["ivmax"] is not None:
         imi = axi.imshow(icanvas, origin="lower", cmap="gray",
                          vmin=m["ivmin"], vmax=m["ivmax"], aspect="equal")
-        _annotate_snapshot_panels(axi, boxes, icanvas.shape[0], fontsize=16)
-        _cb(plt.colorbar(imi, ax=axi, shrink=0.8), "intensity")
+        _annotate_snapshot_panels(axi, boxes, icanvas.shape[0], fontsize=fs.TITLE)
+        _image_cb(imi, axi, "intensity")
     axi.set_xticks([]); axi.set_yticks([])
-    axi.set_title("Intensity", fontsize=16)
+    axi.set_title("Intensity", fontsize=fs.TITLE)
 
     axr = fig.add_subplot(gs[:, 1]); axr.axis("off")
     # snapshot count/names are dropped from the title -- each panel is already labelled with its
     # snapshot name by _annotate_snapshot_panels, so nothing is lost
     axr.text(0.0, 1.0, f"Averaged cell — {dose_label}",
-             transform=axr.transAxes, va="top", fontsize=17, weight="bold")
+             transform=axr.transAxes, va="top", fontsize=fs.HEADLINE, weight="bold")
 
     def _f(v):
         return f"{v:.1f}" if np.isfinite(v) else "—"
@@ -1295,7 +1379,7 @@ def render_snapshot_cell_report(tiles, template, avg_by_array, dose_label, path,
         tbl_bottom = 0.80 - _th
         tbl = axr.table(cellText=rows_t, colLabels=col_labels, cellLoc="center",
                         bbox=[0.0, tbl_bottom, 1.0, _th])
-        tbl.auto_set_font_size(False); tbl.set_fontsize(12)
+        tbl.auto_set_font_size(False); tbl.set_fontsize(fs.TABLE)
         tbl.auto_set_column_width(col=list(range(len(col_labels))))  # headers need it at this size
         for c in range(len(col_labels)):
             tbl[0, c].set_facecolor("#dddddd"); tbl[0, c].set_text_props(weight="bold")
@@ -1315,17 +1399,18 @@ def render_snapshot_cell_report(tiles, template, avg_by_array, dose_label, path,
             floor = r.floor_um if np.isfinite(r.floor_um) else np.nanmin(prof)
             z = prof - floor
             depth = r.depth_um if np.isfinite(r.depth_um) else np.nanmax(z)
-            ln, = axp.plot(rc, z, "-", lw=1.8,
+            ln, = axp.plot(rc, z, "-", lw=2.4,
                            label=f"D{a.diameter_um:g} P{a.pitch_um:g} — depth {depth:.0f} µm")
             axp.axvline(a.diameter_um / 2, color=ln.get_color(), ls=":", lw=1.1)
             drew = True
         if drew:
             axp.axhline(0, color="grey", lw=0.8)
-            axp.set_xlabel("radius from pin centre (µm)", fontsize=13)
-            axp.set_ylabel("mean height above floor (µm)", fontsize=13)
+            axp.set_xlabel("radius from pin centre (µm)", fontsize=fs.LABEL)
+            axp.set_ylabel("mean height above floor (µm)", fontsize=fs.LABEL)
             axp.set_title("Mean radial pin profile — averaged over snapshots "
-                          "(dotted = drawn radius)", fontsize=13)
-            axp.tick_params(labelsize=12); axp.grid(alpha=0.3); axp.legend(fontsize=12)
+                          "(dotted = drawn radius)", fontsize=fs.TITLE_SM)
+            axp.tick_params(labelsize=fs.TICK); axp.grid(alpha=0.3)
+            axp.legend(fontsize=fs.LEGEND_SM)
         else:
             axp.remove()
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -1349,15 +1434,15 @@ def make_snapshot_radial_overlays(template, avg_by_array, out_dir, dose_label=""
         z = prof - floor
         depth = res.depth_um if np.isfinite(res.depth_um) else np.nanmax(z)
         fig, ax = plt.subplots(figsize=(9, 6))
-        ax.plot(rc, z, "-", lw=1.9, label=f"{dose_label} — depth {depth:.0f} µm")
+        ax.plot(rc, z, "-", lw=2.6, label=f"{dose_label} — depth {depth:.0f} µm")
         ax.axhline(0, color="grey", lw=0.8)
-        ax.axvline(a.diameter_um / 2, color="green", ls=":", lw=1.2,
+        ax.axvline(a.diameter_um / 2, color="green", ls=":", lw=1.6,
                    label=f"drawn radius {a.diameter_um/2:g} µm")
-        ax.set_xlabel("radius from pin centre (µm)", fontsize=14)
-        ax.set_ylabel("mean height above clean floor (µm)", fontsize=14)
+        ax.set_xlabel("radius from pin centre (µm)", fontsize=fs.LABEL)
+        ax.set_ylabel("mean height above clean floor (µm)", fontsize=fs.LABEL)
         ax.set_title(f"Mean radial pin profile — Ø {a.diameter_um:g} µm, "
-                     f"pitch {a.pitch_um:g} µm", fontsize=16)
-        ax.tick_params(labelsize=14); ax.grid(alpha=0.3); ax.legend(fontsize=12)
+                     f"pitch {a.pitch_um:g} µm", fontsize=fs.TITLE)
+        ax.tick_params(labelsize=fs.TICK); ax.grid(alpha=0.3); ax.legend(fontsize=fs.LEGEND_SM)
         fig.tight_layout()
         fig.savefig(root / f"a{a.array_id:02d}_D{a.diameter_um:g}_P{a.pitch_um:g}.png", dpi=170)
         plt.close(fig)

@@ -24,6 +24,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+import figstyle as fs
+
 HERE = Path(__file__).resolve().parent
 
 # (label, drawn diameter um, nearest-neighbour pitch um) -- the three fabricated pin families.
@@ -61,14 +63,14 @@ def render(path: Path) -> Path:
     fig = plt.figure(figsize=(11, 1.15 * (len(rows) + 1) + 1.4))
     ax = fig.add_subplot(111); ax.axis("off")
     ax.text(0.0, 1.0, "Porosity — square vs hexagonal lattice at the same pitch",
-            transform=ax.transAxes, va="top", fontsize=17, weight="bold")
+            transform=ax.transAxes, va="top", fontsize=fs.HEADLINE, weight="bold")
     ax.text(0.0, 0.86, "Φ = open (coolant) area fraction from drawn geometry; the hexagonal cell is "
             "0.866× the square one, so the same pitch packs 1.155× the pins.",
-            transform=ax.transAxes, va="top", fontsize=12, style="italic", color="0.3")
+            transform=ax.transAxes, va="top", fontsize=fs.NOTE, style="italic", color="0.3")
     _th = min(0.82, 0.16 * (len(rows) + 1))
     tbl = ax.table(cellText=rows, colLabels=COL_LABELS, cellLoc="center",
                    bbox=[0.0, 0.74 - _th, 1.0, _th])
-    tbl.auto_set_font_size(False); tbl.set_fontsize(12)
+    tbl.auto_set_font_size(False); tbl.set_fontsize(fs.TABLE)
     tbl.auto_set_column_width(col=list(range(len(COL_LABELS))))
     for c in range(len(COL_LABELS)):
         tbl[0, c].set_facecolor("#dddddd"); tbl[0, c].set_text_props(weight="bold")

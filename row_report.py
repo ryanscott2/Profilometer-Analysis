@@ -30,6 +30,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
+import figstyle as fs
 import report
 import extract
 import porosity_table as pt
@@ -226,7 +227,7 @@ def _column_axis(ax, units, colors, *, label_blocks=True, block_y=1.02):
             if i == len(geoms) or geoms[i] != geoms[start]:
                 ax.text(0.5 * (start + i - 1), block_y, geoms[start],
                         transform=ax.get_xaxis_transform(), ha="center", va="bottom",
-                        fontsize=13, weight="bold", color=colors.get(geoms[start], "0.3"))
+                        fontsize=fs.NOTE, weight="bold", color=colors.get(geoms[start], "0.3"))
                 start = i
     ax.set_xlim(-0.6, len(u) - 0.4)
     ax.grid(alpha=0.3, axis="y")
@@ -280,7 +281,7 @@ def _fig_depth_vs_passes(units, rollup, path, *, transparent=False):
             dy = 12 if (int(r["wafer_col"]) % 2) else -20
             ax.annotate(f"c{int(r['wafer_col'])} · {r['laser']}", (xv, r["depth_um"]),
                         textcoords="offset points", xytext=(0, dy), ha="center",
-                        fontsize=11, color="0.25")
+                        fontsize=fs.ANNOT, color="0.25")
         lab = geom
         # Slope per PASS is only meaningful when speed is constant; on a mixed-speed row the x axis
         # is dose ratio, and a "µm / pass" label anchored in pass coordinates would sit in the wrong
@@ -291,7 +292,7 @@ def _fig_depth_vs_passes(units, rollup, path, *, transparent=False):
                 ax.annotate(f"{(y1 - y0) / (x1 - x0):+.1f} µm / pass",
                             (0.5 * (x0 + x1), 0.5 * (y0 + y1)),
                             textcoords="offset points", xytext=(6, -14),
-                            fontsize=11, color=c, weight="bold")
+                            fontsize=fs.ANNOT, color=c, weight="bold")
         if len(miss):
             lab += f" — {len(ok)} of {len(g)} doses"
             for _, r in miss.iterrows():
@@ -302,11 +303,12 @@ def _fig_depth_vs_passes(units, rollup, path, *, transparent=False):
                 # place the callout in AXES fraction, not the not-yet-autoscaled data limits
                 ax.text(xv, 0.02, f"  c{int(r['wafer_col'])} — no data",
                         transform=ax.get_xaxis_transform(),
-                        rotation=90, va="bottom", ha="right", fontsize=10, color=MISSING_COLOR)
+                        rotation=90, va="bottom", ha="right", fontsize=fs.ANNOT_SM,
+                        color=MISSING_COLOR)
         handles.append(Line2D([], [], color=c, marker="o", ls="-", label=lab))
     ax.axhline(TARGET_DEPTH_UM, color="0.45", ls="--", lw=1.2, zorder=0)
     ax.text(0.995, TARGET_DEPTH_UM, f" design target {TARGET_DEPTH_UM:g} µm ", ha="right",
-            va="bottom", fontsize=12, color="0.35", transform=ax.get_yaxis_transform())
+            va="bottom", fontsize=fs.NOTE, color="0.35", transform=ax.get_yaxis_transform())
     if single_speed:
         xs = sorted(units["map_passes"].dropna().unique())
         ax.set_xticks(xs)
@@ -338,7 +340,8 @@ def _fig_diameter_fidelity(units, path, *, transparent=False):
         c = colors.get(r["geometry"], "0.4")
         if not np.isfinite(r.get("disc_mid_um", np.nan)):
             ax1.plot(x, 0, "x", color="0.6", ms=11, mew=2)
-            ax1.text(x, 0, "\nno data", ha="center", va="top", fontsize=10, color=MISSING_COLOR)
+            ax1.text(x, 0, "\nno data", ha="center", va="top", fontsize=fs.ANNOT_SM,
+                     color=MISSING_COLOR)
             ax2.plot(x, 0, "x", color="0.6", ms=11, mew=2)
             continue
         ax1.plot(x, r["disc_top_um"], "^", mfc="none", mec=c, ms=10, mew=1.8)
@@ -384,7 +387,7 @@ def _fig_porosity(units, path, *, transparent=False):
         if not np.isfinite(ach):
             ax1.plot(x, design if np.isfinite(design) else 0, "x", color="0.6", ms=11, mew=2)
             ax1.text(x, design if np.isfinite(design) else 0, "\nno data", ha="center", va="top",
-                     fontsize=10, color=MISSING_COLOR)
+                     fontsize=fs.ANNOT_SM, color=MISSING_COLOR)
             ax2.plot(x, 0, "x", color="0.6", ms=11, mew=2)
             continue
         if np.isfinite(design):
@@ -398,7 +401,8 @@ def _fig_porosity(units, path, *, transparent=False):
             d_pp = 100.0 * (ach - design)
             ax2.vlines(x, 0, d_pp, color=c, lw=6, alpha=0.85)
             ax2.annotate(f"{d_pp:+.1f}", (x, d_pp), textcoords="offset points",
-                         xytext=(0, 6 if d_pp >= 0 else -16), ha="center", fontsize=11, color=c)
+                         xytext=(0, 6 if d_pp >= 0 else -16), ha="center", fontsize=fs.ANNOT,
+                         color=c)
             if np.isfinite(top):
                 ax2.plot(x, 100.0 * (top - design), "o", mfc="none", mec=c, ms=7, mew=1.5)
     ax1.set_ylabel("open-area fraction Φ")
@@ -450,7 +454,7 @@ def _fig_summary_table(units, records, path, *, transparent=False):
     tbl = ax.table(cellText=body or [["—"] * len(cols)], colLabels=cols, cellLoc="center",
                    bbox=[0, 0, 1, 0.86])
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(12)
+    tbl.set_fontsize(fs.TABLE)
     tbl.auto_set_column_width(range(len(cols)))
     for j in range(len(cols)):
         cell = tbl[0, j]
@@ -464,7 +468,7 @@ def _fig_summary_table(units, records, path, *, transparent=False):
     n_ok = sum(1 for rec in records if rec.produced_data)
     n_try = sum(1 for rec in records if rec.planned.status == "ready")
     ax.set_title(f"Wafer row summary — {n_ok} / {n_try} samples registered",
-                 fontsize=17, weight="bold", pad=16)
+                 fontsize=fs.HEADLINE, weight="bold", pad=16)
     return _finish(fig, path, dpi=300, transparent=transparent, facecolor="white")
 
 
@@ -502,7 +506,7 @@ def _fig_montage(units, panels, path, *, transparent=False):
     ax.set_xlabel("x (mm — physical within a panel; panels are separate captures)")
     ax.set_ylabel("y (mm)")
     rs._annotate_snapshot_panels(ax, boxes, hh, scale=mm_px)
-    rs._cb(plt.colorbar(im, ax=ax, shrink=0.85), "height above local floor (µm)")
+    rs._image_cb(im, ax, "height above local floor (µm)")
     row_no = int(units["wafer_row"].iloc[0]) if len(units) else 0
     ax.set_title(f"Sample height — wafer row {row_no}")
     fig.tight_layout()
@@ -514,7 +518,7 @@ def make_row_figures(rollup, units, out_dir, *, panels=None, plan=None, records=
     """Build the five row-level figures. Returns the paths actually written.
 
     Every figure is drawn inside ``report.PLOT_RC`` so the row set matches the per-sample set
-    (the +4 pt house typography)."""
+    (the house typography in ``figstyle``)."""
     out_dir = Path(out_dir)
     written = []
     # A SKIPPED column carries a placeholder row with no geometry and passes=0. It belongs in the

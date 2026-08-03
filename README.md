@@ -374,7 +374,13 @@ python calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
   `depth_vs_passes_speed_3d.png` (per-band 3-D depth = f(passes, speed): measured points + the
   recommended-model surface + a target-depth plane), `depth_parity.png`, and `depth_heatmap.png`
   (passes×speed predicted-depth heatmap with the target-depth contour — read off which (P, S) hits
-  the target).
+  the target). `depth_heatmap.png` (name kept for compatibility) is a **scatter of the measured
+  cells only** — one marker per cell-band median at its (scan speed, passes), coloured by measured
+  depth, with a **red dashed ring** on any cell whose depth landed within ±`TARGET_WINDOW_UM`
+  (5 µm) of a requested target, i.e. the 50–60 µm window for the default 55 µm target. There is
+  deliberately no model surface and no fitted contour: a colour field over the whole rectangle is a
+  picture of depths nobody measured, and most of it would be extrapolation. Everything on that
+  figure is a measurement; the fitted models and their caveats stay in `depth_calibration.txt`.
 
 **From the UI:** the *Depth calibration* panel (right column) lists the discovered samples
 (multi-select; none selected = all) in a two-column table — the sample name and an inline **cells**
@@ -406,6 +412,10 @@ at left).
 - `row_report.py` — the row rollup: combined `row_measurements.csv`/`row_units.csv` schema and the
   five cross-sample comparison figures.
 - `calibrate_depth.py` — cross-sample etch-depth calibration (see below); reuses `report._ols_fit`.
+- `figstyle.py` — house figure typography: named type-size roles (`TITLE`, `LABEL`, `TICK`,
+  `LEGEND`, `ANNOT`, …) and the `PLOT_RC` rc-context, all derived from one `BUMP` constant. Every
+  figure writer imports it, so a presentation-size change is a one-line edit rather than ~130
+  scattered literals.
 - `pflm_ui.py` — Tkinter sample-tester GUI (sample library, run/stop, figure preview,
   depth-calibration panel).
 - `synth.py`, `selftest.py` — synthetic scan generator and end-to-end validation.
