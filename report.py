@@ -14,18 +14,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
+import figstyle as fs
+
 # flags that mean the READ is untrustworthy (bad data, not merely a non-ideal result). Debris
 # ("wide-D") is deliberately NOT here: a debris-widened pin is reliable data that happens to show
 # debris -- it is excluded from the diameter-calibration FIT (see _fit_subset), not marked bad.
 CRITICAL_FLAGS = ("no relief", "weak lattice", "off-scan", "floor uncertain")
 
-# Type size for this module's figures: 4 pt above the matplotlib defaults (title 16, labels/ticks/
-# legend 14, suptitle 16), matching the presentation sizes used in run_sample.py's figures. Applied
-# as an rc context in make_plots rather than per call so no default-sized element is missed; the
-# explicit per-call sizes further down are the same +4 over what they used to be. A figure function
-# called directly (outside make_plots) renders at matplotlib's defaults instead.
-PLOT_RC = {"font.size": 14, "axes.titlesize": 16, "axes.labelsize": 14, "xtick.labelsize": 14,
-           "ytick.labelsize": 14, "legend.fontsize": 14, "figure.titlesize": 16}
+# Type sizes come from figstyle (one knob for every figure in the project). Applied as an rc
+# context in make_plots rather than per call so no default-sized element is missed; the explicit
+# per-call sizes further down name the same roles. A figure function called directly (outside
+# make_plots) renders at matplotlib's defaults instead. Re-exported because row_report imports it
+# as report.PLOT_RC.
+PLOT_RC = fs.PLOT_RC
 
 
 # --------------------------------------------------------------------------- #
@@ -101,7 +102,7 @@ def make_overview(df, out_dir, colors):
                 lim = [0, np.nanmax(df["drawn_diameter_um"]) * 1.1]
                 ax.plot(lim, lim, "k--", lw=0.8, alpha=0.5)
                 ax.text(0.97, 0.9, "measured = drawn", transform=ax.transAxes,
-                        ha="right", va="top", fontsize=12, color="k", alpha=0.6)
+                        ha="right", va="top", fontsize=fs.NOTE, color="k", alpha=0.6)
             if yc == "pitch_um":
                 for p in sorted(df["nominal_pitch_um"].dropna().unique()):
                     ax.axhline(p, color="grey", ls="--", lw=0.7)
@@ -128,9 +129,9 @@ def make_depth_dose(df, out_dir, colors):
             ax.plot(m.index, m.values, "-", color=c, alpha=0.5)
     ax.axhline(55, color="grey", ls="--", lw=1.2)
     ax.text(0.02, 0.96, "design target 55 µm", transform=ax.transAxes,
-            va="top", color="grey", fontsize=13)
+            va="top", color="grey", fontsize=fs.NOTE)
     if len(d):
-        ax.legend(fontsize=13)
+        ax.legend(fontsize=fs.LEGEND_SM)
     ax.set_xlabel("dose proxy = passes / speed")
     ax.set_ylabel("etch depth (µm)   [pin top − clean floor]")
     ax.set_title("Etch depth vs dose")
@@ -151,7 +152,7 @@ def make_dose_collapse(df, out_dir, colors):
     axes[0].set_xlabel("scan speed (mm/s)"); axes[0].set_ylabel("depth (µm)")
     axes[0].set_title("Ablation depth vs speed")
     if len(d):
-        axes[0].legend(fontsize=10, ncol=2)
+        axes[0].legend(fontsize=fs.ANNOT_SM, ncol=2)
     # (b) depth vs dose
     dd = d[d.dose_ratio.notna()]
     for p, g in dd.groupby("passes"):
@@ -160,7 +161,7 @@ def make_dose_collapse(df, out_dir, colors):
     axes[1].set_xlabel("dose proxy  passes / speed"); axes[1].set_ylabel("depth (µm)")
     axes[1].set_title("Depth vs passes/speed");
     if len(dd):
-        axes[1].legend(fontsize=12)
+        axes[1].legend(fontsize=fs.LEGEND_SM)
     # (c) diameter discrepancy vs dose
     for p, g in dd.groupby("passes"):
         axes[2].plot(g.dose_ratio, g.disc_mid_um, "o", color=_color_for(colors, p),
@@ -170,7 +171,7 @@ def make_dose_collapse(df, out_dir, colors):
     axes[2].set_ylabel("measured − drawn diameter (µm)")
     axes[2].set_title("Manufacturing discrepancy vs dose")
     if len(dd):
-        axes[2].legend(fontsize=12)
+        axes[2].legend(fontsize=fs.LEGEND_SM)
     fig.tight_layout()
     fig.savefig(out_dir / "figures" / "dose_collapse.png", dpi=200)
     plt.close(fig)
@@ -196,7 +197,7 @@ def make_per_row(df, out_dir, colors):
                 axes[1][j].plot(r["speed"], r["diameter_um"], "o", color=c, mfc=mfc,
                                 ms=7, mew=1.3, ls="none")
         dd = f"{drawn_d[0]:g}–{drawn_d[-1]:g}" if drawn_d else "?"
-        axes[0][j].set_title(f"band {band} — Ø {dd}, pitch {pitch_nom:g} µm", fontsize=13)
+        axes[0][j].set_title(f"band {band} — Ø {dd}, pitch {pitch_nom:g} µm", fontsize=fs.TITLE_SM)
         axes[0][j].set_xlabel("speed (mm/s)"); axes[1][j].set_xlabel("speed (mm/s)")
         if j == 0:
             axes[0][j].set_ylabel("depth (µm)")
@@ -258,7 +259,7 @@ def make_diameter_fit(df, out_dir, colors):
         ax.set_xlabel("drawn / design Ø (µm)")
         if j == 0:
             ax.set_ylabel("measured Ø (µm)  ▲ top (open)  ● mid (filled)")
-        ax.legend(fontsize=11, loc="upper left")
+        ax.legend(fontsize=fs.LEGEND_SM, loc="upper left")
     fig.suptitle("Measured vs drawn diameter with linear fit", y=1.0)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(out_dir / "figures" / "diameter_fit.png", dpi=300, bbox_inches="tight")
@@ -298,11 +299,11 @@ def make_grid_overlays(results, out_dir):
         ax.set_title(f"c{sample.cell_id} b{sample.band}c{sample.col} "
                      f"D{sample.nominal_diameter_um:g} P{sample.passes} S{sample.speed:g}"
                      + ("" if reliable else "  ⚠"),
-                     fontsize=10, color=("black" if reliable else "firebrick"))
+                     fontsize=fs.ANNOT_SM, color=("black" if reliable else "firebrick"))
         ax.set_xticks([]); ax.set_yticks([])
     for idx in range(n, nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
-    fig.suptitle("Known pin grid on each array", y=1.0, fontsize=16)
+    fig.suptitle("Known pin grid on each array", y=1.0, fontsize=fs.SUPTITLE)
     fig.tight_layout(rect=[0, 0, 1, 0.985])
     fig.savefig(out_dir / "figures" / "grid_overlays.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -401,16 +402,16 @@ def make_diameter_model(df, out_dir):
         lim = [min(lo_hi), max(lo_hi)]
         axes[0].plot(lim, lim, "k--", lw=0.8, alpha=0.6)
     # sized per call (not via PLOT_RC): run_sample calls this one outside make_plots' rc context
-    axes[0].set_xlabel("model-predicted top Ø (µm)", fontsize=14)
-    axes[0].set_ylabel("measured top Ø (µm)", fontsize=14)
-    axes[0].set_title("Diameter model parity", fontsize=16)
-    axes[0].legend(fontsize=12); axes[0].grid(alpha=0.3)
+    axes[0].set_xlabel("model-predicted top Ø (µm)", fontsize=fs.LABEL)
+    axes[0].set_ylabel("measured top Ø (µm)", fontsize=fs.LABEL)
+    axes[0].set_title("Diameter model parity", fontsize=fs.TITLE)
+    axes[0].legend(fontsize=fs.LEGEND_SM); axes[0].grid(alpha=0.3)
     axes[1].axhline(0, color="grey", lw=0.8)
-    axes[1].set_xlabel("model-predicted top Ø (µm)", fontsize=14)
-    axes[1].set_ylabel("residual measured-predicted (µm)", fontsize=14)
-    axes[1].set_title("residuals", fontsize=16); axes[1].grid(alpha=0.3)
+    axes[1].set_xlabel("model-predicted top Ø (µm)", fontsize=fs.LABEL)
+    axes[1].set_ylabel("residual measured-predicted (µm)", fontsize=fs.LABEL)
+    axes[1].set_title("residuals", fontsize=fs.TITLE); axes[1].grid(alpha=0.3)
     for _a in axes:
-        _a.tick_params(labelsize=14)
+        _a.tick_params(labelsize=fs.TICK)
     fig.tight_layout()
     p_png = out_dir / "diameter_model.png"
     fig.savefig(p_png, dpi=170); plt.close(fig)
@@ -426,7 +427,7 @@ def make_plots(df, results, out_dir):
         print("No rows -> no plots.")
         return
     colors = _pass_colors(df)
-    with plt.rc_context(PLOT_RC):                        # +4 pt over the matplotlib defaults
+    with plt.rc_context(PLOT_RC):                        # presentation sizes from figstyle
         make_overview(df, out_dir, colors)
         make_dose_collapse(df, out_dir, colors)
         make_per_row(df, out_dir, colors)

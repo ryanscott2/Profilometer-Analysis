@@ -31,6 +31,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Patch
 
+import figstyle as fs
+
 
 # ----------------------------------------------------------- lightweight VK4 #
 @dataclass
@@ -628,11 +630,12 @@ def extract_array(scan, placement, array, sample, *,
 def _qc(crop, z0, valid, cell_c, rc, prof, lattice, px_px, py_px, res, qc_path, cls):
     pxu, pyu = crop.x_um_per_px, crop.y_um_per_px
     H, W = z0.shape
-    # 4 pt above the matplotlib defaults (titles 16, labels/ticks 14, legends +4) so a QC panel
-    # stays readable when it is pulled out of legacy/qc/ and shown at slide size
+    # figstyle sizes so a QC panel stays readable when it is pulled out of legacy/qc/ and shown at
+    # slide size. The stat-laden panel titles are split over two lines: at this type size they no
+    # longer fit a 7.5 in panel on one.
     fig, ax = plt.subplots(2, 2, figsize=(15, 11))
     for _a in ax.ravel():
-        _a.tick_params(labelsize=14)
+        _a.tick_params(labelsize=fs.TICK)
 
     cf = res.floor_um if np.isfinite(res.floor_um) else 0.0
     disp = np.where(valid, z0 - cf, np.nan)
@@ -647,12 +650,15 @@ def _qc(crop, z0, valid, cell_c, rc, prof, lattice, px_px, py_px, res, qc_path, 
 
     # (0,0) height referenced to clean floor + KNOWN pin centres
     im0 = ax[0, 0].imshow(disp, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax)
-    cb0 = plt.colorbar(im0, ax=ax[0, 0], shrink=0.8)
-    cb0.set_label("height above clean floor (µm)", fontsize=14); cb0.ax.tick_params(labelsize=14)
+    # divider-anchored so the bar matches the (aspect-equal) image, not the axes box around it
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+    cb0 = plt.colorbar(im0, cax=make_axes_locatable(ax[0, 0]).append_axes("right", "4%", pad=0.16))
+    cb0.set_label("height above clean floor (µm)", fontsize=fs.LABEL)
+    cb0.ax.tick_params(labelsize=fs.TICK)
     cl = lattice["centers_local"]
     ax[0, 0].plot(cl[:, 0], cl[:, 1], "r+", ms=9, mew=1.2)
-    ax[0, 0].set_title(f"{res.filename} — known pins", fontsize=16)
-    ax[0, 0].set_xlabel("px", fontsize=14); ax[0, 0].set_ylabel("px", fontsize=14)
+    ax[0, 0].set_title(f"{res.filename}\nknown pins", fontsize=fs.TITLE)
+    ax[0, 0].set_xlabel("px", fontsize=fs.LABEL); ax[0, 0].set_ylabel("px", fontsize=fs.LABEL)
 
     # (0,1) mean pin
     ny, nx = cell_c.shape
@@ -667,10 +673,10 @@ def _qc(crop, z0, valid, cell_c, rc, prof, lattice, px_px, py_px, res, qc_path, 
         ax[0, 1].add_patch(Circle((cx, cy), res.top_diameter_um / 2, fill=False,
                                   color="r", lw=1.5))
         ax[0, 1].set_title(f"mean pin — base {res.base_diameter_um:.0f} / "
-                           f"top {res.top_diameter_um:.0f} µm", fontsize=16)
+                           f"top {res.top_diameter_um:.0f} µm", fontsize=fs.TITLE)
     else:
-        ax[0, 1].set_title("mean pin — diameter unreliable", fontsize=16)
-    ax[0, 1].set_xlabel("µm", fontsize=14); ax[0, 1].set_ylabel("µm", fontsize=14)
+        ax[0, 1].set_title("mean pin — diameter unreliable", fontsize=fs.TITLE)
+    ax[0, 1].set_xlabel("µm", fontsize=fs.LABEL); ax[0, 1].set_ylabel("µm", fontsize=fs.LABEL)
 
     # (1,0) classification
     ax[1, 0].imshow(disp, origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
@@ -685,11 +691,11 @@ def _qc(crop, z0, valid, cell_c, rc, prof, lattice, px_px, py_px, res, qc_path, 
     ax[1, 0].legend(handles=[Patch(color="#DC1414", label="pins"),
                              Patch(color="#1C59ED", label="clean floor"),
                              Patch(color="#FF9900", label="debris")],
-                    fontsize=12, loc="upper right")
-    ax[1, 0].set_title(f"classification  depth={res.depth_um:.1f} µm · "
+                    fontsize=fs.LEGEND_SM, loc="upper right")
+    ax[1, 0].set_title(f"classification  depth={res.depth_um:.1f} µm\n"
                        f"floor flat={res.floor_flatness_um:.2f} µm · "
-                       f"debris {100*res.debris_fraction:.0f}%", fontsize=16)
-    ax[1, 0].set_xlabel("px", fontsize=14); ax[1, 0].set_ylabel("px", fontsize=14)
+                       f"debris {100*res.debris_fraction:.0f}%", fontsize=fs.TITLE)
+    ax[1, 0].set_xlabel("px", fontsize=fs.LABEL); ax[1, 0].set_ylabel("px", fontsize=fs.LABEL)
 
     # (1,1) radial profile
     ax[1, 1].plot(rc, prof, "-o", ms=3, color="0.3")
@@ -700,12 +706,12 @@ def _qc(crop, z0, valid, cell_c, rc, prof, lattice, px_px, py_px, res, qc_path, 
             ax[1, 1].axvline(r_, color=c_, ls="--", lw=1, label=f"{lab} Ø={2*r_:.0f}")
     ax[1, 1].axvline(res.nominal_diameter_um / 2, color="g", ls=":",
                      label=f"drawn r={res.nominal_diameter_um/2:g}")
-    ax[1, 1].set_xlabel("radius (µm)", fontsize=14)
-    ax[1, 1].set_ylabel("mean-cell height (µm)", fontsize=14)
-    ax[1, 1].legend(fontsize=11)
+    ax[1, 1].set_xlabel("radius (µm)", fontsize=fs.LABEL)
+    ax[1, 1].set_ylabel("mean-cell height (µm)", fontsize=fs.LABEL)
+    ax[1, 1].legend(fontsize=fs.LEGEND_SM)
     sat = f" · pin-sat {100*res.pin_sat_frac:.0f}%" if np.isfinite(res.pin_sat_frac) else ""
     ax[1, 1].set_title(f"radial profile  meas-latt={res.lattice_strength:.2f}{sat}"
-                       + (f"  ·  {res.flags}" if res.flags else ""), fontsize=16)
+                       + (f"\n{res.flags}" if res.flags else ""), fontsize=fs.TITLE)
 
     plt.tight_layout()
     if qc_path is None:

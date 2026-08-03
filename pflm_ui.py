@@ -27,6 +27,15 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+# The wafer-row vocabulary (filename grammar, wafer map, run plan) lives in wafer_map.py, which is
+# deliberately stdlib-only so importing it here keeps the UI's startup free of numpy/pandas/
+# matplotlib. _safe_name is shared from there so the UI and run_row.py cannot drift apart on what a
+# results folder is called.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from wafer_map import (safe_name as _safe_name, parse_sample_id, group_snapshots,  # noqa: E402
+                       read_wafer_map, rows_present, row_out_name, date_tag_from_names,
+                       DEFAULT_MAP_NAME)
+
 HERE = Path(__file__).resolve().parent
 SAMPLES_JSON = HERE / ".ui_samples.json"
 WORKSPACE = HERE / ".ui_workspace"
@@ -37,6 +46,8 @@ TEXT_EXT = (".txt", ".csv", ".log", ".json")
 # Depth-calibration tool (calibrate_depth.py). Keep these in sync with that module's OUT_NAME /
 # MEAS_REL: it pools the per-sample legacy CSVs and writes the cross-sample analysis here.
 CAL_SCRIPT = "calibrate_depth.py"
+ROW_SCRIPT = "run_row.py"        # wafer-row batch driver (run_row.py --row N)
+ROW_FIGURES_DIR = "row_figures"  # keep in sync with run_row.ROW_FIGURES_DIR
 CAL_OUT_NAME = "etch depth"
 MEAS_REL = Path("legacy") / "measurements.csv"
 
@@ -57,28 +68,6 @@ try:
     _PIL = True
 except Exception:                                        # pragma: no cover - optional dep
     _PIL = False
-
-
-_SLASH = re.compile(r"[/\\]")
-_INVALID_NAME = re.compile(r'[<>:"|?*\x00-\x1f]')
-_RESERVED = {"CON", "PRN", "AUX", "NUL",
-             *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
-
-
-def _safe_name(name):
-    """Turn a UI sample name into a filesystem-safe folder name (Windows-safe): slashes become
-    spaces; any other character illegal in a Windows path becomes an underscore; a Windows reserved
-    device name (CON, PRN, COM1, ...) gets a trailing underscore so it can be a real folder.
-
-    NOTE: '/' -> space is intentional (per the sample-naming convention) and is not one-to-one, so
-    e.g. 'D100/D50' and 'D100 D50' still map to the same folder -- that collision is inherent to the
-    space convention, not a sanitizer bug."""
-    name = _SLASH.sub(" ", str(name))
-    name = _INVALID_NAME.sub("_", name)
-    name = re.sub(r"\s+", " ", name).strip(" .")
-    if name.upper().split(".")[0] in _RESERVED:
-        name += "_"
-    return name or "unnamed"
 
 
 def _sample_name_collision(name, existing_names):
@@ -119,17 +108,60 @@ def _snapshot_label(stem):
     return stem.rsplit("_", 1)[-1] if "_" in stem else stem
 
 
+def _wafer_cell_id(stem):
+    """``(col, row)`` from a VK4 stem's ``_{col}{row}_`` token, or None. Thin wrapper over
+    ``wafer_map.parse_sample_id`` so the UI and ``run_row.py`` agree on the grammar exactly."""
+    got = parse_sample_id(stem)
+    return None if got is None else (got[0], got[1])
+
+
 def _classify_vk4_folder(vk4_dir):
-    """``(mode, labels)`` for a VK4 folder. ``mode`` is ``'snapshots'`` when it holds plain
-    ``*.vk4`` with no ``_Y{n}_X{m}`` raster tile (-> run_sample multi-snapshot), else ``'raster'``.
-    ``labels`` lists the snapshot names (empty for a raster)."""
+    """``(mode, labels)`` for a VK4 folder.
+
+    ``'raster'``   -- holds a ``_Y{n}_X{m}`` tile grid (the assembled full-sample workflow).
+    ``'row'``      -- a FLAT MULTI-SAMPLE wafer folder: the plain ``*.vk4`` carry ``_{col}{row}_``
+                      tokens for MORE THAN ONE distinct (col, row), i.e. several different samples
+                      live here (-> run_row.py). Also detected one level down, so pointing at the
+                      PARENT of several per-geometry folders works.
+    ``'snapshots'``-- disjoint crops of ONE uniform cell (-> run_sample --snapshots).
+
+    The ``row`` test deliberately runs BEFORE the label-collision fallback below: on a flat wafer
+    folder every sample has a ``Center``, so that fallback would otherwise fire and route every
+    sample of every row into a single ``analyze_multi_snapshot`` call, which averages them as if
+    they were replicate views of one cell -- silently, with no error.
+
+    ``len(cells) > 1``, not ``>= 1``: a single-sample folder that merely carries a CR token is
+    today's ``snapshots`` mode and must keep behaving identically."""
     vks = sorted(Path(vk4_dir).glob("*.vk4"))
     if vks and not any(_RASTER_TILE_RE.search(p.stem) for p in vks):
+        cells = {c for c in (_wafer_cell_id(p.stem) for p in vks) if c is not None}
+        if len(cells) > 1:
+            return "row", [f"c{c}r{r}" for c, r in sorted(cells)]
         labels = [_snapshot_label(p.stem) for p in vks]
         if len(set(labels)) != len(labels):                 # collision -> disambiguate, never merge
             labels = [p.stem for p in vks]
         return "snapshots", labels
+    if not vks:                                  # maybe a PARENT of per-geometry sample folders
+        deep = sorted(Path(vk4_dir).rglob("*.vk4"))
+        cells = {c for c in (_wafer_cell_id(p.stem) for p in deep) if c is not None}
+        if len(cells) > 1:
+            return "row", [f"c{c}r{r}" for c, r in sorted(cells)]
     return "raster", []
+
+
+def _wafer_rows_in_dir(vk4_dir):
+    """``(rows_present, n_samples, snapshot_labels, n_unparsed)`` for a wafer-row folder."""
+    p = Path(vk4_dir)
+    vks = sorted(p.glob("*.vk4")) or sorted(p.rglob("*.vk4"))
+    cells, labels, unparsed = set(), set(), 0
+    for f in vks:
+        got = parse_sample_id(f.stem)
+        if got is None:
+            unparsed += 1
+            continue
+        cells.add((got[0], got[1]))
+        labels.add(got[2])
+    return sorted({r for _c, r in cells}), len(cells), sorted(labels), unparsed
 
 
 def _first_ps_label(text):
@@ -150,7 +182,8 @@ class App:
         self.cal_cell_specs = {}            # sample folder name -> inline cell-id filter spec ("" = all cells)
         self.q = queue.Queue()
         self.samples = self._load_samples()
-        self.cur = {"dxf": "", "vk4_dir": ""}
+        self.cur = {"dxf": "", "vk4_dir": "", "wafer_map": ""}
+        self._row_cfg = {}                  # wafer-row mode: resolved map path + date tag
         self._preview_img = None            # keep a ref so Tk doesn't GC it
         self._preview_path = None
         self._tree_paths = {}
@@ -302,6 +335,11 @@ class App:
         self.sample_combo.pack(side="left")
         self.sample_combo.bind("<<ComboboxSelected>>",
                                lambda e: self._load_sample(self.sample_var.get()))
+        # Wafer-row mode: a mode chip plus a row picker, both hidden unless the selected VK4 folder
+        # classifies as 'row'. Together with Run these are the whole two-click row workflow.
+        self.mode_chip = ttk.Label(tbar, text="", style="Status.TLabel")
+        self.row_var = tk.StringVar()
+        self.row_combo = ttk.Combobox(tbar, textvariable=self.row_var, state="readonly", width=9)
         self.run_btn = ttk.Button(tbar, text="▶  Run", style="Accent.TButton",
                                   command=self._toggle_run)
         self.run_btn.pack(side="right")
@@ -499,9 +537,23 @@ class App:
                    command=self._browse_vk4).grid(row=2, column=0, sticky="ew", pady=(6, 0))
         self._make_drop(self.vk4_list, self._on_drop_vk4)
 
+        # The wafer map is a large, external, shared, durable artifact that run_row.py reads from
+        # disk, so this is a path + Browse (like the DXF block) and NOT a text box -- a text box
+        # would fork it into one divergent copy per sample inside .ui_samples.json.
+        wmf = ttk.LabelFrame(dr, text=" Wafer map (row mode)  ·  drag/drop ",
+                             style="Card.TLabelframe", padding=6)
+        wmf.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 6)); wmf.columnconfigure(0, weight=1)
+        self.wmap_lbl = tk.Label(wmf, text="(none)", anchor="w", background=P["input"],
+                                 foreground=P["text"], relief="flat", padx=6, pady=4,
+                                 highlightthickness=1, highlightbackground=P["inputborder"])
+        self.wmap_lbl.grid(row=0, column=0, sticky="ew")
+        ttk.Button(wmf, text="Browse…", style="Tool.TButton",
+                   command=self._browse_wafer_map).grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self._make_drop(self.wmap_lbl, self._on_drop_wafer_map)
+
         lpf = ttk.LabelFrame(dr, text=" Laser parameters (cell_params grid) ",
                              style="Card.TLabelframe", padding=6)
-        lpf.grid(row=4, column=0, sticky="nsew", padx=10, pady=(0, 10)); dr.rowconfigure(4, weight=1)
+        lpf.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10)); dr.rowconfigure(5, weight=1)
         lpf.columnconfigure(0, weight=1); lpf.rowconfigure(0, weight=1)
         self.csv_text = self._mono_text(lpf, height=6, width=34, wrap="none", font=("Consolas", 10),
                                         undo=True)
@@ -551,20 +603,90 @@ class App:
         if paths:
             messagebox.showwarning("DXF", "Dropped item is not a .dxf file.")
 
+    def _set_wafer_map(self, path):
+        self.cur["wafer_map"] = str(path)
+        self.wmap_lbl.config(text=Path(path).name if path else "(none)")
+
+    def _browse_wafer_map(self):
+        p = filedialog.askopenfilename(title="Select wafer map CSV",
+                                       filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        if p:
+            self._set_wafer_map(p)
+            self._set_vk4_dir(self.cur["vk4_dir"]) if self.cur["vk4_dir"] else None
+
+    def _on_drop_wafer_map(self, paths):
+        for p in paths:
+            if p.lower().endswith(".csv"):
+                self._set_wafer_map(p)
+                return
+        if paths:
+            messagebox.showwarning("Wafer map", "Dropped item is not a .csv file.")
+
+    def _find_wafer_map(self, vk4_dir):
+        """The wafer map for this folder: an explicit pick wins, else search beside the VK4 folder,
+        its parent, then CSV/ -- the same order run_row.py uses, so the UI shows what the run
+        will actually read."""
+        if self.cur.get("wafer_map") and Path(self.cur["wafer_map"]).is_file():
+            return Path(self.cur["wafer_map"])
+        d = Path(vk4_dir)
+        for cand in (d / DEFAULT_MAP_NAME, d.parent / DEFAULT_MAP_NAME,
+                     HERE / "CSV" / DEFAULT_MAP_NAME):
+            if cand.is_file():
+                return cand
+        return None
+
     def _set_vk4_dir(self, d):
         d = Path(d)
         self.cur["vk4_dir"] = str(d)
         self.vk4_dir_lbl.config(text=str(d))
         self.vk4_list.delete(0, tk.END)
-        vks = sorted(d.glob("*.vk4"))
+        vks = sorted(d.glob("*.vk4")) or sorted(d.rglob("*.vk4"))
         for f in vks:
             self.vk4_list.insert(tk.END, f.name)
         mode, labels = _classify_vk4_folder(d)
-        if mode == "snapshots":                              # disjoint crops -> tiled montage
+        self._row_cfg = {}
+        if mode == "row":
+            rows, n_samples, snaps, unparsed = _wafer_rows_in_dir(d)
+            txt = (f"{d}   ({len(vks)} .vk4 — wafer map: {n_samples} samples, "
+                   f"rows {','.join(str(r) for r in rows)}; snapshots: {', '.join(snaps)})")
+            if unparsed:
+                txt += f"   ⚠ {unparsed} file(s) with no col/row token"
+            self.vk4_dir_lbl.config(text=txt)
+            self._show_row_controls(rows, d)
+        elif mode == "snapshots":                            # disjoint crops -> tiled montage
             self.vk4_dir_lbl.config(
                 text=f"{d}   ({len(vks)} .vk4 — snapshot montage: {', '.join(labels)})")
+            self._show_row_controls(None, d)
         else:
             self.vk4_dir_lbl.config(text=f"{d}   ({len(vks)} .vk4)")
+            self._show_row_controls(None, d)
+
+    def _show_row_controls(self, rows, vk4_dir):
+        """Reveal the mode chip + row picker only for a wafer-row folder, and preselect the lowest
+        row that is in both the map and the files and has no Results folder yet -- so the common
+        case really is 'open the folder, press Run'."""
+        if not rows:
+            self.mode_chip.pack_forget(); self.row_combo.pack_forget()
+            return
+        map_path = self._find_wafer_map(vk4_dir)
+        mapped = []
+        if map_path is not None:
+            entries, meta, _probs = read_wafer_map(map_path)
+            mapped = [r for r in rows_present(entries) if r in rows]
+            self._row_cfg = {"map": str(map_path), "date": meta.get("date", "")}
+            self._set_wafer_map(map_path)
+        choices = [f"Row {r}" for r in (mapped or rows)]
+        self.row_combo["values"] = choices
+        if choices:
+            names = [f.name for f in Path(vk4_dir).rglob("*.vk4")]
+            tag = self._row_cfg.get("date") or date_tag_from_names(names) or ""
+            fresh = next((c for c in choices
+                          if not (DEF_OUT / _safe_name(
+                              row_out_name(tag, int(c.split()[1])))).exists()), choices[0])
+            self.row_var.set(fresh if self.row_var.get() not in choices else self.row_var.get())
+        self.mode_chip.config(text="wafer row")
+        self.mode_chip.pack(side="left", padx=(10, 4))
+        self.row_combo.pack(side="left")
 
     def _browse_vk4(self):
         d = filedialog.askdirectory(title="Select VK4 folder")
@@ -592,6 +714,7 @@ class App:
         if not s:
             return
         self._set_dxf(s.get("dxf", ""))
+        self._set_wafer_map(s.get("wafer_map", ""))          # old samples: absent -> cleared
         if s.get("vk4_dir") and Path(s["vk4_dir"]).is_dir():
             self._set_vk4_dir(s["vk4_dir"])
         self.csv_text.delete("1.0", "end")
@@ -602,6 +725,7 @@ class App:
 
     def _snapshot(self):
         return {"dxf": self.cur["dxf"], "vk4_dir": self.cur["vk4_dir"],
+                "wafer_map": self.cur.get("wafer_map", ""),
                 "csv_text": self._csv(), "radial_text": self._radial()}
 
     def _save_as(self):
@@ -650,6 +774,9 @@ class App:
         if self.cal_proc and self.cal_proc.poll() is None:
             return messagebox.showerror("Run", "Depth calibration is in progress — wait for it to "
                                                "finish before starting a sample run.")
+        vk4_now = self.cur.get("vk4_dir", "")
+        if vk4_now and Path(vk4_now).is_dir() and _classify_vk4_folder(vk4_now)[0] == "row":
+            return self._start_row_run()
         if not self.sample_var.get().strip():
             return messagebox.showerror(
                 "Run", "Select a sample in the Samples dropdown first — its name is used for the "
@@ -700,6 +827,71 @@ class App:
         self.run_btn.config(text="■  Stop"); self.status.config(text="running…")
         threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
 
+    # ------------------------------------------------------------- wafer-row run #
+    def _row_number(self):
+        try:
+            return int(self.row_var.get().split()[1])
+        except (IndexError, ValueError):
+            return 0
+
+    def _row_name(self):
+        tag = self._row_cfg.get("date") or date_tag_from_names(
+            [f.name for f in Path(self.cur["vk4_dir"]).rglob("*.vk4")]) or ""
+        return _safe_name(row_out_name(tag, self._row_number()))
+
+    def _start_row_run(self):
+        """Launch run_row.py for the selected wafer row: ONE subprocess for the whole row, reusing
+        the existing console/Stop/results plumbing (self.proc, _reader, _drain_console)."""
+        n = self._row_number()
+        if not n:
+            return messagebox.showerror("Run row", "Pick a wafer row in the toolbar first.")
+        map_path = self._find_wafer_map(self.cur["vk4_dir"])
+        if map_path is None:
+            return messagebox.showerror(
+                "Run row", f"No {DEFAULT_MAP_NAME} found beside the VK4 folder, in its parent, or "
+                f"in CSV\\. Use the “Wafer map” box in the Inputs drawer to pick one.")
+        # Pre-flight: six samples is a long run, so fail in the first second, not the tenth minute.
+        entries, _meta, problems = read_wafer_map(map_path)
+        hard = [p for p in problems if not p.startswith("WARNING")]
+        if hard:
+            return messagebox.showerror("Wafer map", f"{map_path}\n\n" + "\n".join(hard[:12]))
+        if n not in rows_present(entries):
+            return messagebox.showerror(
+                "Run row", f"The wafer map has no entries for row {n} "
+                f"(rows present: {', '.join(str(r) for r in rows_present(entries))}).")
+        row_name = self._row_name()
+        collision = _sample_name_collision(row_name, self.samples)
+        if collision:
+            return messagebox.showerror(
+                "Run row", f"The row folder Results\\{row_name} collides with sample "
+                f"'{collision}'. Rename one so neither can overwrite the other.")
+        if row_name.casefold() == CAL_OUT_NAME.casefold():
+            return messagebox.showerror(
+                "Run row", f"'{CAL_OUT_NAME}' is reserved for the depth-calibration output.")
+        out_dir = DEF_OUT / row_name
+        if out_dir.is_dir() and ((out_dir / "legacy").is_dir() or (out_dir / "figures").is_dir()
+                                 or (out_dir / ".pflm-results.json").is_file()):
+            return messagebox.showerror(
+                "Run row", f"Results\\{row_name} is an existing SINGLE-sample result, not a wafer-row "
+                f"container. Pick a different row name so that result is not put at risk.")
+        dxf_dir = str(Path(self.cur["dxf"]).parent) if self.cur.get("dxf") else ""
+        cmd = [sys.executable, "-u", str(HERE / ROW_SCRIPT), "--row", str(n),
+               "--map", str(map_path), "--vk4", str(self.cur["vk4_dir"]),
+               "--out", str(out_dir)]
+        if dxf_dir:
+            cmd += ["--dxf-dir", dxf_dir]
+        self.console.delete("1.0", "end")
+        self._log("$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd) + "\n")
+        try:
+            self.proc = subprocess.Popen(
+                cmd, cwd=str(HERE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=dict(os.environ, PYTHONUNBUFFERED="1"))
+        except Exception as e:
+            self.proc = None
+            return messagebox.showerror("Run row", str(e))
+        self.run_btn.config(text="■  Stop"); self.status.config(text=f"running row {n}…")
+        threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
+
     def _reader(self, proc):
         try:
             for line in proc.stdout:
@@ -717,15 +909,24 @@ class App:
     # ------------------------------------------------------ depth calibration #
     def _discover_samples(self):
         """Sample folders under Results/ that hold a legacy/measurements.csv — exactly what
-        calibrate_depth pools. The calibration output folder is skipped (it has no legacy/)."""
+        calibrate_depth pools. The calibration output folder is skipped (it has no legacy/).
+
+        Mirrors calibrate_depth.discover_samples, INCLUDING its one-level descent into a wafer-row
+        container: a row's samples are listed as '072426 Row 1/c1 D50 P100 P25_S400' so the tokens
+        passed to --include and the --cell-filters JSON keys match what that module discovers."""
         if not DEF_OUT.is_dir():
             return []
         out = []
         for sub in sorted(p for p in DEF_OUT.iterdir() if p.is_dir()):
-            if sub.name == CAL_OUT_NAME:
+            if sub.name == CAL_OUT_NAME or sub.name.startswith("."):
                 continue
             if (sub / MEAS_REL).is_file():
                 out.append(sub.name)
+            else:                                # a wafer-row container -> one level deeper
+                out.extend(f"{sub.name}/{c.name}"
+                           for c in sorted(p for p in sub.iterdir()
+                                           if p.is_dir() and not p.name.startswith("."))
+                           if (c / MEAS_REL).is_file())
         return out
 
     def _refresh_cal_samples(self):
@@ -1032,10 +1233,21 @@ class App:
 
     # ----------------------------------------------------------------- export #
     def _export_zip(self):
-        name = self._dataset_name()
-        figs = self._dataset_out_dir() / "figures"
-        if not figs.is_dir():
-            return messagebox.showerror("Export", f"No figures to export for '{name}'. Run it first.")
+        # A wafer-row result is a CONTAINER: it has no figures/ of its own, but it does have
+        # row_figures/ plus one full dataset per sample. Zip the whole row in that case.
+        vk4 = self.cur.get("vk4_dir", "")
+        is_row = bool(vk4) and Path(vk4).is_dir() and _classify_vk4_folder(vk4)[0] == "row"
+        if is_row and self._row_number():
+            name = self._row_name()
+            root = DEF_OUT / name
+            if not (root / ROW_FIGURES_DIR).is_dir():
+                return messagebox.showerror("Export", f"No row results for '{name}'. Run it first.")
+        else:
+            name = self._dataset_name()
+            root = self._dataset_out_dir() / "figures"
+            if not root.is_dir():
+                return messagebox.showerror("Export",
+                                            f"No figures to export for '{name}'. Run it first.")
         out = filedialog.asksaveasfilename(title="Save figures zip", defaultextension=".zip",
                                            initialfile=f"{name}_figures.zip",
                                            filetypes=[("Zip archive", "*.zip")])
@@ -1044,9 +1256,9 @@ class App:
         try:
             out_resolved = Path(out).resolve()               # don't let the archive include itself
             with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-                for p in figs.rglob("*"):
+                for p in root.rglob("*"):
                     if p.is_file() and p.resolve() != out_resolved:
-                        zf.write(p, arcname=str(p.relative_to(figs)))
+                        zf.write(p, arcname=str(p.relative_to(root)))
         except Exception as e:
             return messagebox.showerror("Export", str(e))
         self.status.config(text=f"exported {Path(out).name}")

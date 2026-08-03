@@ -183,6 +183,7 @@ if __name__ == "__main__":       # pragma: no cover
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import figstyle as fs
     from dxf_geometry import read_design
 
     here = Path(__file__).parent
@@ -191,9 +192,9 @@ if __name__ == "__main__":       # pragma: no cover
     fig, ax = plt.subplots(1, 2, figsize=(16, 7))
     ax[0].imshow(scan.height_um, origin="lower", cmap="viridis")
     ax[1].imshow(scan.intensity, origin="lower", cmap="gray")
-    ax[0].set_title("height", fontsize=16); ax[1].set_title("intensity", fontsize=16)
-    for _a in ax:                                        # same +4-over-default type size as the
-        _a.tick_params(labelsize=14)                     # figures in run_sample.py / report.py
+    ax[0].set_title("height", fontsize=fs.TITLE); ax[1].set_title("intensity", fontsize=fs.TITLE)
+    for _a in ax:                                        # same type sizes as every other figure
+        _a.tick_params(labelsize=fs.TICK)                # in the project (figstyle)
     out = here / "Results" / "synth_preview.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=120); print("wrote", out, "truth origin", truth["origins"])

@@ -686,22 +686,148 @@ def _cell_pin_pattern(template, xppx, yppx, x_right, y_up, rot_deg, ds, margin_p
     return T, t0c, t0r, Ht, Wt
 
 
-def _adaptive_pin_mask(z0, valid, pitch_px, min_prom_um=2.0):
-    """Depth-robust pin map for the marker-free fallback: mark pixels raised above the LOCAL
-    floor rather than a single global height threshold.
+#: Pin prominence, as a fraction of the LOCAL pin prominence, used alongside the fixed noise floor.
+#: The 2 um floor is a NOISE threshold; laser ejecta is not noise and scales with dose, so on a
+#: high-dose cell a fixed bar admits debris fragments as if they were pins. Scaling with the relief
+#: keeps the bar at "a real pin" at every dose.
+#:
+#: Measured LOCALLY (see :func:`_local_pin_prominence`), not over the whole scan. A scan-wide
+#: statistic is the cell's own relief only when the scan holds ONE cell -- which is how the wafer
+#: row is captured, and the case this was tuned on. On a multi-cell sample the DEEPEST cell sets the
+#: bar and every shallower cell's pins fall under it and vanish: measured on '071626 D100 D50 4x4'
+#: (cells 12-158 um deep) a scan-wide statistic registered 9 of 16 cells, dropping every cell
+#: shallower than ~35 um -- exactly the low-dose end the depth calibration needs. That is the same
+#: whole-scan-threshold failure this helper exists to avoid.
+#:
+#: 0.25, not the 0.20 this shipped with: the statistic also changed from a 95-5 peak-to-trough span
+#: to the 95th-percentile prominence (~half the value on these scans), so the fraction is
+#: re-calibrated to keep the same bar. Verified against the constraint it exists for -- the wafer
+#: row is 24/24 at 0.25 and 22/24 at 0.20.
+DOSE_ROBUST_PROM_FRAC = 0.25
+#: KNOWN LIMIT, measured 2026-08-02 -- do not try to close this with another constant.
+#:
+#: A proportional bar cannot serve both populations, because they OVERLAP in relief:
+#:
+#:     needs a 4-8 um bar          | local prominence | must keep the ~2 um floor | prominence
+#:     row c1 D50 P100 P25_S400    |      16.5 um     | 4x4 cell (2,1) P10_S200   |   12.4 um
+#:     row c6 D50 P100 P50_S800    |      22.4 um     | 4x4 cell (4,1) P10_S800   |   10.6 um
+#:     row c4 D100 P150 P44_S800   |      32.3 um     | 4x4 cell (1,4) P80_S100   |   61.8 um
+#:
+#: Between the 12.4 um cell and the 16.5 um sample the required bar rises 1.64x while prominence
+#: rises 1.33x, so no proportional law separates them; a law steep enough to do it (e.g. quadratic)
+#: puts a 57 um bar on the 61.8 um cell and kills that one instead. A knee fails the same way -- it
+#: must sit between 12.4 and 16.5, and from that headroom it cannot lift c1's bar without wrecking
+#: c4 (tested at knee 20 um: 22/24 at every fraction from 0.25 to 0.50). Lowering the fraction does
+#: nothing (14/16 at 0.12, 0.15 and 0.20 alike) and neither does PIN_AREA_FLOOR_FRAC (14/16 at 0.04,
+#: and it costs the row 22/24).
+#:
+#: What actually distinguishes them is DEBRIS TEXTURE, not depth: c1 is debris-heavy at 16.5 um of
+#: relief while the 4x4's low-dose cells are clean at 12.4. Separating those needs a debris-aware
+#: statistic, which is real work and not a threshold tweak. Consequence today: the two shallowest
+#: cells of a wide-range multi-cell sweep are declined (14 of 16 on the 4x4, up from 9).
+#:
+#: Side of the block the local prominence is measured over, in pin pitches. Several pitches so the
+#: block holds enough pins for a stable percentile, but comfortably inside one unit cell -- that is
+#: what keeps a shallow cell's bar independent of a deep neighbour.
+LOCAL_SPAN_BLOCK_PITCH = 3.0
+#: Minimum valid pixels for a block's own percentile to be trusted; sparser blocks (scan edge,
+#: drop-out fields) inherit the median of the blocks that do qualify.
+LOCAL_SPAN_MIN_PX = 256
+#: Component-area floor as a fraction of one nominal pin's area. A pin eroded to half its drawn
+#: DIAMETER still has ~25% of its area, so this keeps genuinely damaged pins while rejecting the
+#: ejecta speckle that the old 0.04 (= 20% of diameter) let through.
+PIN_AREA_FLOOR_FRAC = 0.25
+PIN_AREA_CEIL_FRAC = 1.6                    # unchanged: rejects bridged/merged pin pairs
 
-    ``scan_feature``'s ``pin_mask`` (used by the marker path) thresholds the leveled height at a
-    whole-scan percentile, so on a sample whose cells span a wide depth range the SHALLOW cells'
-    pins never clear the global level and vanish. Here the background is a local (~1.5 pin-pitch)
-    mean, so a small fixed prominence catches pins at any absolute etch depth -- exactly the
-    cells the global mask drops. The marker path is untouched; this feeds the fallback only."""
+
+def _local_pin_prominence(rel, valid, pitch_px):
+    """How high a pin top stands above its local background, measured per BLOCK.
+
+    The 95th percentile of ``rel`` -- the pin-top level -- and NOT the 95-5 peak-to-trough span the
+    scan-wide version used. Two reasons, both measured:
+
+    * Peak-to-trough double-counts. ``rel`` is height minus a ~1.5-pitch local mean, so the pins sit
+      above it and the floor below it; p95-p05 is therefore about the whole excursion, not the pin.
+      It also collects any other relief in the block -- on '071626 D100 D50 4x4' the un-etched array
+      dividers inside each cell put the span at ~24 um where the pins stand ~12 um, so a fraction of
+      the span cut those pins near mid-height.
+    * A percentile, not max-min: the tails here are laser ejecta and drop-out speckle, and a
+      peak-to-trough statistic reads a spike as relief. Measured on the debris-heavy
+      '72026 D100 D50 2x2', max-min over a pin pitch put the bar so high that 3 of its 4 cells
+      stopped registering.
+
+    So ``DOSE_ROBUST_PROM_FRAC`` now reads directly as "a pin counts once it is this fraction of the
+    way from its local background to a real pin top", which is what the bar was always meant to be.
+
+    Only the SCOPE and the statistic move, never the fail-closed gates downstream. Blocks are a few
+    pin pitches -- enough pins for a stable percentile, comfortably inside a unit cell, so a shallow
+    cell's bar is its own and not its deep neighbour's. They are expanded back nearest-neighbour:
+    the step at a block edge is negligible inside a uniform cell (adjacent blocks read almost the
+    same) and is wanted at a cell boundary, which is the whole point. Returned float32, scan
+    shape."""
+    nb = int(max(8, round(LOCAL_SPAN_BLOCK_PITCH * pitch_px)))
+    H, W = rel.shape
+    ny, nx = max(1, H // nb), max(1, W // nb)
+    ys = np.linspace(0, H, ny + 1).round().astype(int)
+    xs = np.linspace(0, W, nx + 1).round().astype(int)
+    grid = np.full((ny, nx), np.nan, np.float32)
+    for i in range(ny):
+        for j in range(nx):
+            sl = (slice(ys[i], ys[i + 1]), slice(xs[j], xs[j + 1]))
+            # invalid pixels are excluded, not neutralised: a stitched raster's holes carry a
+            # leveled height that is not a surface measurement at all
+            v = rel[sl][valid[sl]]
+            if v.size >= LOCAL_SPAN_MIN_PX:
+                grid[i, j] = max(0.0, float(np.percentile(v, 95.0)))
+    if not np.isfinite(grid).any():
+        return np.zeros_like(rel, dtype=np.float32)
+    grid[~np.isfinite(grid)] = np.nanmedian(grid)      # sparse blocks inherit the typical value
+    out = np.repeat(np.repeat(grid, nb, axis=0), nb, axis=1)
+    if out.shape[0] < H or out.shape[1] < W:           # last partial block: edge-extend
+        out = np.pad(out, ((0, max(0, H - out.shape[0])), (0, max(0, W - out.shape[1]))),
+                     mode="edge")
+    return out[:H, :W]
+
+
+def _adaptive_pin_mask(z0, valid, pitch_px, min_prom_um=2.0):
+    """Depth-robust pin map: mark pixels raised above the LOCAL floor rather than a single global
+    height threshold.
+
+    ``scan_feature``'s ``pin_mask`` thresholds the leveled height at a whole-scan percentile, so on
+    a sample whose cells span a wide depth range the SHALLOW cells' pins never clear the global
+    level and vanish. Here the background is a local (~1.5 pin-pitch) mean, so a small prominence
+    catches pins at any absolute etch depth -- exactly the cells the global mask drops.
+
+    Used by BOTH the marker path (:func:`register_sample`, :func:`register_scan`) and the
+    marker-free fallback. It is not fallback-only, and a change here moves every registration.
+
+    The prominence bar is the LARGER of ``min_prom_um`` (a noise floor) and a fraction of the
+    relief. On a heavily-ablated cell the ejecta around each pin clears a fixed 2 um bar, so the
+    component set becomes part pins and part debris, and every statistic computed over it --
+    coherence, inlier fraction -- is diluted by the debris rather than by any defect in the lattice.
+    Scaling the bar with the relief fixes the EVIDENCE instead of weakening the fail-closed tests
+    that consume it.
+
+    That relief is measured LOCALLY. Taking it scan-wide reintroduced, through the back door, the
+    very whole-scan threshold described above: on a multi-cell dose sweep the deepest cell sets the
+    bar and the shallow cells are erased. See :data:`DOSE_ROBUST_PROM_FRAC`."""
     from scipy.ndimage import uniform_filter
     k = int(max(5, round(1.5 * pitch_px)))
     vf = valid.astype(np.float32)
     zf = np.where(valid, z0, 0.0).astype(np.float32)
     bg = (uniform_filter(zf, size=k, mode="nearest")
           / np.maximum(uniform_filter(vf, size=k, mode="nearest"), 1e-6))
-    return valid & ((z0 - bg) > min_prom_um)
+    # float32 throughout: these are whole-scan arrays (a stitched 4x4 is 57 Mpx) and the block
+    # statistic below holds another one.
+    rel = np.subtract(z0, bg, dtype=np.float32)
+    del bg, zf, vf
+    if np.any(valid):
+        bar = _local_pin_prominence(rel, valid, pitch_px)
+        bar *= DOSE_ROBUST_PROM_FRAC
+        np.maximum(bar, min_prom_um, out=bar)
+    else:
+        bar = min_prom_um
+    return valid & (rel > bar)
 
 
 def _uniform_component_centers(pin_mask, array, xppx, yppx):
@@ -709,8 +835,10 @@ def _uniform_component_centers(pin_mask, array, xppx, yppx):
 
     Connected components are used only to estimate lattice angle and phase.  Final finite-array
     scoring samples every expected lattice node directly, so a damaged or bridged component cannot
-    by itself create edge evidence.  The broad area window deliberately retains partial/eroded pin
-    tops while rejecting the many one-pixel prominence speckles seen in real VK4 height maps.
+    by itself create edge evidence.  The area window retains partial/eroded pin tops while
+    rejecting the prominence speckle seen in real VK4 height maps -- the floor is a fraction of one
+    pin's AREA, so a pin worn to half its drawn diameter (a quarter of its area) still counts while
+    ejecta fragments do not.
     """
     from scipy.ndimage import center_of_mass, label
 
@@ -719,8 +847,8 @@ def _uniform_component_centers(pin_mask, array, xppx, yppx):
         return np.empty((0, 2), float)
     areas = np.bincount(labels.ravel())[1:]
     expected = np.pi * (0.5 * array.diameter_um / xppx) * (0.5 * array.diameter_um / yppx)
-    keep = np.flatnonzero((areas >= max(3.0, 0.04 * expected))
-                          & (areas <= 1.6 * expected)) + 1
+    keep = np.flatnonzero((areas >= max(3.0, PIN_AREA_FLOOR_FRAC * expected))
+                          & (areas <= PIN_AREA_CEIL_FRAC * expected)) + 1
     if keep.size == 0:
         return np.empty((0, 2), float)
     rc = np.asarray(center_of_mass(pin_mask, labels, keep), float)
