@@ -560,6 +560,33 @@ def main():
                      "#16: register_sample recovers the tiled cell grid (cols 1,2,3, single row)")
             ck.check(all(p.x_right == 1 and p.y_up == 1 for p in pls_L),
                      "#16: register_sample reports the expected orientation (x_right=+1, y_up=+1)")
+
+            # A tiled scan whose cells sit at VERY different depths is what a scan-WIDE prominence
+            # bar gets wrong: the deepest cell sets the bar, the shallow cells' pins fall under it,
+            # and those cells never register. Every other synthetic scan in this file is uniform
+            # depth, which is exactly why that shipped unnoticed -- on the real '071626 D100 D50
+            # 4x4' (cells 12-158 um) a scan-wide span registered 9 of 16 cells, losing the whole
+            # low-dose end. Splice one deep cell beside two shallow ones and require all three.
+            _deep, _trD = synth_scan(_Ltmpl, x_um_per_px=2.0, y_um_per_px=2.0,
+                                     origin_px=(110.0, 90.0), n_cells=3, cell_gap_um=_gap,
+                                     depth_um=120.0, floor_um=60.0, seed=21)
+            _shal, _ = synth_scan(_Ltmpl, x_um_per_px=2.0, y_um_per_px=2.0,
+                                  origin_px=(110.0, 90.0), n_cells=3, cell_gap_um=_gap,
+                                  depth_um=10.0, floor_um=60.0, seed=21)
+            # splice in the GAP after cell 1, not midway between the two origins -- that lands
+            # inside cell 1 and would half-etch it, which is a different (and unfair) test
+            _ocols = sorted(c for c, _r in _trD["origins"])
+            _cut = int(_ocols[0] + _allcL[:, 0].max() / 2.0 + 0.5 * _gap / 2.0)
+            _mix = SynthScan(_deep.height_raw.copy(), _deep.intensity.copy(),
+                             _deep.x_um_per_px, _deep.y_um_per_px, _deep.z_um_per_digit)
+            _mix.height_raw[:, _cut:] = _shal.height_raw[:, _cut:]
+            _mix.intensity[:, _cut:] = _shal.intensity[:, _cut:]
+            pls_mix = register_sample(_mix, _Ltmpl, cell_pitch_um=_pitch, mirror_x=False)
+            ck.check(len(pls_mix) == 3,
+                     "mixed-depth tiling (one 120 um cell beside two 10 um cells): all three "
+                     f"cells register, not just the deep one (got {len(pls_mix)})")
+            ck.check(sorted(p.cell_col for p in pls_mix) == [1, 2, 3],
+                     "mixed-depth tiling: the shallow cells keep their grid indices")
     except Exception as e:                                   # pragma: no cover
         ck.check(False, f"L-marker path raised: {e!r}")
 
@@ -970,13 +997,26 @@ def main():
         ck.check(_family_keys == {(1, 150.0), (1, 350.0)},
                  "calibration: same local band number at different pitches remains separate")
 
-        # passes×speed (interaction) is preferred whenever it fits with meaningful signal, even when a
-        # dose form has a lower AICc -- depth does not collapse to dose = passes/speed.
+        # The passes×speed FAMILY is preferred over the dose forms even when a dose form has the
+        # lower AICc -- depth does not collapse to dose = passes/speed. Within that family the
+        # interaction TERM is kept only when it is itself supported: adj-R² scores the whole fit,
+        # so a band can clear it on the main effects while its passes×speed coefficient is
+        # indistinguishable from zero, and the figure then draws a curved target contour whose
+        # curvature is entirely that unsupported term.
+        _sat_f = {"ok": True, "aicc": 8.0, "r2": 0.9}
+        _logd_f = {"ok": True, "aicc": 6.0, "adj_r2": 0.9}
+        _add_f = {"ok": True, "aicc": 10.0, "adj_r2": 0.6}
         _best, _ = cd.choose_recommended(
-            {"ok": True, "aicc": 8.0, "r2": 0.9},
-            {"ok": True, "aicc": 6.0, "adj_r2": 0.9},
-            {"ok": True, "aicc": 10.0, "adj_r2": 0.6})
-        ck.check(_best == "interaction", "calibration: passes×speed model preferred over dose forms")
+            _sat_f, _logd_f, {"ok": True, "aicc": 10.0, "adj_r2": 0.6, "p_interaction": 0.01},
+            _add_f)
+        ck.check(_best == "interaction",
+                 "calibration: a SUPPORTED passes×speed interaction beats the dose forms")
+        _best, _ = cd.choose_recommended(
+            _sat_f, _logd_f, {"ok": True, "aicc": 10.0, "adj_r2": 0.6, "p_interaction": 0.64},
+            _add_f)
+        ck.check(_best == "additive",
+                 "calibration: an unsupported interaction term (p=0.64) falls to the ADDITIVE "
+                 "model -- a straight contour -- not to a dose form")
         # falls back to the lowest-AICc dose form when the interaction model is not estimable
         _fb, _ = cd.choose_recommended(
             {"ok": True, "aicc": 12.0, "r2": 0.5},

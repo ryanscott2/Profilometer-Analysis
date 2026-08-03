@@ -37,10 +37,12 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 # Reuse the exact OLS helper the diameter model uses so both calibrations report CIs/R² the same
 # way. X must already include the intercept column; returns (params, conf_int, r2, adj_r2, n, p, pv).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import figstyle as fs                                           # noqa: E402  house type sizes
 from report import _ols_fit                                     # noqa: E402
 
 HERE = Path(__file__).resolve().parent
@@ -48,6 +50,9 @@ DEF_RESULTS = HERE / "Results"
 OUT_NAME = "etch depth"                # cross-sample output dir; has no legacy/ so it self-skips discovery
 MEAS_REL = Path("legacy") / "measurements.csv"
 DEF_TARGET_UM = 55.0                   # the design target used throughout the codebase
+#: Half-width of the "on target" window, um. A measured cell-band median within this of a requested
+#: target is ringed on the depth scatter -- with the default 55 um target that is the 50-60 um band.
+TARGET_WINDOW_UM = 5.0
 DEF_MAX_DEBRIS = None                  # OFF by default: debris_fraction is a poor proxy for a bad
 #                                        depth read (the user vets which samples are good). Pass
 #                                        --max-debris X to re-enable the cut.
@@ -495,8 +500,8 @@ def fit_log_dose_ols(g, alpha=0.05):
     return out
 
 
-def _design_interaction(g):
-    """Centered design for depth ~ 1 + passes + speed + passes:speed; a predictor (and its
+def _design_passes_speed(g, with_interaction):
+    """Centered design for depth ~ 1 + passes + speed [+ passes:speed]; a predictor (and its
     interaction) is dropped when constant within the band, mirroring report._model_design. Also
     returns the centering means so the fit can be evaluated at arbitrary (passes, speed)."""
     names, cols, cen = ["intercept"], [np.ones(len(g))], {}
@@ -507,15 +512,14 @@ def _design_interaction(g):
         if np.ptp(v) > 1e-9:
             cen[nm] = v - v.mean()
             names.append(nm); cols.append(cen[nm])
-    if "passes" in cen and "speed" in cen:
+    if with_interaction and "passes" in cen and "speed" in cen:
         names.append("passes×speed"); cols.append(cen["passes"] * cen["speed"])
     return np.column_stack(cols), g["depth_um"].to_numpy(float), names, means
 
 
-def fit_interaction_ols(g, alpha=0.05):
-    """depth ~ 1 + passes + speed + passes:speed (centered) via report._ols_fit."""
-    out = {"form": "interaction OLS  depth ~ 1 + passes + speed + passes:speed", "ok": False}
-    X, y, names, means = _design_interaction(g)
+def _fit_ps_ols(g, *, with_interaction, form, alpha=0.05):
+    X, y, names, means = _design_passes_speed(g, with_interaction)
+    out = {"form": form, "ok": False}
     if X.shape[0] < X.shape[1] + 2:
         out["msg"] = f"n={X.shape[0]} too few for a {X.shape[1]}-term fit"
         return out
@@ -525,25 +529,61 @@ def fit_interaction_ols(g, alpha=0.05):
         out.update(names=names, beta=beta, ci=ci, r2=r2, adj_r2=adj, n=int(n), pvalues=pv,
                    ss_res=ss_res, k_params=X.shape[1], aicc=_aicc(n, ss_res, X.shape[1]),
                    means=means, ok=True)
+        if "passes×speed" in names:
+            out["p_interaction"] = float(pv[names.index("passes×speed")])
     except Exception as e:
         out["msg"] = f"OLS failed: {e}"
     return out
 
 
-def choose_recommended(sat, logd, inter):
-    """Recommend the passes×speed (interaction) model whenever it fits with meaningful signal.
+def fit_interaction_ols(g, alpha=0.05):
+    """depth ~ 1 + passes + speed + passes:speed (centered) via report._ols_fit."""
+    return _fit_ps_ols(g, with_interaction=True, alpha=alpha,
+                       form="interaction OLS  depth ~ 1 + passes + speed + passes:speed")
+
+
+def fit_additive_ols(g, alpha=0.05):
+    """depth ~ 1 + passes + speed (centered), NO interaction term.
+
+    The honest default whenever the interaction coefficient is not supported by the data: it still
+    separates passes from speed (so it does not assume depth collapses to dose), but it does not
+    assert that the per-pass gain changes with speed."""
+    return _fit_ps_ols(g, with_interaction=False, alpha=alpha,
+                       form="additive OLS  depth ~ 1 + passes + speed")
+
+
+def choose_recommended(sat, logd, inter, addit=None, alpha=0.05):
+    """Pick the model to report and invert. Prefer the passes×speed family; inside it, only keep the
+    interaction TERM when the data support it.
 
     Etch depth does NOT collapse to dose = passes/speed (the same ratio gives very different depth),
-    so the passes×speed model is the honest form. The dose-only fits (saturating, log-dose) are kept
-    only as a fallback when the interaction model is not estimable (too few points, or only one of
-    passes/speed swept). ``None`` still suppresses inversion when nothing is informative.
-    """
-    if (inter.get("ok") and np.isfinite(inter.get("aicc", np.inf))
-            and np.isfinite(inter.get("adj_r2", np.nan)) and inter["adj_r2"] >= MIN_PREDICTIVE_R2):
-        return "interaction", (f"passes×speed model (adj R²={inter['adj_r2']:.2f}); "
-                               f"depth does not collapse to dose")
+    so a passes×speed form is the honest one and the dose-only fits (saturating, log-dose) are a
+    fallback for when it is not estimable. But "use the interaction model whenever it fits at all"
+    was too permissive: adj-R² measures the WHOLE fit, and a band can clear it on the passes and
+    speed main effects while its passes×speed coefficient is indistinguishable from zero (measured:
+    p=0.64 and p=0.41 on the D50 and D100 bands). Anything read off that term -- most visibly the
+    curvature of a target contour -- is then unearned. Require p < ``alpha`` on the interaction
+    coefficient itself; otherwise drop to the additive fit."""
+    addit = addit or {}
+
+    def _usable(fit):
+        return (fit.get("ok") and np.isfinite(fit.get("aicc", np.inf))
+                and np.isfinite(fit.get("adj_r2", np.nan))
+                and fit["adj_r2"] >= MIN_PREDICTIVE_R2)
+
+    p_int = inter.get("p_interaction", float("nan"))
+    if _usable(inter) and np.isfinite(p_int) and p_int < alpha:
+        return "interaction", (f"passes×speed model (adj R²={inter['adj_r2']:.2f}); the "
+                               f"interaction term is supported (p={p_int:.2g} < {alpha:g}), so the "
+                               f"per-pass gain does vary with speed")
+    if _usable(addit):
+        why = (f"interaction term not supported (p={p_int:.2g} ≥ {alpha:g}) -> additive"
+               if np.isfinite(p_int) else "additive passes+speed model")
+        return "additive", (f"{why} (adj R²={addit['adj_r2']:.2f}); depth still does not collapse "
+                            f"to dose, but no speed-dependence of the per-pass gain is claimed "
+                            f"that the data do not show")
     candidates = []
-    for key, fit in (("saturating", sat), ("log-dose", logd), ("interaction", inter)):
+    for key, fit in (("saturating", sat), ("log-dose", logd)):
         if not fit.get("ok") or not np.isfinite(fit.get("aicc", np.inf)):
             continue
         quality = fit.get("r2", np.nan) if key == "saturating" else fit.get("adj_r2", np.nan)
@@ -609,7 +649,7 @@ def fit_mixedlm(g, alpha=0.05):
 
 
 # ==================================================================== inversion == #
-def invert_target(rec_key, sat, logd, inter, target, alpha=0.05):
+def invert_target(rec_key, sat, logd, inter, target, alpha=0.05, addit=None):
     """Dose that yields ``target`` depth under the recommended model, + a (1−alpha) interval.
 
     Saturating: dose* = −ln(1 − target/a)/k (defined only when target < plateau a); the interval
@@ -640,29 +680,34 @@ def invert_target(rec_key, sat, logd, inter, target, alpha=0.05):
             return float("nan"), float("nan"), float("nan"), "log-dose slope 0 — not invertible"
         dstar = float(np.exp((target - b0) / b1))
         return dstar, float("nan"), float("nan"), "log-dose inversion (point; inverse CI unavailable)"
-    if rec_key == "interaction" and inter.get("ok"):
+    if rec_key in ("interaction", "additive"):
         return (float("nan"), float("nan"), float("nan"),
-                "interaction model: depth depends on passes & speed separately — read the "
-                "(passes, speed) target contour off depth_heatmap.png (no single dose)")
+                "interaction model: depth depends on passes & speed separately, so there is no "
+                "single dose — see depth_heatmap.png for which measured (passes, speed) cells "
+                "landed in the target window")
     return float("nan"), float("nan"), float("nan"), "recommended model not invertible"
 
 
-def _predict(rec_key, sat, logd, inter, dose=None, passes=None, speed=None, drawn=None):
-    """Predicted depth from the recommended model. Saturating and log-dose use dose = passes/speed;
-    interaction uses passes & speed directly (rebuilt from the stored centered coefficients + means).
-    Returns an array shaped like the broadcast of the relevant inputs."""
+def _predict(R, dose=None, passes=None, speed=None):
+    """Predicted depth from band-result ``R``'s recommended model. Saturating and log-dose use
+    dose = passes/speed; the additive and interaction forms use passes & speed directly (rebuilt
+    from the stored centered coefficients + means). Returns an array shaped like the broadcast of
+    the relevant inputs."""
+    rec_key = R.get("rec_key")
+    sat, logd = R["sat"], R["logd"]
     if rec_key == "saturating" and sat.get("ok"):
         return _sat(np.asarray(dose, float), sat["a"], sat["k"])
     if rec_key == "log-dose" and logd.get("ok"):
         b0, b1 = logd["b0_at_med"], logd["b_logdose"]
         return b0 + b1 * np.log(np.asarray(dose, float))
-    if rec_key == "interaction" and inter.get("ok"):
+    fit = R.get("inter") if rec_key == "interaction" else R.get("addit")
+    if rec_key in ("interaction", "additive") and fit and fit.get("ok"):
         P, S = np.asarray(passes, float), np.asarray(speed, float)
-        mp, ms = inter["means"]["passes"], inter["means"]["speed"]
+        mp, ms = fit["means"]["passes"], fit["means"]["speed"]
         val = np.zeros(np.shape(P + S))                  # broadcast shape of the (P, S) grid
         term = {"intercept": 1.0, "passes": P - mp, "speed": S - ms,
                 "passes×speed": (P - mp) * (S - ms)}
-        for nm, b in zip(inter["names"], inter["beta"]):
+        for nm, b in zip(fit["names"], fit["beta"]):
             val = val + b * term[nm]
         return val
     return np.full(np.shape(dose), np.nan)
@@ -725,9 +770,10 @@ def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude
         sat = fit_saturating(g["dose_ratio"], g["depth_um"], alpha=alpha)
         logd = fit_log_dose_ols(g, alpha=alpha)
         inter = fit_interaction_ols(g, alpha=alpha)
-        rec_key, rec_why = choose_recommended(sat, logd, inter)
+        addit = fit_additive_ols(g, alpha=alpha)
+        rec_key, rec_why = choose_recommended(sat, logd, inter, addit, alpha=alpha)
         mixed = fit_mixedlm(g, alpha=alpha)
-        per_band[b] = dict(g=g, sat=sat, logd=logd, inter=inter, rec_key=rec_key,
+        per_band[b] = dict(g=g, sat=sat, logd=logd, inter=inter, addit=addit, rec_key=rec_key,
                            rec_why=rec_why, mixed=mixed, label=_fmt_band(b, g, band_meta),
                            label_short=_fmt_band_short(b, g, band_meta))
 
@@ -778,18 +824,24 @@ def _fmt_band(b, g, band_meta=None):
 
 
 def _fmt_band_short(b, g, band_meta=None):
-    """Figure-title form of :func:`_fmt_band`: ``Band 1 — Ø 47.5–52.5 µm, pitch = 100 µm``. The full
-    label (drawn Ø actually present, n) stays in the text report, where there is room for it."""
+    """Figure-title form of :func:`_fmt_band`: the NOMINAL geometry and nothing else --
+    ``Ø 50 µm pins, 100 µm pitch``.
+
+    Review feedback on the presentation set: "just give nominal p & d". A user-defined band declares
+    a tolerance window around a nominal diameter, so the nominal is that window's midpoint. Without
+    band definitions there IS no declared nominal -- a DXF band sweeps drawn Ø (say 50–67.5 µm) and
+    its midpoint would be a diameter nobody drew -- so that case keeps the honest range. The band
+    index, the drawn Ø actually present and n stay in the text report, where there is room."""
     source_band = b[0] if isinstance(b, tuple) else b
-    if band_meta and source_band in band_meta:            # user-defined band: declared range/pitch
+    if band_meta and source_band in band_meta:            # user-defined band: nominal = midpoint
         dmin, dmax, pitch = band_meta[source_band]
-        drng = f"{dmin:g}–{dmax:g}"
+        dlbl = f"{0.5 * (dmin + dmax):g}"
     else:
         ds = sorted(g["drawn_diameter_um"].dropna().unique())
-        drng = f"{ds[0]:g}–{ds[-1]:g}" if ds else "?"
+        dlbl = f"{ds[0]:g}–{ds[-1]:g}" if ds else "?"
         pitch = (g["nominal_pitch_um"].dropna().iloc[0]
                  if g["nominal_pitch_um"].notna().any() else float("nan"))
-    return f"Band {source_band} — Ø {drng} µm, pitch = {pitch:g} µm"
+    return f"Ø {dlbl} µm pins, {pitch:g} µm pitch"
 
 
 def _short_band(b):
@@ -870,12 +922,30 @@ def write_report(out_dir, samples, gate_rep, gated, per_band, targets, alpha, ma
                 L.append(f"      {nm:>16} = {bta:+10.3f}   [{ci_lbl} {lo:+.3f}, {hi:+.3f}]   p={pv:.2g}")
         else:
             L.append(f"  [log-dose OLS]  skipped: {logd.get('msg', '?')}")
+        addit = R.get("addit", {})
+        if addit.get("ok"):
+            L.append(f"  [additive OLS]  {addit['form']}   R²={addit['r2']:.3f}  adj-R²={addit['adj_r2']:.3f}  AICc={addit['aicc']:.2f}  (n={addit['n']})")
+            for nm, bta, (lo, hi), pv in zip(addit["names"], addit["beta"], addit["ci"], addit["pvalues"]):
+                L.append(f"      {nm:>16} = {bta:+10.4g}   [{ci_lbl} {lo:+.4g}, {hi:+.4g}]   p={pv:.2g}")
+        else:
+            L.append(f"  [additive OLS]  skipped: {addit.get('msg', '?')}")
         if inter.get("ok"):
             L.append(f"  [interaction OLS]  {inter['form']}   R²={inter['r2']:.3f}  adj-R²={inter['adj_r2']:.3f}  AICc={inter['aicc']:.2f}  (n={inter['n']})")
             for nm, bta, (lo, hi), pv in zip(inter["names"], inter["beta"], inter["ci"], inter["pvalues"]):
                 L.append(f"      {nm:>16} = {bta:+10.4g}   [{ci_lbl} {lo:+.4g}, {hi:+.4g}]   p={pv:.2g}")
+            _pi = inter.get("p_interaction", float("nan"))
+            if np.isfinite(_pi):
+                L.append(f"      -> passes×speed p={_pi:.2g}: any speed-dependence of the per-pass "
+                         f"gain rests ENTIRELY on this term; "
+                         f"{'supported' if _pi < alpha else 'NOT supported -> additive preferred'}")
         else:
             L.append(f"  [interaction OLS]  skipped: {inter.get('msg', '?')}")
+        _nsp = int(g["speed"].dropna().nunique())
+        if _nsp <= 2:
+            L.append(f"  !! this band swept only {_nsp} distinct scan speed(s). A two-point sweep "
+                     f"fixes the ENDS of the speed response and nothing between them: many curves "
+                     f"pass through two points. Treat any shape between the measured speeds as "
+                     f"assumed, not measured.")
         L.append("")
         L.append(f"  >> recommended form: {R['rec_key'] or 'none'}  ({R['rec_why']})")
         L.append("")
@@ -906,7 +976,8 @@ def write_report(out_dir, samples, gate_rep, gated, per_band, targets, alpha, ma
         speeds = sorted(g["speed"].dropna().unique())
         s_ref = float(np.median(speeds)) if speeds else float("nan")
         for t in targets:
-            dstar, lo, hi, note = invert_target(R["rec_key"], sat, logd, inter, t, alpha)
+            dstar, lo, hi, note = invert_target(R["rec_key"], sat, logd, inter, t, alpha,
+                                                addit=R.get("addit"))
             if np.isfinite(dstar):
                 pi = f"  [dose {ci_lbl} {lo:.4g}, {hi:.4g}]" if np.isfinite(lo) else ""
                 ex = (f"  e.g. at {s_ref:g} mm/s -> {dstar * s_ref:.0f} passes"
@@ -957,7 +1028,7 @@ def fig_depth_3d(out_dir, per_band, targets):
         return
     nrows, ncols = _grid(len(bands))
     colors = _sample_colors(per_band)
-    fig = plt.figure(figsize=(6.8 * ncols, 5.4 * nrows))
+    fig = plt.figure(figsize=(7.6 * ncols, 6.1 * nrows))
     for idx, b in enumerate(bands):
         R = per_band[b]; g = R["g"]; rk = R["rec_key"]
         P = g["passes"].to_numpy(float); S = g["speed"].to_numpy(float)
@@ -965,7 +1036,7 @@ def fig_depth_3d(out_dir, per_band, targets):
         if rk in ("saturating", "log-dose", "interaction"):  # recommended-model surface
             pg = np.linspace(P.min(), P.max(), 24); sg = np.linspace(S.min(), S.max(), 24)
             PG, SG = np.meshgrid(pg, sg)
-            ZG = _predict(rk, R["sat"], R["logd"], R["inter"], dose=PG / SG, passes=PG, speed=SG)
+            ZG = _predict(R, dose=PG / SG, passes=PG, speed=SG)
             if np.ndim(ZG) and np.isfinite(ZG).any():
                 ax.plot_surface(PG, SG, ZG, cmap="viridis", alpha=0.4, linewidth=0, antialiased=True)
         for s, gs in g.groupby("sample"):
@@ -975,17 +1046,20 @@ def fig_depth_3d(out_dir, per_band, targets):
             pg2, sg2 = np.meshgrid([P.min(), P.max()], [S.min(), S.max()])
             ax.plot_surface(pg2, sg2, np.full(pg2.shape, float(t)), color="crimson",
                             alpha=0.12, linewidth=0)
-        ax.set_xlabel("passes", labelpad=8, fontsize=13)
-        ax.set_ylabel("speed (mm/s)", labelpad=8, fontsize=13)
-        ax.set_zlabel("depth (µm)", labelpad=6, fontsize=13)
-        ax.tick_params(labelsize=12)
-        ax.set_title(R["label_short"], fontsize=14); ax.view_init(elev=22, azim=-60)
+        ax.set_xlabel("passes", labelpad=12, fontsize=fs.LABEL)
+        ax.set_ylabel("speed (mm/s)", labelpad=14, fontsize=fs.LABEL)
+        ax.set_zlabel("depth (µm)", labelpad=10, fontsize=fs.LABEL)
+        ax.tick_params(labelsize=fs.TICK)
+        ax.set_title(R["label_short"], fontsize=fs.TITLE); ax.view_init(elev=22, azim=-60)
         if idx == 0:
-            ax.legend(fontsize=10, loc="upper left")
-    fig.suptitle("Etch depth = f(passes, speed) per band", y=1.0, fontsize=15)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
+            ax.legend(fontsize=fs.LEGEND_SM, loc="upper left")
+    fig.suptitle("Etch depth = f(passes, speed) per band", y=0.985, fontsize=fs.SUPTITLE)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.subplots_adjust(right=0.95)
     p = out_dir / "depth_vs_passes_speed_3d.png"
-    fig.savefig(p, dpi=170, bbox_inches="tight"); plt.close(fig)
+    # NOT bbox_inches="tight" here: Axes3D leaves its axis labels out of the tight bbox, so the
+    # rightmost panel's z-label was cropped off the saved image. The margins above are explicit.
+    fig.savefig(p, dpi=170); plt.close(fig)
     print(f"Wrote {p}")
 
 
@@ -999,7 +1073,7 @@ def fig_depth_vs_dose(out_dir, per_band, targets):
         return
     nrows, ncols = _grid(len(bands))
     colors = _sample_colors(per_band)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6.4 * ncols, 4.8 * nrows), squeeze=False)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7.2 * ncols, 5.4 * nrows), squeeze=False)
     for idx, b in enumerate(bands):
         ax = axes[idx // ncols][idx % ncols]
         R = per_band[b]; g = R["g"]
@@ -1008,14 +1082,15 @@ def fig_depth_vs_dose(out_dir, per_band, targets):
                     ls="none", label=str(s))
         for t in targets:
             ax.axhline(t, color="crimson", ls="--", lw=1)
-        ax.set_xlabel("dose = passes / speed", fontsize=13); ax.set_ylabel("depth (µm)", fontsize=13)
-        ax.tick_params(labelsize=12)
-        ax.set_title(R["label_short"], fontsize=14); ax.grid(alpha=0.3)
+        ax.set_xlabel("dose = passes / speed", fontsize=fs.LABEL)
+        ax.set_ylabel("depth (µm)", fontsize=fs.LABEL)
+        ax.tick_params(labelsize=fs.TICK)
+        ax.set_title(R["label_short"], fontsize=fs.TITLE); ax.grid(alpha=0.3)
         if idx == 0:
-            ax.legend(fontsize=10)
+            ax.legend(fontsize=fs.LEGEND_SM)
     for idx in range(len(bands), nrows * ncols):             # blank any unused grid cell
         axes[idx // ncols][idx % ncols].axis("off")
-    fig.suptitle("Etch depth vs dose", y=1.0, fontsize=15)
+    fig.suptitle("Etch depth vs dose", y=1.0, fontsize=fs.SUPTITLE)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     p = out_dir / "depth_vs_dose.png"
     fig.savefig(p, dpi=170, bbox_inches="tight"); plt.close(fig)
@@ -1025,15 +1100,14 @@ def fig_depth_vs_dose(out_dir, per_band, targets):
 def fig_parity(out_dir, per_band, targets=None):        # targets unused; accepted for a uniform call loop
     """Measured-vs-predicted parity + residuals (reuses the make_diameter_model two-panel layout),
     coloured by band, using each band's recommended model."""
-    fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(14.5, 6.6))
     cmap = plt.get_cmap("tab10")
     lo_hi = []
     for i, (b, R) in enumerate(per_band.items()):
         g, rk = R["g"], R["rec_key"]
         if rk not in ("saturating", "log-dose", "interaction"):
             continue
-        pred = _predict(rk, R["sat"], R["logd"], R["inter"],
-                        dose=g["dose_ratio"].to_numpy(float),
+        pred = _predict(R, dose=g["dose_ratio"].to_numpy(float),
                         passes=g["passes"].to_numpy(float), speed=g["speed"].to_numpy(float))
         y = g["depth_um"].to_numpy(float)
         m = np.isfinite(pred) & np.isfinite(y)
@@ -1048,16 +1122,16 @@ def fig_parity(out_dir, per_band, targets=None):        # targets unused; accept
     if lo_hi:
         lim = [min(lo_hi), max(lo_hi)]
         axes[0].plot(lim, lim, "k--", lw=0.8, alpha=0.6)
-    axes[0].set_xlabel("model-predicted depth (µm)", fontsize=13)
-    axes[0].set_ylabel("measured depth (µm)", fontsize=13)
-    axes[0].set_title("Depth model parity", fontsize=15)
-    axes[0].legend(fontsize=11); axes[0].grid(alpha=0.3)
+    axes[0].set_xlabel("model-predicted depth (µm)", fontsize=fs.LABEL)
+    axes[0].set_ylabel("measured depth (µm)", fontsize=fs.LABEL)
+    axes[0].set_title("Depth model parity", fontsize=fs.TITLE)
+    axes[0].legend(fontsize=fs.LEGEND_SM); axes[0].grid(alpha=0.3)
     axes[1].axhline(0, color="grey", lw=0.8)
-    axes[1].set_xlabel("model-predicted depth (µm)", fontsize=13)
-    axes[1].set_ylabel("residual measured−predicted (µm)", fontsize=13)
-    axes[1].set_title("residuals", fontsize=15); axes[1].grid(alpha=0.3)
+    axes[1].set_xlabel("model-predicted depth (µm)", fontsize=fs.LABEL)
+    axes[1].set_ylabel("residual measured−predicted (µm)", fontsize=fs.LABEL)
+    axes[1].set_title("residuals", fontsize=fs.TITLE); axes[1].grid(alpha=0.3)
     for _a in axes:
-        _a.tick_params(labelsize=12)
+        _a.tick_params(labelsize=fs.TICK)
     fig.tight_layout()
     p = out_dir / "depth_parity.png"
     fig.savefig(p, dpi=170); plt.close(fig)
@@ -1065,56 +1139,69 @@ def fig_parity(out_dir, per_band, targets=None):        # targets unused; accept
 
 
 def fig_heatmap(out_dir, per_band, targets):
-    """Per-band passes × speed heatmap of predicted depth (recommended model), with the target-depth
-    contour(s) overlaid — read off which (passes, speed) hits a target. Actual data points marked."""
-    # A passes×speed heatmap needs BOTH swept: a band with a single distinct passes (or speed) value
-    # collapses the grid to a 1-D strip, and ax.contour requires a >=2x2 grid -> would crash. Skip
-    # (with a note) those bands and any non-predictable model.
-    invertible, skipped = [], []
-    for b, R in per_band.items():
-        g = R["g"]
-        if R["rec_key"] not in ("saturating", "log-dose", "interaction"):
-            continue
-        if g["passes"].dropna().nunique() < 2 or g["speed"].dropna().nunique() < 2:
-            skipped.append(b)
-        else:
-            invertible.append(b)
-    if skipped:
-        skipped_label = [_short_band(b) for b in skipped]
-        print(f"heatmap: bands {skipped_label} have a single distinct passes or speed (a P×S heatmap "
-              f"needs both swept) -> omitted; see depth_vs_dose.png for their dose response.")
-    if not invertible:
-        print("No band varies both passes and speed -> skipping heatmap.")
+    """Per-band scatter of the MEASURED cells in (scan speed × passes), coloured by measured depth,
+    with the on-target cells ringed.
+
+    Deliberately no model surface and no fitted contour. A colour field over the whole rectangle is
+    a picture of depths nobody measured -- with this many cells most of it is extrapolation -- and
+    the target contour's shape is carried by fit terms the data do not always support. Everything
+    drawn here is a measurement. Which (passes, speed) hit the target is read straight off the
+    rings; the fitted models and their caveats live in depth_calibration.txt.
+
+    Kept under the historical filename depth_heatmap.png so existing result folders and the UI's
+    figure list keep working."""
+    bands = [b for b, R in per_band.items() if np.isfinite(R["g"]["depth_um"]).any()]
+    if not bands:
+        print("No band has a finite measured depth -> skipping the depth scatter.")
         return
-    levels = sorted({float(t) for t in targets})         # strictly increasing (contour requires it)
-    nrows, ncols = _grid(len(invertible))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 5.0 * nrows), squeeze=False)
-    for idx, b in enumerate(invertible):
+    levels = sorted({float(t) for t in targets})
+    nrows, ncols = _grid(len(bands))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7.0 * ncols, 5.6 * nrows), squeeze=False)
+    n_on = 0
+    for idx, b in enumerate(bands):
         ax = axes[idx // ncols][idx % ncols]
-        R = per_band[b]; g = R["g"]; rk = R["rec_key"]
-        p_grid = np.linspace(g["passes"].min(), g["passes"].max(), 120)
-        s_grid = np.linspace(g["speed"].min(), g["speed"].max(), 120)
-        P, S = np.meshgrid(p_grid, s_grid)
-        Z = _predict(rk, R["sat"], R["logd"], R["inter"], dose=P / S, passes=P, speed=S)
-        pcm = ax.pcolormesh(s_grid, p_grid, Z.T, shading="auto", cmap="viridis")
-        cb = fig.colorbar(pcm, ax=ax)
-        cb.set_label("predicted depth (µm)", fontsize=13); cb.ax.tick_params(labelsize=12)
-        cs = ax.contour(s_grid, p_grid, Z.T, levels=levels, colors="white", linewidths=1.5)
-        ax.clabel(cs, fmt=lambda v: f"{v:g} µm", fontsize=11)
-        ax.plot(g["speed"], g["passes"], "o", mfc="none", mec="crimson", ms=7, mew=1.2,
-                label="measured cells")
-        ax.set_xlabel("scan speed (mm/s)", fontsize=13); ax.set_ylabel("passes", fontsize=13)
-        ax.tick_params(labelsize=12)
-        ax.set_title(R["label_short"], fontsize=14)
-        ax.legend(fontsize=10, loc="upper left")
-    for idx in range(len(invertible), nrows * ncols):
+        R = per_band[b]; g = R["g"]
+        meas = g["depth_um"].to_numpy(float)
+        spd = g["speed"].to_numpy(float)
+        pas = g["passes"].to_numpy(float)
+        fin = np.isfinite(meas) & np.isfinite(spd) & np.isfinite(pas)
+
+        sc = ax.scatter(spd[fin], pas[fin], c=meas[fin], cmap="viridis", s=220,
+                        edgecolors="black", linewidths=1.4, zorder=3)
+        cb = fig.colorbar(sc, ax=ax)
+        cb.set_label("measured depth (µm)", fontsize=fs.LABEL)
+        cb.ax.tick_params(labelsize=fs.TICK)
+
+        # On target = measured depth within +-TARGET_WINDOW_UM of a requested target (55 um by
+        # default -> the 50-60 um window). This is a measurement, not a prediction: the ring says
+        # "this cell came out on target", not "the model says it would".
+        on = fin & np.any([np.abs(meas - t) <= TARGET_WINDOW_UM for t in levels], axis=0)
+        n_on += int(on.sum())
+        if on.any():
+            ax.scatter(spd[on], pas[on], s=760, facecolors="none", edgecolors="red",
+                       linewidths=2.4, linestyle="--", zorder=4)
+
+        ax.set_xlabel("scan speed (mm/s)", fontsize=fs.LABEL)
+        ax.set_ylabel("passes", fontsize=fs.LABEL)
+        ax.tick_params(labelsize=fs.TICK)
+        ax.grid(alpha=0.3, zorder=0)
+        ax.margins(0.13)                                 # the rings need room at the axes edge
+        ax.set_title(R["label_short"], fontsize=fs.TITLE)
+    for idx in range(len(bands), nrows * ncols):
         axes[idx // ncols][idx % ncols].axis("off")
-    fig.suptitle("Predicted etch depth over passes × speed, with target-depth contours", y=1.0,
-                 fontsize=15)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    win = "  /  ".join(f"{t - TARGET_WINDOW_UM:g}–{t + TARGET_WINDOW_UM:g} µm" for t in levels)
+    key = [Line2D([], [], marker="o", ls="none", mfc="0.75", mec="black", mew=1.4, ms=12,
+                  label="measured cell"),
+           Line2D([], [], marker="o", ls="none", mfc="none", mec="red", mew=2.0, ms=17,
+                  label=f"on target ({win})")]
+    fig.suptitle("Measured etch depth by scan speed and passes", y=1.0, fontsize=fs.SUPTITLE)
+    bottom = min(0.30, 0.49 / fig.get_figheight())       # reserve BEFORE placing, or it hits x labels
+    fig.tight_layout(rect=[0, bottom, 1, 0.96])
+    fig.legend(handles=key, loc="lower center", ncol=2, fontsize=fs.LEGEND_SM, frameon=False,
+               bbox_to_anchor=(0.5, 0.004))
     p = out_dir / "depth_heatmap.png"
     fig.savefig(p, dpi=170, bbox_inches="tight"); plt.close(fig)
-    print(f"Wrote {p}")
+    print(f"Wrote {p}  ({n_on} cell-band median(s) inside the target window)")
 
 
 # ========================================================================= CLI == #
