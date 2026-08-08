@@ -11,10 +11,15 @@ from `pflm_ui` rather than reimplemented, so this cannot drift from the Tk front
 end on what a run actually is. `pflm_ui` is import-safe: it defines helpers at
 module level and only builds a window under its own `__main__`.
 
-Covers the single-sample run, wafer-row batch mode, depth calibration and the
-figures zip export. Only the per-sample cell filter in depth calibration is still
-Tk-only. Everything reuses `pflm_ui`'s helpers and `wafer_map`, so the two front
-ends cannot disagree about what a run is.
+Covers everything the Tk front end does: the single-sample run, wafer-row batch
+mode, depth calibration with per-sample cell filters, and the figures zip export.
+The run commands, sample library, workspace and VK4 classification all come from
+`pflm_ui` and `wafer_map` by import, so the two front ends cannot disagree about
+what a run is.
+
+Needs `pip install PySide6` alongside this project's own requirements. On Windows,
+enable long paths first (`LongPathsEnabled`), or the wheel half-extracts and leaves
+a tree with no QML modules at all.
 """
 
 from __future__ import annotations
