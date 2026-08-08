@@ -87,7 +87,7 @@ response, target line, and process settings are demonstrative rather than experi
 | Independent snapshots | Separate interior/corner captures of one uniform cell | `run_sample.py --snapshots` |
 | Wafer row | Multiple geometries and doses organized by wafer position | `run_row.py` |
 | Cross-sample calibration | Pool reviewed measurements and compare depth models | `calibrate_depth.py` |
-| Desktop interface | Browse inputs, launch runs, and preview results | `pflm_ui.py` |
+| Desktop interface | Browse inputs, launch runs, and preview results | `pflm_app.py` |
 
 ## Quick start
 
@@ -105,8 +105,11 @@ python -m pip install -r requirements.txt
 Launch the desktop interface:
 
 ```powershell
-python pflm_ui.py
+python pflm_app.py
 ```
+
+The earlier Tk interface (`python pflm_ui.py`) still runs and shares its helpers
+with the current one, but `pflm_app.py` is the maintained front end.
 
 Or run a sample from the standard local folder structure:
 
@@ -159,24 +162,52 @@ as black-box outputs.
 
 ## Repository guide
 
-| Module | Responsibility |
+Modules sit flat at the root and import each other directly, so once the
+dependencies are installed every script runs as-is — this project itself is never
+installed as a package. They layer cleanly: readers and helpers at the bottom,
+measurement in the middle, orchestration and interfaces on top.
+
+| Reading and geometry | Responsibility |
 |---|---|
+| `vk4.py` | Decode Keyence VK4 files: height map, laser-intensity image, X/Y/Z calibration |
 | `dxf_geometry.py` | Parse fabrication geometry and group pin arrays |
 | `assemble.py` | Stitch Keyence tile rasters |
+| `wafer_map.py` | The wafer map, the VK4 filename grammar, and the run plan |
+
+| Measurement | Responsibility |
+|---|---|
 | `register.py` | Locate unit cells and solve design-to-scan transforms |
 | `extract.py` | Classify pixels and measure pin geometry |
+| `laser_params.py` | Per-unit-cell laser parameters for the tiled full-sample workflow |
+| `calibrate_depth.py` | Cross-sample process calibration |
+
+| Orchestration | Responsibility |
+|---|---|
 | `run_sample.py` | Analyze a full sample or snapshot set |
 | `run_row.py` / `row_report.py` | Batch and summarize a wafer row |
-| `calibrate_depth.py` | Cross-sample process calibration |
+| `parallel.py` | Run the pipeline's independent units across processes |
+| `accel.py` | Optional FFT / cross-correlation backend, GPU first with a CPU fallback |
+
+| Output and interfaces | Responsibility |
+|---|---|
 | `report.py` / `figstyle.py` | Shared reporting and figure styling |
-| `pflm_ui.py` | Optional desktop interface |
+| `porosity_table.py` | Square-versus-hex porosity reference table |
+| `pflm_app.py` + `qml/` | Desktop interface (PySide6 + QML), the maintained front end |
+| `pflm_ui.py` | Earlier Tk interface; still runnable, and the source of shared UI helpers |
 | `synth.py` / `selftest.py` | Synthetic data and end-to-end validation |
+
+Supporting directories: `docs/` (technical reference and dated session notes),
+`assets/` (README figures), `qml/` (interface markup). Local data folders — `DXF/`,
+`VK4/`, `CSV/`, and `Results/` — are expected beside the scripts and are not tracked.
 
 ## Detailed documentation
 
 The implementation notes, file-naming rules, coordinate conventions, registration
 failure modes, wafer-map schema, calibration methodology, and complete output contract are
 preserved in the [technical reference](docs/technical-reference.md).
+
+Dated session notes recording why particular changes were made are kept under
+[`docs/notes/`](docs/notes).
 
 ## Research status
 

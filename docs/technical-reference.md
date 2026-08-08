@@ -6,8 +6,8 @@ For the project overview and quick start, see the [main README](../README.md).
 
 ## DXF-driven pin-fin metrology
 
-Version 2 of the UV-laser pin-fin profilometry analysis (v1 is archived at
-`../../Archive/pinfin_analysis`, outside this repo).
+Version 2 of the UV-laser pin-fin profilometry analysis. v1 is not in this
+repository; it is archived beside it, at `UV Laser PFLM/Archive/pinfin_analysis`.
 Where v1 hard-coded the array geometry and one array per VK4, **v2 reads the geometry
 straight from the fabrication DXF** and measures every array of every unit cell in a scan.
 

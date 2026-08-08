@@ -1,6 +1,5 @@
 # PFLM Profilometer Analysis — Python dependencies
 # Tested on Python 3.13 (Windows). Versions listed are the tested minimums.
-# tkinter itself ships with CPython and is not pip-installable.
 
 # --- core analysis + plotting ---
 numpy>=2.5.1
@@ -11,6 +10,13 @@ ezdxf>=1.4.4          # DXF fabrication-geometry reader
 statsmodels>=0.14.6  # optional: process-conditional diameter model (diameter_model.png/.txt); the
 #                      figure is skipped with a note if this is absent, the rest of the run is fine
 
-# --- pflm_ui.py (optional desktop GUI) ---
+# --- desktop interface (pflm_app.py) ---
+# The current UI. On Windows, enable long paths before installing or the wheel
+# half-extracts against the 260-character limit and the QML plugins go missing.
+PySide6>=6.11.1
+
+# --- legacy Tk interface (pflm_ui.py) ---
+# Superseded by pflm_app.py, but still runnable, and pflm_app imports its shared
+# helpers. tkinter itself ships with CPython and is not pip-installable.
 Pillow>=12.3.0        # figure preview (PNG/JPG); PNG also works via Tk without it
 tkinterdnd2>=0.6.2    # drag-and-drop for the DXF/VK4 panels (Browse buttons work without it)

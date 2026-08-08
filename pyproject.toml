@@ -1,0 +1,43 @@
+# Tool configuration for the PFLM Profilometer Analysis pipeline.
+#
+# Deliberately no [project] or [build-system] table: this repository is run as
+# scripts (`python run_sample.py`, `python selftest.py`), not installed as a
+# package. Adding packaging metadata without a package layout would advertise an
+# install path that does not exist. Project metadata lives in README.md, and the
+# runtime dependencies live in requirements.txt.
+
+[tool.ruff]
+# 110 describes the code as actually written: the 95th percentile line is 98
+# characters and only 22 lines in the tree exceed 110. A stricter limit would
+# report hundreds of pre-existing violations rather than catch new ones.
+line-length = 110
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes: undefined names, unused imports
+    "W",   # pycodestyle warnings
+    "I",   # import ordering
+    "UP",  # outdated syntax for the target Python
+    "B",   # bugbear: common correctness traps
+]
+ignore = [
+    "E501",  # line length is enforced by the formatter, not the linter
+    "B008",  # function call in argument default: intentional for the Path() defaults here
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The selftest builds deliberately malformed inputs and shadows names to prove
+# the pipeline rejects them.
+"selftest.py" = ["B011", "F841"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+# The suite is a single self-contained script (`python selftest.py`) rather than
+# a pytest tree; this stanza only keeps pytest from wandering into data folders
+# if it is ever pointed at the repository.
+norecursedirs = ["Results", "VK4", "DXF", "CSV", "assets", "qml", ".ui_workspace"]

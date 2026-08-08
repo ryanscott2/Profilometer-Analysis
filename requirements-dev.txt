@@ -1,0 +1,10 @@
+# Development tooling. Not needed to run the analysis or either interface.
+#   python -m pip install -r requirements-dev.txt
+#
+# The test suite itself needs nothing beyond requirements.txt: run `python
+# selftest.py`.
+
+-r requirements.txt
+
+ruff                  # lint + format; configured in pyproject.toml. Unpinned: not
+#                       yet installed here, so no version has been tested.
