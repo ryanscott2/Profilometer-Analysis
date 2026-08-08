@@ -186,8 +186,8 @@ if __name__ == "__main__":       # pragma: no cover
     import figstyle as fs
     from dxf_geometry import read_design
 
-    here = Path(__file__).parent
-    design = read_design(next((here / "DXF").glob("*.dxf")))
+    root = Path(__file__).resolve().parent.parent
+    design = read_design(next((root / "DXF").glob("*.dxf")))
     scan, truth = synth_scan(design.cells[0])
     fig, ax = plt.subplots(1, 2, figsize=(16, 7))
     ax[0].imshow(scan.height_um, origin="lower", cmap="viridis")

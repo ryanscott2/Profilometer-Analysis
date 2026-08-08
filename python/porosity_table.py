@@ -27,6 +27,7 @@ import matplotlib.pyplot as plt
 import figstyle as fs
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent  # repo root: modules live in python/, data sits beside it
 
 # (label, drawn diameter um, nearest-neighbour pitch um) -- the three fabricated pin families.
 FAMILIES = [("D50 P100", 50.0, 100.0),
@@ -81,7 +82,7 @@ def render(path: Path) -> Path:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--out", default=str(HERE / "porosity_square_vs_hex.png"))
+    ap.add_argument("--out", default=str(ROOT / "porosity_square_vs_hex.png"))
     a = ap.parse_args(argv)
     for label, d, p in FAMILIES:                          # same numbers to stdout, for the record
         sq, hexa = porosity(d, p)                         # ASCII only: consoles here are cp1252

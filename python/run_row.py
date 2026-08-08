@@ -62,10 +62,11 @@ from dxf_geometry import read_design
 import run_sample as rs
 
 HERE = Path(__file__).resolve().parent
-DEF_DXF_DIR = HERE / "DXF"
-DEF_VK4_DIR = HERE / "VK4"
-DEF_CSV_DIR = HERE / "CSV"
-DEF_OUT_DIR = HERE / "Results"
+ROOT = HERE.parent  # repo root: modules live in python/, data sits beside it
+DEF_DXF_DIR = ROOT / "DXF"
+DEF_VK4_DIR = ROOT / "VK4"
+DEF_CSV_DIR = ROOT / "CSV"
+DEF_OUT_DIR = ROOT / "Results"
 
 ROW_SENTINEL = rs.ROW_SENTINEL                 # ".pflm-row.json"
 ROW_FIGURES_DIR = "row_figures"

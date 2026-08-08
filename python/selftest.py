@@ -33,7 +33,8 @@ from synth import SynthScan, synth_scan
 import report as ra
 
 HERE = Path(__file__).parent
-OUT = HERE / "Results" / "legacy" / "selftest"
+ROOT = HERE.parent  # repo root: modules live in python/, data sits beside it
+OUT = ROOT / "Results" / "legacy" / "selftest"
 
 
 def _dxf_candidates(name: str, fixture_group: str) -> list[Path]:
@@ -58,8 +59,8 @@ def _dxf_candidates(name: str, fixture_group: str) -> list[Path]:
     # These paths make the same test portable to GitHub Actions and other machines.  No source
     # is ever opened for writing; the repository DXF is only a fallback test fixture.
     candidates.extend((
-        HERE / "DXF" / name,
-        HERE / "tests" / "fixtures" / fixture_group / name,
+        ROOT / "DXF" / name,
+        ROOT / "tests" / "fixtures" / fixture_group / name,
     ))
 
     # Keep error messages readable if an override happens to duplicate another location.
@@ -525,8 +526,8 @@ def main():
                 _cands.append(_resolve_dxf(_fixture_name, "registration"))
             except FileNotFoundError:
                 pass
-        if (HERE / "Results").is_dir():
-            _cands += list((HERE / "Results").glob("*/figures/*.dxf"))
+        if (ROOT / "Results").is_dir():
+            _cands += list((ROOT / "Results").glob("*/figures/*.dxf"))
         _Ltmpl = None
         for _p in _cands:
             try:

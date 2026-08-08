@@ -37,9 +37,10 @@ from wafer_map import (safe_name as _safe_name, parse_sample_id, group_snapshots
                        DEFAULT_MAP_NAME)
 
 HERE = Path(__file__).resolve().parent
-SAMPLES_JSON = HERE / ".ui_samples.json"
-WORKSPACE = HERE / ".ui_workspace"
-DEF_OUT = HERE / "Results"
+ROOT = HERE.parent  # repo root: modules live in python/, data sits beside it
+SAMPLES_JSON = ROOT / ".ui_samples.json"
+WORKSPACE = ROOT / ".ui_workspace"
+DEF_OUT = ROOT / "Results"
 IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp")
 TEXT_EXT = (".txt", ".csv", ".log", ".json")
 
@@ -213,21 +214,21 @@ class App:
 
     def _load_working_tree_defaults(self):
         """Pre-fill from the repo's DXF/ VK4/ CSV/ so the currently-loaded sample runs at once."""
-        dxfs = sorted((HERE / "DXF").glob("*.dxf")) if (HERE / "DXF").is_dir() else []
+        dxfs = sorted((ROOT / "DXF").glob("*.dxf")) if (ROOT / "DXF").is_dir() else []
         if dxfs:
             self._set_dxf(dxfs[0])
-        if (HERE / "VK4").is_dir() and any((HERE / "VK4").glob("*.vk4")):
-            self._set_vk4_dir(HERE / "VK4")
-        csv = HERE / "CSV" / "cell_params.csv"
+        if (ROOT / "VK4").is_dir() and any((ROOT / "VK4").glob("*.vk4")):
+            self._set_vk4_dir(ROOT / "VK4")
+        csv = ROOT / "CSV" / "cell_params.csv"
         if csv.exists():
             self.csv_text.delete("1.0", "end")
             self.csv_text.insert("1.0", csv.read_text(encoding="utf-8-sig"))
-        rad = HERE / "CSV" / "radial_sets.csv"
+        rad = ROOT / "CSV" / "radial_sets.csv"
         if rad.exists():
             self.radial_text.delete("1.0", "end")
             self.radial_text.insert("1.0", rad.read_text(encoding="utf-8-sig"))
         # band definitions for the depth calibration: from CSV/band_defs.csv if present, else default
-        bands = HERE / "CSV" / "band_defs.csv"
+        bands = ROOT / "CSV" / "band_defs.csv"
         self.cal_bands_text.delete("1.0", "end")
         self.cal_bands_text.insert("1.0", bands.read_text(encoding="utf-8-sig")
                                    if bands.exists() else DEFAULT_BAND_DEFS)
@@ -630,7 +631,7 @@ class App:
             return Path(self.cur["wafer_map"])
         d = Path(vk4_dir)
         for cand in (d / DEFAULT_MAP_NAME, d.parent / DEFAULT_MAP_NAME,
-                     HERE / "CSV" / DEFAULT_MAP_NAME):
+                     ROOT / "CSV" / DEFAULT_MAP_NAME):
             if cand.is_file():
                 return cand
         return None

@@ -64,10 +64,11 @@ def _extract_worker(scan, item):
     return extract_array(scan, pl, a, sample, make_qc=make_qc, qc_path=qc_path)
 
 HERE = Path(__file__).parent
-DEF_DXF_DIR = HERE / "DXF"
-DEF_VK4_DIR = HERE / "VK4"
-DEF_CSV_DIR = HERE / "CSV"
-DEF_OUT_DIR = HERE / "Results"
+ROOT = HERE.parent  # repo root: modules live in python/, data sits beside it
+DEF_DXF_DIR = ROOT / "DXF"
+DEF_VK4_DIR = ROOT / "VK4"
+DEF_CSV_DIR = ROOT / "CSV"
+DEF_OUT_DIR = ROOT / "Results"
 RESULTS_SENTINEL = ".pflm-results.json"
 # Marks a wafer-row CONTAINER (written by run_row.py): a plain folder holding several per-sample
 # datasets plus a rollup. It is never itself a transaction target -- see _contains_owned_datasets.

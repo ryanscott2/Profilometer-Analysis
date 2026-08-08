@@ -48,6 +48,7 @@ from PySide6.QtQml import QQmlApplicationEngine  # noqa: E402
 from PySide6.QtQuickControls2 import QQuickStyle  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent  # repo root: modules live in python/, data sits beside it
 sys.path.insert(0, str(HERE))
 
 # Reused so the two front ends cannot disagree about what a run is.
@@ -198,7 +199,7 @@ class Bridge(QObject):
             folder = Path(vk4_dir)
             found = next((c for c in (folder / DEFAULT_MAP_NAME,
                                       folder.parent / DEFAULT_MAP_NAME,
-                                      pflm_ui.HERE / "CSV" / DEFAULT_MAP_NAME)
+                                      pflm_ui.ROOT / "CSV" / DEFAULT_MAP_NAME)
                           if c.is_file()), None)
         if found is None:
             result["problem"] = (f"No {DEFAULT_MAP_NAME} beside the VK4 folder, in its parent, "
@@ -491,7 +492,7 @@ def main() -> int:
     engine = QQmlApplicationEngine()
     bridge = Bridge()
     engine.rootContext().setContextProperty("bridge", bridge)
-    engine.load(QUrl.fromLocalFile(str(HERE / "qml" / "Main.qml")))
+    engine.load(QUrl.fromLocalFile(str(ROOT / "qml" / "Main.qml")))
     if not engine.rootObjects():
         print("Failed to load the QML interface.", file=sys.stderr)
         return 1

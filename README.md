@@ -32,7 +32,7 @@ results.
 | **Registration** | Alignment-marker detection, lattice-aware correlation, mirroring, and rotation |
 | **Measurements** | Etch depth, pitch, base/mid/top diameter, taper, porosity, and debris metrics |
 | **Outputs** | CSV measurements, QC overlays, height maps, calibration plots, and wafer-row summaries |
-| **Interfaces** | Command-line workflows and an optional Tkinter desktop UI |
+| **Interfaces** | Command-line workflows and an optional PySide6 + QML desktop UI |
 
 ## Pipeline
 
@@ -105,29 +105,29 @@ python -m pip install -r requirements.txt
 Launch the desktop interface:
 
 ```powershell
-python pflm_app.py
+python python/pflm_app.py
 ```
 
-The earlier Tk interface (`python pflm_ui.py`) still runs and shares its helpers
+The earlier Tk interface (`python python/pflm_ui.py`) still runs and shares its helpers
 with the current one, but `pflm_app.py` is the maintained front end.
 
 Or run a sample from the standard local folder structure:
 
 ```powershell
-python run_sample.py
+python python/run_sample.py
 ```
 
-The default workflow expects `DXF/`, `VK4/`, `CSV/`, and `Results/` folders beside
-the scripts. Explicit paths can also be supplied:
+The default workflow expects `DXF/`, `VK4/`, `CSV/`, and `Results/` folders at the
+repository root, beside `python/`. Explicit paths can also be supplied:
 
 ```powershell
-python run_sample.py <vk4_dir> <out_dir> [<dxf>] [<cell_csv>]
+python python/run_sample.py <vk4_dir> <out_dir> [<dxf>] [<cell_csv>]
 ```
 
 Before running an entire wafer row, print and inspect the plan:
 
 ```powershell
-python run_row.py --row 1 --vk4 <dir> --dxf-dir <dir> --dry-run
+python python/run_row.py --row 1 --vk4 <dir> --dxf-dir <dir> --dry-run
 ```
 
 ## Typical outputs
@@ -152,7 +152,7 @@ and comparison figures without modifying the underlying per-sample datasets.
 Run the synthetic and regression test suite with:
 
 ```powershell
-python selftest.py
+python python/selftest.py
 ```
 
 The analysis records reliability flags for missing pins, physically impossible diameter
@@ -162,10 +162,14 @@ as black-box outputs.
 
 ## Repository guide
 
-Modules sit flat at the root and import each other directly, so once the
+All modules live in `python/` and import each other directly, so once the
 dependencies are installed every script runs as-is — this project itself is never
 installed as a package. They layer cleanly: readers and helpers at the bottom,
 measurement in the middle, orchestration and interfaces on top.
+
+Two path anchors follow from that layout, and the distinction matters when editing:
+`HERE` is `python/`, used to locate sibling scripts launched as subprocesses, while
+`ROOT` is the repository root, where every data folder lives.
 
 | Reading and geometry | Responsibility |
 |---|---|
@@ -196,9 +200,10 @@ measurement in the middle, orchestration and interfaces on top.
 | `pflm_ui.py` | Earlier Tk interface; still runnable, and the source of shared UI helpers |
 | `synth.py` / `selftest.py` | Synthetic data and end-to-end validation |
 
-Supporting directories: `docs/` (technical reference and dated session notes),
-`assets/` (README figures), `qml/` (interface markup). Local data folders — `DXF/`,
-`VK4/`, `CSV/`, and `Results/` — are expected beside the scripts and are not tracked.
+Supporting directories, all at the repository root: `python/` (every module),
+`docs/` (technical reference and dated session notes), `assets/` (README figures),
+`qml/` (interface markup). Local data folders — `DXF/`, `VK4/`, `CSV/`, and
+`Results/` — are expected there too, and are not tracked.
 
 ## Detailed documentation
 

@@ -726,7 +726,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         p = Path(sys.argv[1])
     else:                                              # first DXF present, not a hardcoded name
-        p = next((Path(__file__).parent / "DXF").glob("*.dxf"), None)
+        p = next((Path(__file__).resolve().parent.parent / "DXF").glob("*.dxf"), None)
         if p is None:
             raise SystemExit("no DXF given and none found in DXF/")
     design = read_design(p)

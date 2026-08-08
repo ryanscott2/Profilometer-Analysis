@@ -46,7 +46,8 @@ import figstyle as fs                                           # noqa: E402  ho
 from report import _ols_fit                                     # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-DEF_RESULTS = HERE / "Results"
+ROOT = HERE.parent  # repo root: modules live in python/, data sits beside it
+DEF_RESULTS = ROOT / "Results"
 OUT_NAME = "etch depth"                # cross-sample output dir; has no legacy/ so it self-skips discovery
 MEAS_REL = Path("legacy") / "measurements.csv"
 DEF_TARGET_UM = 55.0                   # the design target used throughout the codebase
