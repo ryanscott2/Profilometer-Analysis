@@ -3,10 +3,10 @@ __pycache__/
 *.py[cod]
 
 # Generated analysis outputs
-Results/
+results/
 
-# Raw scan tiles (large; kept locally, archived per run to Results/figures/vk4_source.zip)
-VK4/
+# Raw scan tiles (large; kept locally, archived per run to results/figures/vk4_source.zip)
+vk4/
 
 # pflm_ui.py local state (sample library + staged cell_params for a run)
 .ui_samples.json
@@ -15,8 +15,8 @@ VK4/
 
 # Per-sample inputs (fabrication DXF + laser-param CSVs) are kept locally and managed via the
 # pflm_ui sample library (.ui_samples.json), not committed.
-DXF/
-CSV/
+dxf/
+csv/
 
 # Fabrication mask layouts are unpublished lab geometry: their filenames alone disclose the
 # pin diameter/pitch design matrix and the lattice pivot.  Never commit a DXF anywhere in the

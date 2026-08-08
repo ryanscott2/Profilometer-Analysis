@@ -2,7 +2,7 @@
 Per-unit-cell laser parameters for the tiled full-sample workflow (run_sample.py).
 
 An assembled scan holds several tiled unit cells, each machined with different laser settings
-that are not in the scan or the DXF, so the user supplies them in ``CSV/cell_params.csv`` -- a
+that are not in the scan or the DXF, so the user supplies them in ``csv/cell_params.csv`` -- a
 plain GRID in DESIGN/DXF orientation: line ``r`` (top = row 1) is design row r, column ``c``
 (left = col 1) is design col c, and every entry is a ``P{passes}_S{speed}`` label. That is the
 frame registration numbers cells in ((1,1) = the DXF top-left, anchored on the alignment marker).

@@ -7,7 +7,7 @@ For the project overview and quick start, see the [main README](../README.md).
 ## DXF-driven pin-fin metrology
 
 Version 2 of the UV-laser pin-fin profilometry analysis. v1 is not in this
-repository; it is archived beside it, at `UV Laser PFLM/Archive/pinfin_analysis`.
+repository; it is archived beside it, at `UV Laser PFLM/archive/pinfin_analysis`.
 Where v1 hard-coded the array geometry and one array per VK4, **v2 reads the geometry
 straight from the fabrication DXF** and measures every array of every unit cell in a scan.
 
@@ -31,7 +31,7 @@ Pipeline:
    come from those classified populations (robust to debris). The diameter is read from the
    mean pin, built by **stacking the patches centred on each known pin** (no fold wrap/edge
    artifacts), at three heights (base / mid / top) to capture taper.
-4. **Report** (`run_sample.py` + `report.py`) — `Results/<sample>/legacy/measurements.csv` plus the
+4. **Report** (`run_sample.py` + `report.py`) — `results/<sample>/legacy/measurements.csv` plus the
    figure set (clean figures under `figures/`, the v1 set under `legacy/figures/`).
 
 ## Workflow — full tiled sample (`run_sample.py`)
@@ -56,7 +56,7 @@ cells. The driver stitches the tiles into one scan (`assemble.py`), finds every 
   `absolute_origin=false` and `ambiguous_axes` prevent its arbitrary pitch-equivalent index from
   masquerading as an absolute origin. The strict low-level path can still fail closed.
 - Cells are indexed by **design (row, col) with (1,1) = DXF top-left** (marker-anchored). Laser
-  parameters are supplied per cell in `CSV/cell_params.csv` as a plain **grid in that design
+  parameters are supplied per cell in `csv/cell_params.csv` as a plain **grid in that design
   orientation**: line `r` = design row `r` (top first), column `c` = design col `c` (left first),
   each entry a `P{passes}_S{speed}` label (no header, no index columns, no template file). The
   Keyence scan is X-mirrored vs the design, so author the grid **as the DXF is drawn, not as the
@@ -64,10 +64,10 @@ cells. The driver stitches the tiles into one scan (`assemble.py`), finds every 
   you can confirm the mapping (a `rot` near ±180° flags a re-oriented wafer).
 
 ```bash
-# 1. DXF/*.dxf present; drop the tile raster in VK4/ (…_Y1_X1.vk4 …)
-python run_sample.py                    # -> Results/direct/{figures,legacy,...}
-# then fill CSV/cell_params.csv (a P{passes}_S{speed} grid, DXF orientation) and re-run for the
-# laser-parameter plots; or: python run_sample.py <vk4_dir> <out_dir> [<dxf>] [<cell_csv>]
+# 1. dxf/*.dxf present; drop the tile raster in vk4/ (…_Y1_X1.vk4 …)
+python python/run_sample.py                    # -> results/direct/{figures,legacy,...}
+# then fill csv/cell_params.csv (a P{passes}_S{speed} grid, DXF orientation) and re-run for the
+# laser-parameter plots; or: python python/run_sample.py <vk4_dir> <out_dir> [<dxf>] [<cell_csv>]
 ```
 
 ## Workflow — disjoint snapshots of one uniform cell (`run_sample.py --snapshots`)
@@ -99,7 +99,7 @@ All snapshots in one dataset share a single laser dose. Provide them as a folder
 entirely — it would refuse (or, on a periodic pin lattice, alias) disjoint non-overlapping crops.
 
 ```bash
-python run_sample.py --snapshots <vk4_dir> <out_dir> <dxf> P{passes}_S{speed}
+python python/run_sample.py --snapshots <vk4_dir> <out_dir> <dxf> P{passes}_S{speed}
 ```
 
 **From the UI:** select the dataset's folder as usual — the VK4 label shows
@@ -124,7 +124,7 @@ An explicit `C{col}R{row}` token also works, for a wafer wider than nine columns
 unambiguous token is never guessed at — it is listed as unparsed and blocks the run until it is
 renamed or `--allow-unparsed` is given.
 
-**`CSV/wafer_map.csv`** declares, per (row, col), the dose, the pin geometry and the lattice:
+**`csv/wafer_map.csv`** declares, per (row, col), the dose, the pin geometry and the lattice:
 
 ```csv
 # date: 072426
@@ -156,8 +156,8 @@ DXF filename's pitch/`TRIANGULAR` tokens must agree with its own content (warnin
 run `median(diameter_um)/drawn_diameter_um` must land in [0.7, 1.6] (status `suspect`).
 
 ```bash
-python run_row.py --row 1 --dry-run
-python run_row.py --row 1 --vk4 <dir> [<dir> ...] --dxf-dir <dir>
+python python/run_row.py --row 1 --dry-run
+python python/run_row.py --row 1 --vk4 <dir> [<dir> ...] --dxf-dir <dir>
 ```
 
 `--vk4` takes several folders, and a folder with no top-level `*.vk4` is searched recursively — so
@@ -170,7 +170,7 @@ because that is how registration failure is reported.
 Output layout — note the extra nesting level:
 
 ```
-Results/072426 Row 1/                  <- a plain CONTAINER, never a transaction target
+results/072426 Row 1/                  <- a plain CONTAINER, never a transaction target
     .pflm-row.json
     c1 D50 P100 P25_S400/              <- a normal, fully transactional per-sample dataset
     ...
@@ -203,14 +203,14 @@ subprocess with the usual console/Stop plumbing.
 Inspect just the DXF geometry:
 
 ```bash
-python dxf_geometry.py                 # prints arrays / bands / pitches / diameters
+python python/dxf_geometry.py                 # prints arrays / bands / pitches / diameters
 ```
 
 Validate the whole pipeline on synthetic data (no VK4 files needed):
 
 ```bash
-python selftest.py                     # synthetic pipeline + real-DXF alias regressions
-python synth.py                        # writes Results/synth_preview.png
+python python/selftest.py                     # synthetic pipeline + real-DXF alias regressions
+python python/synth.py                        # writes results/synth_preview.png
 ```
 
 When the Stanford OneDrive environment is available, `selftest.py` opens its original DXFs directly
@@ -223,15 +223,15 @@ prevents Git from rewriting DXF bytes during checkout.
 
 | folder | contents |
 |--------|----------|
-| `DXF/` | the fabrication DXF (one unit cell, or a larger tiled design) |
-| `VK4/` | Keyence profilometer scans (`*.vk4`) |
-| `CSV/` | `cell_params.csv` (per-cell laser settings), `radial_sets.csv` (radial overlays), `wafer_map.csv` (per-sample dose/geometry/lattice for `run_row.py`) |
-| `Results/` | analysis outputs. Every run uses a dedicated `Results/<dataset name>/` child; direct runs default to `Results/direct/`. A wafer row adds one nesting level: `Results/<date> Row <n>/<sample>/` |
+| `dxf/` | the fabrication DXF (one unit cell, or a larger tiled design) |
+| `vk4/` | Keyence profilometer scans (`*.vk4`) |
+| `csv/` | `cell_params.csv` (per-cell laser settings), `radial_sets.csv` (radial overlays), `wafer_map.csv` (per-sample dose/geometry/lattice for `run_row.py`) |
+| `results/` | analysis outputs. Every run uses a dedicated `results/<dataset name>/` child; direct runs default to `results/direct/`. A wafer row adds one nesting level: `results/<date> Row <n>/<sample>/` |
 
 ## Laser parameters CSV (`cell_params.csv`)
 
 Per-cell laser settings are not in the scan or the DXF — you supply them in
-`CSV/cell_params.csv` as a plain **grid in DXF/design orientation**: line `r` (top = row 1) is
+`csv/cell_params.csv` as a plain **grid in DXF/design orientation**: line `r` (top = row 1) is
 design row `r`, column `c` (left = col 1) is design col `c`, each entry a `P{passes}_S{speed}`
 label. No header, no index columns.
 
@@ -244,7 +244,7 @@ P60_S400,P65_S400,P70_S400
 The Keyence scan is X-mirrored vs the design, so author the grid **as the DXF is drawn, not as
 the raw scan looks**. Blank cells are skipped; a blank line still advances the row index (so an
 intentional gap keeps later rows on their true numbers). Radial-average overlay sets live in
-`CSV/radial_sets.csv` — one comma-separated `P{passes}_S{speed}` set per line; empty = overlay
+`csv/radial_sets.csv` — one comma-separated `P{passes}_S{speed}` set per line; empty = overlay
 every parameter present.
 
 ## Registration
@@ -262,7 +262,7 @@ subsection; its absolute pin index remains explicitly unresolved. Pass
 `allow_uniform_phase_only=False` to `register_sample` wherever absolute identity is mandatory.
 Confirm the result from the `design(r,c) → marker x/y, rot, reg`
 table printed each run (a `rot` near ±180° flags a re-oriented wafer) and the per-cell reports in
-`Results/<sample>/figures/cells/`. Cell (row,col) indices are absolute (a dropped interior
+`results/<sample>/figures/cells/`. Cell (row,col) indices are absolute (a dropped interior
 row/column leaves a hole, not a shift); a `cell_params` entry with no registered cell is warned as
 a possible edge-dropout that could shift the parameter mapping. (`register_scan` remains the
 low-level single-cell primitive used by `selftest.py`.)
@@ -291,17 +291,17 @@ genuine imperfections rather than synthetic assumptions:
 to prune only ~6–9% of candidates on these wide grids — and the enumeration is not the bottleneck —
 so it was dropped as not worth the added complexity.)
 
-## Outputs (`Results/<dataset name>/`)
+## Outputs (`results/<dataset name>/`)
 
-The UI writes each run under `Results/<sample name>/` — named after the sample selected in the UI
+The UI writes each run under `results/<sample name>/` — named after the sample selected in the UI
 (a sample must be selected to run) — so different datasets keep separate result sets. A direct run
-defaults to `Results/direct/`; an explicit output must still be a dedicated child of this
-repository's `Results/` root. The paths below are relative to that per-run output root.
+defaults to `results/direct/`; an explicit output must still be a dedicated child of this
+repository's `results/` root. The paths below are relative to that per-run output root.
 
 > **Each run is transactional.** New artifacts are written to an owned hidden staging sibling and
 > validated before the completed directory atomically replaces the prior result. A failed run
 > leaves the last completed result intact. Replacement is restricted to a dedicated child of
-> `Results/`; arbitrary, unowned, root, or input-overlapping directories are refused. An internal
+> `results/`; arbitrary, unowned, root, or input-overlapping directories are refused. An internal
 > `.pflm-results.json` sentinel records ownership so recursive cleanup cannot target user data.
 
 Clean outputs live under `figures/`; the v1 plot set, `measurements.csv` and per-array QC live under
@@ -333,13 +333,13 @@ comparable across samples/wafers/dates. Nothing in the per-run pipeline changes;
 each sample's `legacy/measurements.csv`.
 
 ```
-python calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
-                          [--results Results] [--out "Results/etch depth"] \
+python python/calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
+                          [--results Results] [--out "results/etch depth"] \
                           [--bands band_defs.csv] [--cell-filters cells.json] \
                           [--max-debris X] [--drop-shallow] [--allow-legacy-qc]
 ```
 
-- **Discovers** the samples (folders under `Results/` with a `legacy/measurements.csv`), injects a
+- **Discovers** the samples (folders under `results/` with a `legacy/measurements.csv`), injects a
   `sample` column, pools them; `--include`/`--exclude` select the set (default = all).
 - **Per-sample cell selection** — `--cell-filters` names a JSON file mapping a sample folder name to
   a `cell_id` spec, applied **before** pooling so a single bad cell can be dropped without discarding
@@ -376,7 +376,7 @@ python calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
 - **Pools CIs across samples** with a `sample` random-intercept MixedLM (falls back to a sample
   fixed factor if it won't converge), and prints a `sample × dose` coverage table so sample↔dose
   confounding is visible.
-- **Writes** to `Results/etch depth/`: `depth_calibration.txt` (fits, pooled model,
+- **Writes** to `results/etch depth/`: `depth_calibration.txt` (fits, pooled model,
   coverage, per-target inversion with an inverse-mean confidence interval, and the extrapolation box),
   `depth_vs_passes_speed_3d.png` (per-band 3-D depth = f(passes, speed): measured points + the
   recommended-model surface + a target-depth plane), `depth_parity.png`, and `depth_heatmap.png`
@@ -395,7 +395,7 @@ column. Double-click a row's *cells* to include/exclude specific `cell_id`s for 
 (`1-5, 8, 12-16`; prefix `!` to exclude; blank = all); the panel also has a **band-definitions** box
 (one `min_Ø, max_Ø, pitch` per line; number of rows = number of bands; blank = use the CSV `band`
 column) and a target depth (default `55`, comma-separated allowed). It runs the tool on the
-selection — output streams to the console and the results land in `Results/etch depth/` (browsable
+selection — output streams to the console and the results land in `results/etch depth/` (browsable
 at left).
 
 ## Modules

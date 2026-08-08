@@ -189,7 +189,7 @@ class Bridge(QObject):
         """Which wafer rows the map offers for this VK4 folder, plus any hard error.
 
         Searches where run_row.py searches, so the UI shows what the run will read:
-        beside the VK4 folder, its parent, then CSV/.
+        beside the VK4 folder, its parent, then csv/.
         """
         result = {"mode": self.classify(vk4_dir), "rows": [], "mapPath": "", "problem": ""}
         chosen = Path(map_override) if map_override else None
@@ -199,11 +199,11 @@ class Bridge(QObject):
             folder = Path(vk4_dir)
             found = next((c for c in (folder / DEFAULT_MAP_NAME,
                                       folder.parent / DEFAULT_MAP_NAME,
-                                      pflm_ui.ROOT / "CSV" / DEFAULT_MAP_NAME)
+                                      pflm_ui.ROOT / "csv" / DEFAULT_MAP_NAME)
                           if c.is_file()), None)
         if found is None:
             result["problem"] = (f"No {DEFAULT_MAP_NAME} beside the VK4 folder, in its parent, "
-                                 "or in CSV/. Pick one explicitly.")
+                                 "or in csv/. Pick one explicitly.")
             return result
         result["mapPath"] = str(found)
         try:
@@ -256,7 +256,7 @@ class Bridge(QObject):
         out_dir = pflm_ui.DEF_OUT / name
         if out_dir.is_dir() and ((out_dir / "legacy").is_dir() or (out_dir / "figures").is_dir()
                                  or (out_dir / ".pflm-results.json").is_file()):
-            self._set_status(f"Results/{name} is an existing single-sample result, not a row "
+            self._set_status(f"results/{name} is an existing single-sample result, not a row "
                              "container. Pick a different row.")
             return
 

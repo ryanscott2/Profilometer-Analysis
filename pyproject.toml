@@ -1,7 +1,7 @@
 # Tool configuration for the PFLM Profilometer Analysis pipeline.
 #
 # Deliberately no [project] or [build-system] table: this repository is run as
-# scripts (`python run_sample.py`, `python selftest.py`), not installed as a
+# scripts (`python python/run_sample.py`, `python python/selftest.py`), not installed as a
 # package. Adding packaging metadata without a package layout would advertise an
 # install path that does not exist. Project metadata lives in README.md, and the
 # runtime dependencies live in requirements.txt.
@@ -37,7 +37,7 @@ quote-style = "double"
 indent-style = "space"
 
 [tool.pytest.ini_options]
-# The suite is a single self-contained script (`python selftest.py`) rather than
+# The suite is a single self-contained script (`python python/selftest.py`) rather than
 # a pytest tree; this stanza only keeps pytest from wandering into data folders
 # if it is ever pointed at the repository.
-norecursedirs = ["Results", "VK4", "DXF", "CSV", "assets", "qml", ".ui_workspace"]
+norecursedirs = ["results", "vk4", "dxf", "csv", "assets", "qml", ".ui_workspace"]

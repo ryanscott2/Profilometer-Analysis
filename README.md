@@ -117,7 +117,7 @@ Or run a sample from the standard local folder structure:
 python python/run_sample.py
 ```
 
-The default workflow expects `DXF/`, `VK4/`, `CSV/`, and `Results/` folders at the
+The default workflow expects `dxf/`, `vk4/`, `csv/`, and `results/` folders at the
 repository root, beside `python/`. Explicit paths can also be supplied:
 
 ```powershell
@@ -133,7 +133,7 @@ python python/run_row.py --row 1 --vk4 <dir> --dxf-dir <dir> --dry-run
 ## Typical outputs
 
 ```text
-Results/<dataset>/
+results/<dataset>/
 ├── figures/                 # clean, presentation-ready figures
 ├── legacy/
 │   ├── measurements.csv    # one row per measured array
@@ -202,8 +202,8 @@ Two path anchors follow from that layout, and the distinction matters when editi
 
 Supporting directories, all at the repository root: `python/` (every module),
 `docs/` (technical reference and dated session notes), `assets/` (README figures),
-`qml/` (interface markup). Local data folders — `DXF/`, `VK4/`, `CSV/`, and
-`Results/` — are expected there too, and are not tracked.
+`qml/` (interface markup). Local data folders — `dxf/`, `vk4/`, `csv/`, and
+`results/` — are expected there too, and are not tracked.
 
 ## Detailed documentation
 

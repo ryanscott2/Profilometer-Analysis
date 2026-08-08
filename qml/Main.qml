@@ -506,7 +506,7 @@ ApplicationWindow {
                         Label {
                             Layout.fillWidth: true
                             visible: rowCombo.currentIndex >= 0
-                            text: "writes Results/" + bridge.rowName(vk4Field.text,
+                            text: "writes results/" + bridge.rowName(vk4Field.text,
                                                                     root.currentRow())
                             color: theme.textTertiary
                             font.family: theme.mono; font.pixelSize: 11

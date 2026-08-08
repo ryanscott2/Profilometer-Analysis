@@ -283,5 +283,5 @@ def assemble_tiles(vk4_dir, step_col=None, step_row=None, verbose=True) -> Assem
 if __name__ == "__main__":       # pragma: no cover
     import sys
     s = assemble_tiles(sys.argv[1] if len(sys.argv) > 1 else
-                       Path(__file__).resolve().parent.parent / "VK4")
+                       Path(__file__).resolve().parent.parent / "vk4")
     print(s.width, s.height, s.step_col, s.step_row)

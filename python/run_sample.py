@@ -7,13 +7,13 @@ For a sample scanned as a continuous ``_Y{n}_X{m}`` tile grid that spans MANY un
 2. locate every unit cell by its 200 um alignment marker and map the DXF onto each -- the scan
    is X-mirrored vs the DXF, handled per cell (the array is never flipped; ``register.py``),
 3. measure every array of every cell (``extract.py``), tagged with that cell's laser
-   parameters from ``CSV/cell_params.csv`` keyed by design (row, col) with (1,1) = top-left,
-4. write ``Results/measurements.csv`` + the v1 plot set + a labeled cell overview and a
+   parameters from ``csv/cell_params.csv`` keyed by design (row, col) with (1,1) = top-left,
+4. write ``results/measurements.csv`` + the v1 plot set + a labeled cell overview and a
    full-sample height map, both rendered in DESIGN orientation (un-mirrored) for presentation.
 
 Usage:
-    python run_sample.py                      # DXF/ VK4/ CSV/ Results/ under this folder
-    python run_sample.py <vk4_dir> <out_dir> [<dxf>] [<cell_csv>]
+    python python/run_sample.py                      # dxf/ vk4/ csv/ results/ under this folder
+    python python/run_sample.py <vk4_dir> <out_dir> [<dxf>] [<cell_csv>]
 """
 
 from __future__ import annotations
@@ -65,16 +65,16 @@ def _extract_worker(scan, item):
 
 HERE = Path(__file__).parent
 ROOT = HERE.parent  # repo root: modules live in python/, data sits beside it
-DEF_DXF_DIR = ROOT / "DXF"
-DEF_VK4_DIR = ROOT / "VK4"
-DEF_CSV_DIR = ROOT / "CSV"
-DEF_OUT_DIR = ROOT / "Results"
+DEF_DXF_DIR = ROOT / "dxf"
+DEF_VK4_DIR = ROOT / "vk4"
+DEF_CSV_DIR = ROOT / "csv"
+DEF_OUT_DIR = ROOT / "results"
 RESULTS_SENTINEL = ".pflm-results.json"
 # Marks a wafer-row CONTAINER (written by run_row.py): a plain folder holding several per-sample
 # datasets plus a rollup. It is never itself a transaction target -- see _contains_owned_datasets.
 ROW_SENTINEL = ".pflm-row.json"
 
-# Radial-average overlay figures are configured by CSV/radial_sets.csv: each row is one
+# Radial-average overlay figures are configured by csv/radial_sets.csv: each row is one
 # comparison set -- a list of P{passes}_S{speed} labels whose mean-pin radial profiles are
 # overlaid (one figure per nominal geometry). If that file is absent or empty, every laser
 # parameter present in the sample is overlaid instead (a single "all" set per geometry).
@@ -109,10 +109,10 @@ def save_source_docs(dxf_path, vk4_dir, figures_dir):
 
 
 def save_provenance(figures_dir, vk4_dir, dxf_path, cell_csv):
-    """Make a Results/ folder self-describing: copy the run's laser-parameter grid
+    """Make a results/ folder self-describing: copy the run's laser-parameter grid
     (``cell_params.csv``) and its sibling ``radial_sets.csv`` into figures/, and write a
     ``run_manifest.json`` recording which code + inputs produced this run (git commit, input paths,
-    the VK4 file list). Cheap, and re-created every run alongside the DXF/VK4 provenance."""
+    the VK4 file list). Cheap, and re-created every run alongside the dxf/VK4 provenance."""
     figures_dir = Path(figures_dir); figures_dir.mkdir(parents=True, exist_ok=True)
     cell_csv = Path(cell_csv)
     for src in (cell_csv, cell_csv.parent / RADIAL_CSV_NAME):
@@ -583,7 +583,7 @@ def render_cell_report(scan, placement, template, res_by_array, params, path, bo
     cx = placement.origin_col * scan.x_um_per_px / 1000
     cy = placement.origin_row * scan.y_um_per_px / 1000
     lp = (f"P{params.passes}_S{params.speed:g}" if params and params.valid   # P{p}_S{s}, as in
-          else "laser params: (fill CSV/cell_params.csv)")                   # the averaged report
+          else "laser params: (fill csv/cell_params.csv)")                   # the averaged report
     title = (f"Unit cell (row {placement.cell_row}, col {placement.cell_col})   —   {lp}\n"
              f"cell marker in sample: x = {cx:.2f} mm, y = {cy:.2f} mm   ·   "
              f"registration {placement.score:.2f}")
@@ -843,7 +843,7 @@ def make_radial_overlays(template, placements, params, res_by_cell, out_dir, set
     """One figure per nominal geometry (per array in the unit cell), overlaying the mean-pin
     radial-average profile of several laser-parameter combos.
 
-    The combos come from ``sets_csv`` (CSV/radial_sets.csv): each row is one comparison set of
+    The combos come from ``sets_csv`` (csv/radial_sets.csv): each row is one comparison set of
     P{passes}_S{speed} labels -> len(arrays) figures per set, under radial_overlays/set{N}/. If
     that CSV is absent or empty, every laser parameter present in the sample is overlaid instead
     (a single 'all' set). Profiles are the (rc, prof) extract_array already computed per array,
@@ -1493,7 +1493,7 @@ def analyze_multi_snapshot(snapshots, out_dir, dxf_path, *, passes=0, speed=floa
     a per-snapshot report, and one side-by-side montage. Absolute pin position is never claimed.
     Returns ``(df, results, tiles)``.
 
-    ``results_root`` overrides the root that ``out_dir`` must live under (default ``Results/``);
+    ``results_root`` overrides the root that ``out_dir`` must live under (default ``results/``);
     ``run_row.py`` leaves it as ``None`` in production and the selftest points it at a temp dir.
     """
     snapshots = [(Path(p), str(lab)) for p, lab in snapshots]
@@ -1635,7 +1635,7 @@ def main():
     warnings.filterwarnings("ignore", message=".*divide by zero encountered.*")
     argv = sys.argv[1:]
     if argv and argv[0] in ("--snapshots", "--multi"):
-        # python run_sample.py --snapshots <vk4_dir> <out_dir> <dxf> <P{passes}_S{speed}>
+        # python python/run_sample.py --snapshots <vk4_dir> <out_dir> <dxf> <P{passes}_S{speed}>
         a = argv[1:]
         vk4_dir = Path(a[0]) if len(a) > 0 else DEF_VK4_DIR
         out_dir = Path(a[1]) if len(a) > 1 else DEF_OUT_DIR / "direct"

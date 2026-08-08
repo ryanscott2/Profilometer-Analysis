@@ -22,7 +22,7 @@ VK4 filenames carry a compact ``_{col}{row}_`` token before the snapshot label::
 FIRST digit is the column, SECOND is the row. An explicit ``C{col}R{row}`` token is also accepted
 so the scheme survives a wafer wider than nine columns.
 
-``CSV/wafer_map.csv`` declares, per (row, col): the laser dose, the pin geometry and the lattice.
+``csv/wafer_map.csv`` declares, per (row, col): the laser dose, the pin geometry and the lattice.
 Geometry is declared PER LINE and never inferred -- on this wafer the column->geometry pairing
 REVERSES between wafer rows 1-2 and row 4, so any inference rule would be wrong half the time.
 """

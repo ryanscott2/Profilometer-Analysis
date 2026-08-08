@@ -4,7 +4,7 @@ PFLM sample-tester UI — a simple Tkinter front-end for ``run_sample.py``.
 Keep a library of samples (each = a DXF + a VK4 tile folder + a cell_params grid), switch
 between them, edit the laser-parameter grid, run/stop the tiled analysis while watching the
 console live, browse the Results folder + preview figures, and export a zip of ``figures/``.
-Each run writes under ``Results/<sample name>/`` (a sample must be selected to run), so different
+Each run writes under ``results/<sample name>/`` (a sample must be selected to run), so different
 datasets never overwrite one another.
 
 Drag-and-drop uses ``tkinterdnd2`` if installed (``pip install tkinterdnd2``); otherwise use the
@@ -40,7 +40,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent  # repo root: modules live in python/, data sits beside it
 SAMPLES_JSON = ROOT / ".ui_samples.json"
 WORKSPACE = ROOT / ".ui_workspace"
-DEF_OUT = ROOT / "Results"
+DEF_OUT = ROOT / "results"
 IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp")
 TEXT_EXT = (".txt", ".csv", ".log", ".json")
 
@@ -213,22 +213,22 @@ class App:
             messagebox.showerror("Save error", str(e))
 
     def _load_working_tree_defaults(self):
-        """Pre-fill from the repo's DXF/ VK4/ CSV/ so the currently-loaded sample runs at once."""
-        dxfs = sorted((ROOT / "DXF").glob("*.dxf")) if (ROOT / "DXF").is_dir() else []
+        """Pre-fill from the repo's dxf/ vk4/ csv/ so the currently-loaded sample runs at once."""
+        dxfs = sorted((ROOT / "dxf").glob("*.dxf")) if (ROOT / "dxf").is_dir() else []
         if dxfs:
             self._set_dxf(dxfs[0])
-        if (ROOT / "VK4").is_dir() and any((ROOT / "VK4").glob("*.vk4")):
-            self._set_vk4_dir(ROOT / "VK4")
-        csv = ROOT / "CSV" / "cell_params.csv"
+        if (ROOT / "vk4").is_dir() and any((ROOT / "vk4").glob("*.vk4")):
+            self._set_vk4_dir(ROOT / "vk4")
+        csv = ROOT / "csv" / "cell_params.csv"
         if csv.exists():
             self.csv_text.delete("1.0", "end")
             self.csv_text.insert("1.0", csv.read_text(encoding="utf-8-sig"))
-        rad = ROOT / "CSV" / "radial_sets.csv"
+        rad = ROOT / "csv" / "radial_sets.csv"
         if rad.exists():
             self.radial_text.delete("1.0", "end")
             self.radial_text.insert("1.0", rad.read_text(encoding="utf-8-sig"))
-        # band definitions for the depth calibration: from CSV/band_defs.csv if present, else default
-        bands = ROOT / "CSV" / "band_defs.csv"
+        # band definitions for the depth calibration: from csv/band_defs.csv if present, else default
+        bands = ROOT / "csv" / "band_defs.csv"
         self.cal_bands_text.delete("1.0", "end")
         self.cal_bands_text.insert("1.0", bands.read_text(encoding="utf-8-sig")
                                    if bands.exists() else DEFAULT_BAND_DEFS)
@@ -427,7 +427,7 @@ class App:
 
         # ---------- depth calibration (pool completed samples, post-hoc) ----------
         # Shells out to calibrate_depth.py on the samples selected here; output streams to the
-        # console and the report/figures land under Results/_depth_calibration (browsable above).
+        # console and the report/figures land under results/_depth_calibration (browsable above).
         calf = ttk.LabelFrame(right, text=" Depth calibration ", style="Card.TLabelframe", padding=6)
         calf.grid(row=2, column=0, sticky="ew")
         calf.columnconfigure(0, weight=1)
@@ -625,13 +625,13 @@ class App:
 
     def _find_wafer_map(self, vk4_dir):
         """The wafer map for this folder: an explicit pick wins, else search beside the VK4 folder,
-        its parent, then CSV/ -- the same order run_row.py uses, so the UI shows what the run
+        its parent, then csv/ -- the same order run_row.py uses, so the UI shows what the run
         will actually read."""
         if self.cur.get("wafer_map") and Path(self.cur["wafer_map"]).is_file():
             return Path(self.cur["wafer_map"])
         d = Path(vk4_dir)
         for cand in (d / DEFAULT_MAP_NAME, d.parent / DEFAULT_MAP_NAME,
-                     ROOT / "CSV" / DEFAULT_MAP_NAME):
+                     ROOT / "csv" / DEFAULT_MAP_NAME):
             if cand.is_file():
                 return cand
         return None
@@ -765,7 +765,7 @@ class App:
         return _safe_name(self.sample_var.get())
 
     def _dataset_out_dir(self):
-        """Per-dataset output root — Results/<dataset name>/ — holding this run's figures/ + legacy/."""
+        """Per-dataset output root — results/<dataset name>/ — holding this run's figures/ + legacy/."""
         return DEF_OUT / self._dataset_name()
 
     def _toggle_run(self):
@@ -803,7 +803,7 @@ class App:
         csv_path.write_text(self._csv(), encoding="utf-8")
         # radial_sets.csv must sit next to cell_params.csv (run_sample reads it from there)
         (WORKSPACE / "radial_sets.csv").write_text(self._radial(), encoding="utf-8")
-        # each run writes under Results/<dataset name>/ so datasets don't overwrite each other
+        # each run writes under results/<dataset name>/ so datasets don't overwrite each other
         # (run_sample clears only this subfolder, leaving other datasets' results intact)
         out_dir = self._dataset_out_dir()
         mode, _labels = _classify_vk4_folder(vk4)
@@ -909,7 +909,7 @@ class App:
 
     # ------------------------------------------------------ depth calibration #
     def _discover_samples(self):
-        """Sample folders under Results/ that hold a legacy/measurements.csv — exactly what
+        """Sample folders under results/ that hold a legacy/measurements.csv — exactly what
         calibrate_depth pools. The calibration output folder is skipped (it has no legacy/).
 
         Mirrors calibrate_depth.discover_samples, INCLUDING its one-level descent into a wafer-row
@@ -942,7 +942,7 @@ class App:
         all_were_selected = bool(prev_names) and prev_sel == set(prev_names)
         first = not prev_names
         names = self._discover_samples()
-        # forget cell specs for samples that no longer exist under Results/
+        # forget cell specs for samples that no longer exist under results/
         self.cal_cell_specs = {n: s for n, s in self.cal_cell_specs.items() if n in names}
         # tear down any in-flight inline editor before the rows it sat on are deleted
         if self._cal_cell_editor is not None:
@@ -1059,7 +1059,7 @@ class App:
         names = self._discover_samples()
         if not names:
             return messagebox.showerror(
-                "Depth calibration", "No samples with legacy/measurements.csv under Results/. "
+                "Depth calibration", "No samples with legacy/measurements.csv under results/. "
                 "Run at least one sample first.")
         raw = self.cal_target.get().strip()
         try:

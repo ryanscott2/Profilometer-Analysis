@@ -1,14 +1,14 @@
 """
 End-to-end self-test on synthetic data (no real VK4 files required).
 
-Validates the v2 pipeline that cannot be exercised on the empty ``VK4/`` folder yet:
+Validates the v2 pipeline that cannot be exercised on the empty ``vk4/`` folder yet:
 
   1. Registration recovers a known cell origin (single cell and a tiled 2-cell scan).
   2. Extraction recovers the known diameter / pitch / depth for every array.
   3. The full plot suite renders from a synthetic measurements table.
   4. Real markerless fabrication DXFs retain their geometry and resolve only with finite-edge proof.
 
-Run:  python selftest.py       (writes previews/plots under Results/selftest/)
+Run:  python python/selftest.py       (writes previews/plots under results/selftest/)
 Exit code is non-zero if any check fails, so it can gate CI.
 """
 
@@ -34,7 +34,7 @@ import report as ra
 
 HERE = Path(__file__).parent
 ROOT = HERE.parent  # repo root: modules live in python/, data sits beside it
-OUT = ROOT / "Results" / "legacy" / "selftest"
+OUT = ROOT / "results" / "legacy" / "selftest"
 
 
 def _dxf_candidates(name: str, fixture_group: str) -> list[Path]:
@@ -59,7 +59,7 @@ def _dxf_candidates(name: str, fixture_group: str) -> list[Path]:
     # These paths make the same test portable to GitHub Actions and other machines.  No source
     # is ever opened for writing; the repository DXF is only a fallback test fixture.
     candidates.extend((
-        ROOT / "DXF" / name,
+        ROOT / "dxf" / name,
         ROOT / "tests" / "fixtures" / fixture_group / name,
     ))
 
@@ -526,8 +526,8 @@ def main():
                 _cands.append(_resolve_dxf(_fixture_name, "registration"))
             except FileNotFoundError:
                 pass
-        if (ROOT / "Results").is_dir():
-            _cands += list((ROOT / "Results").glob("*/figures/*.dxf"))
+        if (ROOT / "results").is_dir():
+            _cands += list((ROOT / "results").glob("*/figures/*.dxf"))
         _Ltmpl = None
         for _p in _cands:
             try:

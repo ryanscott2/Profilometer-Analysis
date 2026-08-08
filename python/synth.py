@@ -187,7 +187,7 @@ if __name__ == "__main__":       # pragma: no cover
     from dxf_geometry import read_design
 
     root = Path(__file__).resolve().parent.parent
-    design = read_design(next((root / "DXF").glob("*.dxf")))
+    design = read_design(next((root / "dxf").glob("*.dxf")))
     scan, truth = synth_scan(design.cells[0])
     fig, ax = plt.subplots(1, 2, figsize=(16, 7))
     ax[0].imshow(scan.height_um, origin="lower", cmap="viridis")
@@ -195,6 +195,6 @@ if __name__ == "__main__":       # pragma: no cover
     ax[0].set_title("height", fontsize=fs.TITLE); ax[1].set_title("intensity", fontsize=fs.TITLE)
     for _a in ax:                                        # same type sizes as every other figure
         _a.tick_params(labelsize=fs.TICK)                # in the project (figstyle)
-    out = here / "Results" / "synth_preview.png"
+    out = root / "results" / "synth_preview.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=120); print("wrote", out, "truth origin", truth["origins"])

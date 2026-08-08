@@ -5,7 +5,7 @@ A wafer holds a GRID of samples. Each sample is one uniform-cell dataset -- one 
 laser dose, imaged as one or more disjoint snapshots -- i.e. exactly what ``run_sample.py
 --snapshots`` analyses. This module runs a whole ROW of them:
 
-1. read ``CSV/wafer_map.csv`` (``wafer_map.py``) for each (row, col)'s dose, geometry and lattice,
+1. read ``csv/wafer_map.csv`` (``wafer_map.py``) for each (row, col)'s dose, geometry and lattice,
 2. group the VK4 files by their ``_{col}{row}_`` token into one sample per wafer column,
 3. resolve which DXF each sample needs BY CONTENT (pitch + lattice read out of the drawing, not out
    of its filename), cross-checked against the diameter and the VK4 filenames,
@@ -15,7 +15,7 @@ laser dose, imaged as one or more disjoint snapshots -- i.e. exactly what ``run_
 
 Output layout::
 
-    Results/072426 Row 1/            <- a plain CONTAINER, never a transaction target
+    results/072426 Row 1/            <- a plain CONTAINER, never a transaction target
         .pflm-row.json
         c1 D50 P100 P25_S400/        <- a normal, fully transactional per-sample dataset
         c2 D50 P100 P20_S400/
@@ -32,8 +32,8 @@ side. That is why the rollup files are named ``row_*`` and written with plain at
 
 Usage::
 
-    python run_row.py --row 1
-    python run_row.py --row 1 --vk4 <dir> [<dir> ...] --dxf-dir <dir> --dry-run
+    python python/run_row.py --row 1
+    python python/run_row.py --row 1 --vk4 <dir> [<dir> ...] --dxf-dir <dir> --dry-run
 """
 from __future__ import annotations
 
@@ -63,10 +63,10 @@ import run_sample as rs
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent  # repo root: modules live in python/, data sits beside it
-DEF_DXF_DIR = ROOT / "DXF"
-DEF_VK4_DIR = ROOT / "VK4"
-DEF_CSV_DIR = ROOT / "CSV"
-DEF_OUT_DIR = ROOT / "Results"
+DEF_DXF_DIR = ROOT / "dxf"
+DEF_VK4_DIR = ROOT / "vk4"
+DEF_CSV_DIR = ROOT / "csv"
+DEF_OUT_DIR = ROOT / "results"
 
 ROW_SENTINEL = rs.ROW_SENTINEL                 # ".pflm-row.json"
 ROW_FIGURES_DIR = "row_figures"
@@ -706,12 +706,12 @@ def build_parser():
     ap.add_argument("--row", type=int, required=True, help="wafer row number (the SECOND digit of "
                                                            "the _{col}{row}_ token in the VK4 names)")
     ap.add_argument("--map", default="", help=f"wafer map CSV (default: search the VK4 folder, its "
-                                              f"parent, then CSV/{wm.DEFAULT_MAP_NAME})")
+                                              f"parent, then csv/{wm.DEFAULT_MAP_NAME})")
     ap.add_argument("--vk4", nargs="+", default=None,
                     help="one or more VK4 folders; a folder with no top-level .vk4 is searched "
                          "recursively, so the PARENT of several per-geometry folders works")
     ap.add_argument("--dxf-dir", default="", help="folder of candidate DXF drawings")
-    ap.add_argument("--out", default="", help="output folder (default: Results/<date> Row <n>)")
+    ap.add_argument("--out", default="", help="output folder (default: results/<date> Row <n>)")
     ap.add_argument("--out-name", default="", help="name of the Results subfolder (overrides the date)")
     ap.add_argument("--only", type=int, nargs="+", default=None, help="run only these wafer columns")
     ap.add_argument("--jobs", type=int, default=None, help="per-array extraction workers")
@@ -797,7 +797,7 @@ def main(argv=None):
 
     validate_row_container(out_dir)          # BEFORE anything is written (raises SystemExit)
     # The row folder's PARENT is the results root every per-sample transaction is validated against,
-    # so an --out outside Results/ works instead of failing every sample.
+    # so an --out outside results/ works instead of failing every sample.
     results_root = out_dir.parent
 
     run_meta = {"map": str(map_path), "dxf_dir": str(dxf_dir), "vk4_dirs": vk4_dirs}

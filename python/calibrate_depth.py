@@ -11,16 +11,16 @@ LOCAL differential measured per array, so per-tile Z offsets and stage tilt canc
 comparable across samples/wafers/dates, so we can pool the completed runs for a calibration with far
 more (passes, speed) coverage than any single sample has.
 
-It is POST-HOC and ADDITIVE: it reads the saved ``Results/<sample>/legacy/measurements.csv`` files
+It is POST-HOC and ADDITIVE: it reads the saved ``results/<sample>/legacy/measurements.csv`` files
 (no re-registration / re-extraction) and writes its own report + figures under a separate output
 folder. Nothing in the per-run pipeline (``run_sample.analyze_sample``) changes. Re-runnable with a
 different sample selection each time (that is what the UI include/exclude control drives).
 
 Usage:
-    python calibrate_depth.py                                  # all samples, target 55 µm
-    python calibrate_depth.py --include A,B --targets 45,55,65
-    python calibrate_depth.py --results Results --out Results/_depth_calibration --exclude bad_run
-    python calibrate_depth.py --cell-filters cells.json        # keep/drop cell_ids per sample
+    python python/calibrate_depth.py                                  # all samples, target 55 µm
+    python python/calibrate_depth.py --include A,B --targets 45,55,65
+    python python/calibrate_depth.py --results results --out results/_depth_calibration --exclude bad_run
+    python python/calibrate_depth.py --cell-filters cells.json        # keep/drop cell_ids per sample
 
 Deliverables (under --out):  depth_calibration.txt, depth_vs_passes_speed_3d.png, depth_vs_dose.png,
 depth_parity.png, depth_heatmap.png.
@@ -47,7 +47,7 @@ from report import _ols_fit                                     # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent  # repo root: modules live in python/, data sits beside it
-DEF_RESULTS = ROOT / "Results"
+DEF_RESULTS = ROOT / "results"
 OUT_NAME = "etch depth"                # cross-sample output dir; has no legacy/ so it self-skips discovery
 MEAS_REL = Path("legacy") / "measurements.csv"
 DEF_TARGET_UM = 55.0                   # the design target used throughout the codebase
@@ -71,7 +71,7 @@ def discover_samples(results_dir, out_dir, include=None, exclude=None):
     whitelists, ``exclude`` blacklists. The output folder is skipped explicitly (it also has no
     ``legacy/`` so it would self-skip anyway). Returns an ordered list of (name, csv_path).
 
-    Descends ONE extra level into a wafer-row container (``Results/<date> Row n/<sample>/``, written
+    Descends ONE extra level into a wafer-row container (``results/<date> Row n/<sample>/``, written
     by ``run_row.py``) -- those samples are real datasets and would otherwise be invisible to depth
     calibration. Their identity is the relative path ``'072426 Row 1/c1 D50 P100 P25_S400'``, which
     is what ``include``/``exclude`` and the UI's cell-filter keys must use. Dot-directories are
