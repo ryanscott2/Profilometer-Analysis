@@ -8,7 +8,7 @@ everything that decision needs and is PURE: it parses names and CSV text, and co
 Nothing here reads a VK4, parses a DXF, or writes to disk (``read_wafer_map`` reads one CSV).
 
 That purity is deliberate and load-bearing twice over:
-  * ``pflm_ui.py`` imports it at module scope, so it must not drag in numpy/pandas/matplotlib, and
+  * ``ui_shared.py`` imports it at module scope, so it must not drag in numpy/pandas/matplotlib, and
   * the whole plan -- name parsing, grouping, DXF pairing, skips -- is unit-testable in selftest.py
     without a single Keyence file.
 
@@ -47,8 +47,8 @@ MAP_META_KEYS = ("date", "dxf_dir", "vk4_dir")
 
 
 # ----------------------------------------------------------- filesystem-safe names #
-# Moved verbatim from pflm_ui.py so the UI and the CLI cannot drift apart on what a sample folder
-# is called; '[' and ']' are added because _prepare_output_transaction globs
+# The one sanitiser for every results-folder name, so the UI and the CLI cannot drift apart on what
+# a sample folder is called; '[' and ']' are added because _prepare_output_transaction globs
 # f".{final_dir.name}.staging-*" and brackets are glob metacharacters (legal on NTFS, so the old
 # sanitizer let them through).
 _SLASH = re.compile(r"[/\\]")

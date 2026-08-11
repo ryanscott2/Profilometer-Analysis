@@ -412,7 +412,7 @@ at left).
   `--snapshots` multi-snapshot mode (register each disjoint crop of one uniform cell independently →
   measure → tiled montage under the usual figure names).
 - `wafer_map.py` — wafer-row vocabulary: the VK4 `_{col}{row}_` filename grammar, the
-  `wafer_map.csv` reader, and `plan_row` (pure; stdlib only, so `pflm_ui.py` can import it without
+  `wafer_map.csv` reader, and `plan_row` (pure; stdlib only, so `ui_shared.py` can import it without
   pulling in numpy/pandas/matplotlib). Also owns the shared `safe_name` folder sanitiser.
 - `run_row.py` — wafer-row driver: content-based DXF resolution, preflight plan, one
   `analyze_multi_snapshot` call per wafer column, error containment, rollup.
@@ -423,8 +423,11 @@ at left).
   `LEGEND`, `ANNOT`, …) and the `PLOT_RC` rc-context, all derived from one `BUMP` constant. Every
   figure writer imports it, so a presentation-size change is a one-line edit rather than ~130
   scattered literals.
-- `pflm_ui.py` — Tkinter sample-tester GUI (sample library, run/stop, figure preview,
-  depth-calibration panel).
+- `pflm_app.py` + `qml/Main.qml` — the desktop front end (PySide6 + QML): sample library,
+  run/stop, wafer-row and depth-calibration launches, figure preview, and zip export.
+- `ui_shared.py` — the desktop UI's shared launch helpers: the VK4-folder classifier, the
+  name-collision guard, and the workspace/results-folder constants that `pflm_app.py` imports.
+  Stdlib-only, so importing it never pulls in numpy/pandas/matplotlib.
 - `synth.py`, `selftest.py` — synthetic scan generator and end-to-end validation.
 
 ## Notes / assumptions

@@ -1,21 +1,16 @@
-"""PySide6 + QML front end for the PFLM sample tester.
+"""PySide6 + QML desktop front end for the PFLM sample tester.
 
     python pflm_app.py
 
-Same job as `pflm_ui.py`, in the Windows 11 Fluent style: keep a library of named
-samples, run the tiled analysis while watching the console, and browse the figures
-it produces.
+The Windows 11 Fluent-style desktop UI: keep a library of named samples, run the
+tiled analysis while watching the console, and browse the figures it produces.
+Covers the single-sample run, the wafer-row batch mode, depth calibration with
+per-sample cell filters, and the figures zip export.
 
-The run command, sample library, workspace and VK4 classification are all reused
-from `pflm_ui` rather than reimplemented, so this cannot drift from the Tk front
-end on what a run actually is. `pflm_ui` is import-safe: it defines helpers at
-module level and only builds a window under its own `__main__`.
-
-Covers everything the Tk front end does: the single-sample run, wafer-row batch
-mode, depth calibration with per-sample cell filters, and the figures zip export.
-The run commands, sample library, workspace and VK4 classification all come from
-`pflm_ui` and `wafer_map` by import, so the two front ends cannot disagree about
-what a run is.
+The run commands' shared pieces -- the sample library and workspace paths, the
+results-folder naming, and the VK4-folder classification -- come from `ui_shared`
+and `wafer_map` by import rather than being reimplemented here. `ui_shared` is
+stdlib-only, so importing it never pulls numpy/pandas/matplotlib into UI startup.
 
 Needs `pip install PySide6` alongside this project's own requirements. On Windows,
 enable long paths first (`LongPathsEnabled`), or the wheel half-extracts and leaves
@@ -51,8 +46,8 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent  # repo root: modules live in python/, data sits beside it
 sys.path.insert(0, str(HERE))
 
-# Reused so the two front ends cannot disagree about what a run is.
-import pflm_ui  # noqa: E402
+# Shared launch helpers: results/sample-library paths, VK4 classification, name guards.
+import ui_shared  # noqa: E402
 from wafer_map import (DEFAULT_MAP_NAME, date_tag_from_names,  # noqa: E402
                        read_wafer_map, row_out_name, rows_present)
 
@@ -78,7 +73,7 @@ class Bridge(QObject):
     # ------------------------------------------------------------- samples
 
     def _read_samples(self) -> dict:
-        path = pflm_ui.SAMPLES_JSON
+        path = ui_shared.SAMPLES_JSON
         if path.exists():
             try:
                 loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -90,7 +85,7 @@ class Bridge(QObject):
 
     def _write_samples(self) -> None:
         try:
-            pflm_ui.SAMPLES_JSON.write_text(
+            ui_shared.SAMPLES_JSON.write_text(
                 json.dumps(self._samples, indent=2), encoding="utf-8"
             )
         except OSError as exc:
@@ -145,12 +140,12 @@ class Bridge(QObject):
 
     @Slot(str, result=str)
     def classify(self, vk4_dir: str) -> str:
-        """Snapshots or tiles, decided by pflm_ui's own classifier."""
+        """Snapshots or tiles, decided by ui_shared's VK4-folder classifier."""
         path = Path(vk4_dir)
         if not path.is_dir():
             return "no folder"
         try:
-            mode, _labels = pflm_ui._classify_vk4_folder(path)
+            mode, _labels = ui_shared._classify_vk4_folder(path)
             return str(mode)
         except Exception:  # noqa: BLE001 - informational only
             return "unknown"
@@ -165,7 +160,7 @@ class Bridge(QObject):
     @Slot(str)
     def refreshFigures(self, name: str) -> None:
         found: list[str] = []
-        out_dir = pflm_ui.DEF_OUT / pflm_ui._safe_name(name)
+        out_dir = ui_shared.DEF_OUT / ui_shared._safe_name(name)
         for directory in (out_dir / "figures", out_dir):
             if directory.is_dir():
                 found.extend(
@@ -180,7 +175,7 @@ class Bridge(QObject):
 
     @Slot(str, result=str)
     def resultsPath(self, name: str) -> str:
-        return str(pflm_ui.DEF_OUT / pflm_ui._safe_name(name))
+        return str(ui_shared.DEF_OUT / ui_shared._safe_name(name))
 
     # -------------------------------------------------------------- rows
 
@@ -199,7 +194,7 @@ class Bridge(QObject):
             folder = Path(vk4_dir)
             found = next((c for c in (folder / DEFAULT_MAP_NAME,
                                       folder.parent / DEFAULT_MAP_NAME,
-                                      pflm_ui.ROOT / "csv" / DEFAULT_MAP_NAME)
+                                      ui_shared.ROOT / "csv" / DEFAULT_MAP_NAME)
                           if c.is_file()), None)
         if found is None:
             result["problem"] = (f"No {DEFAULT_MAP_NAME} beside the VK4 folder, in its parent, "
@@ -220,11 +215,11 @@ class Bridge(QObject):
 
     @Slot(str, int, result=str)
     def rowName(self, vk4_dir: str, row: int) -> str:
-        """The Results folder a row run writes, derived exactly as pflm_ui does."""
+        """The Results folder a row run writes, named the same way run_row.py names it."""
         if not row:
             return ""
         tag = date_tag_from_names([f.name for f in Path(vk4_dir).rglob("*.vk4")]) or ""
-        return pflm_ui._safe_name(row_out_name(tag, row))
+        return ui_shared._safe_name(row_out_name(tag, row))
 
     @Slot(str, str, int, str)
     def runRow(self, vk4_dir: str, dxf: str, row: int, map_override: str) -> None:
@@ -244,23 +239,23 @@ class Bridge(QObject):
             return
 
         name = self.rowName(vk4_dir, row)
-        # The same three guards pflm_ui applies, so a row run cannot overwrite a
-        # single-sample result or the reserved calibration folder.
-        collision = pflm_ui._sample_name_collision(name, list(self._samples))
+        # Three guards, so a row run cannot overwrite a single-sample result or the
+        # reserved calibration folder.
+        collision = ui_shared._sample_name_collision(name, list(self._samples))
         if collision:
             self._set_status(f"Row folder '{name}' collides with sample '{collision}'.")
             return
-        if name.casefold() == pflm_ui.CAL_OUT_NAME.casefold():
-            self._set_status(f"'{pflm_ui.CAL_OUT_NAME}' is reserved for depth calibration.")
+        if name.casefold() == ui_shared.CAL_OUT_NAME.casefold():
+            self._set_status(f"'{ui_shared.CAL_OUT_NAME}' is reserved for depth calibration.")
             return
-        out_dir = pflm_ui.DEF_OUT / name
+        out_dir = ui_shared.DEF_OUT / name
         if out_dir.is_dir() and ((out_dir / "legacy").is_dir() or (out_dir / "figures").is_dir()
                                  or (out_dir / ".pflm-results.json").is_file()):
             self._set_status(f"results/{name} is an existing single-sample result, not a row "
                              "container. Pick a different row.")
             return
 
-        arguments = ["-u", str(HERE / pflm_ui.ROW_SCRIPT), "--row", str(row),
+        arguments = ["-u", str(HERE / ui_shared.ROW_SCRIPT), "--row", str(row),
                      "--map", info["mapPath"], "--vk4", str(vk4_dir), "--out", str(out_dir)]
         if dxf and Path(dxf).is_file():
             arguments += ["--dxf-dir", str(Path(dxf).parent)]
@@ -270,16 +265,16 @@ class Bridge(QObject):
 
     @Slot(result=str)
     def defaultBands(self) -> str:
-        return str(pflm_ui.DEFAULT_BAND_DEFS)
+        return str(ui_shared.DEFAULT_BAND_DEFS)
 
     @Slot(result=list)
     def calibrationCandidates(self) -> list:
         """Result folders carrying the legacy measurements CSV the pool is built from."""
-        root = pflm_ui.DEF_OUT
+        root = ui_shared.DEF_OUT
         if not root.is_dir():
             return []
         return sorted(entry.name for entry in root.iterdir()
-                      if entry.is_dir() and (entry / pflm_ui.MEAS_REL).is_file())
+                      if entry.is_dir() and (entry / ui_shared.MEAS_REL).is_file())
 
     @Slot(str, result=str)
     def validateCellSpec(self, spec: str) -> str:
@@ -287,7 +282,7 @@ class Bridge(QObject):
 
         Uses calibrate_depth.parse_cell_spec so the grammar has one definition. If
         that module's heavier dependencies are missing, accept the text and let the
-        calibrate subprocess be the judge, which is what pflm_ui does too.
+        calibrate subprocess be the judge.
         """
         if not str(spec).strip():
             return ""
@@ -315,9 +310,9 @@ class Bridge(QObject):
             self._set_status("Give at least one target depth.")
             return
 
-        out_dir = pflm_ui.DEF_OUT / pflm_ui.CAL_OUT_NAME
-        arguments = ["-u", str(HERE / pflm_ui.CAL_SCRIPT),
-                     "--results", str(pflm_ui.DEF_OUT), "--out", str(out_dir),
+        out_dir = ui_shared.DEF_OUT / ui_shared.CAL_OUT_NAME
+        arguments = ["-u", str(HERE / ui_shared.CAL_SCRIPT),
+                     "--results", str(ui_shared.DEF_OUT), "--out", str(out_dir),
                      "--targets", ",".join(f"{v:g}" for v in values)]
         if allow_legacy_qc:
             arguments.append("--allow-legacy-qc")
@@ -333,18 +328,18 @@ class Bridge(QObject):
         filters = {name: str(cell_filters.get(name) or "").strip() for name in pooled}
         filters = {name: spec for name, spec in filters.items() if spec}
         if filters:
-            pflm_ui.WORKSPACE.mkdir(exist_ok=True)
-            filters_path = pflm_ui.WORKSPACE / "cell_filters.json"
+            ui_shared.WORKSPACE.mkdir(exist_ok=True)
+            filters_path = ui_shared.WORKSPACE / "cell_filters.json"
             filters_path.write_text(json.dumps(filters, indent=2), encoding="utf-8")
             arguments += ["--cell-filters", str(filters_path)]
         # Blank or comments-only means "use the measurements' own band column".
         if any(line.strip() and not line.strip().startswith("#")
                for line in str(bands_text).splitlines()):
-            pflm_ui.WORKSPACE.mkdir(exist_ok=True)
-            bands_path = pflm_ui.WORKSPACE / "band_defs.csv"
+            ui_shared.WORKSPACE.mkdir(exist_ok=True)
+            bands_path = ui_shared.WORKSPACE / "band_defs.csv"
             bands_path.write_text(str(bands_text), encoding="utf-8")
             arguments += ["--bands", str(bands_path)]
-        self._launch(arguments, "depth calibration", figures_for=pflm_ui.CAL_OUT_NAME)
+        self._launch(arguments, "depth calibration", figures_for=ui_shared.CAL_OUT_NAME)
 
     # ------------------------------------------------------------ zip export
 
@@ -355,9 +350,9 @@ class Bridge(QObject):
 
         target = Path(QUrl(destination).toLocalFile()
                       if destination.startswith("file:") else destination)
-        folder = pflm_ui.DEF_OUT / pflm_ui._safe_name(name)
+        folder = ui_shared.DEF_OUT / ui_shared._safe_name(name)
         root = folder if is_row else folder / "figures"
-        if is_row and not (folder / pflm_ui.ROW_FIGURES_DIR).is_dir():
+        if is_row and not (folder / ui_shared.ROW_FIGURES_DIR).is_dir():
             return f"No row results for '{name}'. Run it first."
         if not root.is_dir():
             return f"Nothing to export for '{name}'. Run it first."
@@ -411,19 +406,19 @@ class Bridge(QObject):
             self._set_status(f"VK4 folder not found: {vk4}")
             return
 
-        # Same contract as pflm_ui: the params files live beside each other in the
-        # workspace, and run_sample.py reads radial_sets.csv from there.
-        pflm_ui.WORKSPACE.mkdir(exist_ok=True)
-        csv_path = pflm_ui.WORKSPACE / "cell_params.csv"
+        # The params files live beside each other in the workspace, and run_sample.py
+        # reads radial_sets.csv from there.
+        ui_shared.WORKSPACE.mkdir(exist_ok=True)
+        csv_path = ui_shared.WORKSPACE / "cell_params.csv"
         csv_path.write_text(str(values.get("csv_text") or ""), encoding="utf-8")
-        (pflm_ui.WORKSPACE / "radial_sets.csv").write_text(
+        (ui_shared.WORKSPACE / "radial_sets.csv").write_text(
             str(values.get("radial_text") or ""), encoding="utf-8"
         )
 
-        out_dir = pflm_ui.DEF_OUT / pflm_ui._safe_name(name)
-        mode, _labels = pflm_ui._classify_vk4_folder(vk4)
+        out_dir = ui_shared.DEF_OUT / ui_shared._safe_name(name)
+        mode, _labels = ui_shared._classify_vk4_folder(vk4)
         if mode == "snapshots":
-            dose = pflm_ui._first_ps_label(str(values.get("csv_text") or ""))
+            dose = ui_shared._first_ps_label(str(values.get("csv_text") or ""))
             arguments = ["-u", str(HERE / "run_sample.py"), "--snapshots",
                          str(vk4), str(out_dir), str(dxf), dose]
         else:

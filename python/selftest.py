@@ -892,7 +892,7 @@ def main():
         import assemble
         import calibrate_depth as cd
         import laser_params
-        import pflm_ui
+        import ui_shared
         from dxf_geometry import validate_equivalent_cells
 
         # Laser labels must consume the whole cell and encode a positive integer pass count and
@@ -917,7 +917,7 @@ def main():
             shutil.rmtree(_td, ignore_errors=True)
 
         # Sanitized UI names are not unique identifiers; reject two names mapping to one folder.
-        ck.check(pflm_ui._sample_name_collision("D100 D50", {"D100/D50": {}}) == "D100/D50",
+        ck.check(ui_shared._sample_name_collision("D100 D50", {"D100/D50": {}}) == "D100/D50",
                  "UI: colliding sanitized sample names are detected before overwrite")
 
         # The production one-template path must reject a heterogeneous multi-cell fabrication DXF.

@@ -108,9 +108,6 @@ Launch the desktop interface:
 python python/pflm_app.py
 ```
 
-The earlier Tk interface (`python python/pflm_ui.py`) still runs and shares its helpers
-with the current one, but `pflm_app.py` is the maintained front end.
-
 Or run a sample from the standard local folder structure:
 
 ```powershell
@@ -196,8 +193,8 @@ Two path anchors follow from that layout, and the distinction matters when editi
 |---|---|
 | `report.py` / `figstyle.py` | Shared reporting and figure styling |
 | `porosity_table.py` | Square-versus-hex porosity reference table |
-| `pflm_app.py` + `qml/` | Desktop interface (PySide6 + QML), the maintained front end |
-| `pflm_ui.py` | Earlier Tk interface; still runnable, and the source of shared UI helpers |
+| `pflm_app.py` + `qml/` | Desktop interface (PySide6 + QML) |
+| `ui_shared.py` | Shared launch helpers for the desktop UI (results paths, VK4 classification, name guards) |
 | `synth.py` / `selftest.py` | Synthetic data and end-to-end validation |
 
 Supporting directories, all at the repository root: `python/` (every module),
