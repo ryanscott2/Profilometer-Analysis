@@ -645,6 +645,13 @@ ApplicationWindow {
                                 anchors.margins: 4
                                 clip: true
                                 spacing: 2
+                                // The pool can exceed a screenful (every wafer-row column is its own
+                                // entry). The delegates are control-filled, so a drag-flick is eaten
+                                // by the checkbox/field and only the pre-instantiated rows are
+                                // reachable. An explicit scrollbar guarantees every entry can be
+                                // scrolled to and picked, regardless of wheel/flick behaviour.
+                                boundsBehavior: Flickable.StopAtBounds
+                                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
                                 model: bridge.calibrationCandidates()
                                 delegate: RowLayout {
                                     id: poolRow
