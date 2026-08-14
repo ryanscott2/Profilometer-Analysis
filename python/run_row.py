@@ -33,7 +33,7 @@ side. That is why the rollup files are named ``row_*`` and written with plain at
 Usage::
 
     python python/run_row.py --row 1
-    python python/run_row.py --row 1 --vk4 <dir> [<dir> ...] --dxf-dir <dir> --dry-run
+    python python/run_row.py --row 1 --vk4 <dir> [<dir> ...] --dxf-dir <dir-or-file> [...] --dry-run
 """
 from __future__ import annotations
 
@@ -205,15 +205,49 @@ def read_design_cached(path):
     return _DESIGN_CACHE[key]
 
 
-def index_dxf_dir(dxf_dir, *, read=None):
-    """Parse every ``*.dxf`` in ``dxf_dir`` -> ``(facts, problems)``. Unreadable files are reported,
-    never silently skipped."""
+def _collect_dxf_files(inputs):
+    """Expand DXF inputs (each a FILE or a DIRECTORY) to a deduped, sorted list of ``.dxf`` Paths.
+
+    A directory contributes its top-level ``*.dxf`` (the original single-folder behaviour); an
+    individual file is taken as given. Deduped by resolved path so the same drawing listed twice --
+    or one also reachable through a listed folder -- is indexed once. Returns ``(files, problems)``;
+    an empty folder is silent (as before), a missing path or a non-``.dxf`` file is a problem."""
+    files, problems, seen = [], [], set()
+    for item in inputs:
+        p = Path(item)
+        if p.is_dir():
+            cands = sorted(p.glob("*.dxf"))
+        elif p.is_file():
+            if p.suffix.lower() != ".dxf":
+                problems.append(f"not a .dxf file: {p}")
+                continue
+            cands = [p]
+        else:
+            problems.append(f"DXF path not found: {p}")
+            continue
+        for f in cands:
+            r = f.resolve()
+            if r in seen:
+                continue
+            seen.add(r)
+            files.append(f)
+    return files, problems
+
+
+def index_dxf_dir(dxf_inputs, *, read=None):
+    """Parse candidate ``*.dxf`` from one or more inputs -> ``(facts, problems)``.
+
+    ``dxf_inputs`` is a single path or a list of them; each may be a DIRECTORY (its top-level
+    ``*.dxf`` are indexed, as before) or an individual ``.dxf`` FILE. Naming the exact drawings a
+    wafer row uses -- rather than a whole folder -- keeps stray or unreadable drawings from other
+    wafer generations out of the candidate pool, which is the surest way to avoid a same-pitch,
+    same-lattice ambiguity. Unreadable files are reported, never silently skipped."""
     read = read or read_design_cached
-    facts, problems = [], []
-    d = Path(dxf_dir)
-    if not d.is_dir():
-        return facts, [f"DXF directory not found: {d}"]
-    for p in sorted(d.glob("*.dxf")):
+    if isinstance(dxf_inputs, (str, Path)):
+        dxf_inputs = [dxf_inputs]
+    files, problems = _collect_dxf_files(dxf_inputs)
+    facts = []
+    for p in files:
         try:
             design = read(p)
         except Exception as e:                              # a malformed DXF must not kill the plan
@@ -711,7 +745,10 @@ def build_parser():
     ap.add_argument("--vk4", nargs="+", default=None,
                     help="one or more VK4 folders; a folder with no top-level .vk4 is searched "
                          "recursively, so the PARENT of several per-geometry folders works")
-    ap.add_argument("--dxf-dir", default="", help="folder of candidate DXF drawings")
+    ap.add_argument("--dxf-dir", nargs="+", default=None, metavar="PATH",
+                    help="candidate DXF drawings: one or more folders AND/OR individual .dxf files. "
+                         "Naming the exact drawings a row needs keeps unrelated or unreadable DXFs "
+                         "out of the pool (default: the map's dxf_dir, else dxf/)")
     ap.add_argument("--out", default="", help="output folder (default: results/<date> Row <n>)")
     ap.add_argument("--out-name", default="", help="name of the Results subfolder (overrides the date)")
     ap.add_argument("--only", type=int, nargs="+", default=None, help="run only these wafer columns")
@@ -743,10 +780,15 @@ def main(argv=None):
     map_path = _find_map(args.map, vk4_dirs)
 
     entries, meta, problems = wm.read_wafer_map(map_path)
-    dxf_dir = Path(args.dxf_dir or meta.get("dxf_dir") or DEF_DXF_DIR)
+    if args.dxf_dir:                                 # one or more folders and/or .dxf files
+        dxf_inputs = [Path(x) for x in args.dxf_dir]
+    elif meta.get("dxf_dir"):
+        dxf_inputs = [Path(meta["dxf_dir"])]
+    else:
+        dxf_inputs = [DEF_DXF_DIR]
 
     vk4_files, vk4_problems = collect_vk4(vk4_dirs)
-    facts, dxf_problems = index_dxf_dir(dxf_dir)
+    facts, dxf_problems = index_dxf_dir(dxf_inputs)
 
     row_entries = [e for e in entries if e.row == args.row and not e.skip]
     if args.only:
@@ -784,8 +826,9 @@ def main(argv=None):
     out_dir = (Path(args.out) if args.out
                else DEF_OUT_DIR / (wm.safe_name(args.out_name) if args.out_name
                                    else wm.row_out_name(plan.date_tag, plan.row)))
+    dxf_show = ", ".join(str(x) for x in dxf_inputs)
     say(f"wafer map : {map_path}")
-    say(f"DXF dir   : {dxf_dir}   ({len(facts)} drawing(s) parsed)")
+    say(f"DXF       : {dxf_show}   ({len(facts)} drawing(s) parsed)")
     say(f"VK4       : {', '.join(str(v) for v in vk4_dirs)}   ({len(vk4_files)} file(s))\n")
     say(wm.format_plan(plan, out_dir=out_dir))
 
@@ -801,7 +844,7 @@ def main(argv=None):
     # so an --out outside results/ works instead of failing every sample.
     results_root = out_dir.parent
 
-    run_meta = {"map": str(map_path), "dxf_dir": str(dxf_dir), "vk4_dirs": vk4_dirs}
+    run_meta = {"map": str(map_path), "dxf_dir": dxf_show, "vk4_dirs": vk4_dirs}
     if args.rollup_only:
         records = _records_from_disk(plan, out_dir)
         panels = []

@@ -78,7 +78,10 @@ ApplicationWindow {
         if (root.mode === 0)
             bridge.run(sampleCombo.currentText, root.values())
         else if (root.mode === 1)
-            bridge.runRow(vk4Field.text, dxfField.text, root.currentRow(), mapField.text)
+            bridge.runRow(vk4Field.text,
+                          root.dxfFiles.length > 0 ? root.dxfFiles
+                                                   : (dxfField.text ? [dxfField.text] : []),
+                          root.currentRow(), mapField.text)
         else
             bridge.runCalibration(targetsField.text, root.calibrationPicks,
                                   bandsArea.text, legacyQcBox.checked, root.cellSpecs)
@@ -88,6 +91,10 @@ ApplicationWindow {
     // Set from the command line so a sample can be opened directly.
     property string initialSample: ""
     property int initialTab: -1
+    // DXF drawings chosen for a wafer-row run. dxfField.text stays the primary (single) path that
+    // Sample mode uses; this list carries the full multi-selection row mode passes as its candidate
+    // pool. Kept in sync by dxfDialog, applySample and manual edits to the field.
+    property var dxfFiles: []
     onInitialTabChanged: if (initialTab >= 0) tabs.currentIndex = initialTab
     onInitialSampleChanged: {
         var index = bridge.sampleNames.indexOf(initialSample)
@@ -111,6 +118,7 @@ ApplicationWindow {
         if (!info.ok)
             return
         dxfField.text = info.dxf
+        root.dxfFiles = info.dxf ? [info.dxf] : []
         vk4Field.text = info.vk4_dir
         csvArea.text = info.csv_text
         radialArea.text = info.radial_text
@@ -120,9 +128,16 @@ ApplicationWindow {
 
     FileDialog {
         id: dxfDialog
-        title: "Select DXF"
+        title: "Select DXF drawing(s)"
+        fileMode: FileDialog.OpenFiles
         nameFilters: ["DXF (*.dxf)", "All files (*)"]
-        onAccepted: dxfField.text = selectedFile.toString().replace("file:///", "")
+        onAccepted: {
+            var paths = []
+            for (var i = 0; i < selectedFiles.length; i++)
+                paths.push(selectedFiles[i].toString().replace("file:///", ""))
+            root.dxfFiles = paths
+            dxfField.text = paths.length > 0 ? paths[0] : ""
+        }
     }
     FolderDialog {
         id: vk4Dialog
@@ -321,8 +336,21 @@ ApplicationWindow {
                             placeholderText: "No DXF selected"
                             font.family: theme.face
                             font.pixelSize: 12
+                            // A hand-typed path is a single selection; resync so it isn't shadowed
+                            // by a stale multi-pick. Fires on user edits only, not on text = ...
+                            onTextEdited: root.dxfFiles = text ? [text] : []
                         }
                         Button { text: "Browse"; onClicked: dxfDialog.open() }
+                    }
+                    Label {
+                        visible: root.isRowMode
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        text: root.dxfFiles.length > 1
+                              ? root.dxfFiles.length + " DXF drawings selected for the row"
+                              : "Row mode: in Browse, Ctrl/Shift-click to pick every drawing the row uses"
+                        color: theme.textTertiary
+                        font.family: theme.face; font.pixelSize: 11
                     }
                     Label {
                         text: "VK4 tile folder"; color: theme.textSecond

@@ -221,8 +221,8 @@ class Bridge(QObject):
         tag = date_tag_from_names([f.name for f in Path(vk4_dir).rglob("*.vk4")]) or ""
         return ui_shared._safe_name(row_out_name(tag, row))
 
-    @Slot(str, str, int, str)
-    def runRow(self, vk4_dir: str, dxf: str, row: int, map_override: str) -> None:
+    @Slot(str, "QStringList", int, str)
+    def runRow(self, vk4_dir: str, dxfs, row: int, map_override: str) -> None:
         if self._process is not None and self._process.state() != QProcess.NotRunning:
             return
         if not row:
@@ -257,8 +257,15 @@ class Bridge(QObject):
 
         arguments = ["-u", str(HERE / ui_shared.ROW_SCRIPT), "--row", str(row),
                      "--map", info["mapPath"], "--vk4", str(vk4_dir), "--out", str(out_dir)]
-        if dxf and Path(dxf).is_file():
-            arguments += ["--dxf-dir", str(Path(dxf).parent)]
+        dxf_files = [d for d in (dxfs or []) if d and Path(d).is_file()]
+        if len(dxf_files) == 1:
+            # One drawing picked: keep the whole folder as the candidate pool (the shipped
+            # behaviour), so a multi-geometry row still finds every drawing it needs by content.
+            arguments += ["--dxf-dir", str(Path(dxf_files[0]).parent)]
+        elif dxf_files:
+            # Several drawings picked: pass exactly those as the pool -- no stray or unreadable DXFs
+            # from other wafer generations can slip in. This is the reliable path the UI now offers.
+            arguments += ["--dxf-dir", *[str(Path(d)) for d in dxf_files]]
         self._launch(arguments, f"row {row} into {name}", figures_for=name)
 
     # ------------------------------------------------------- depth calibration

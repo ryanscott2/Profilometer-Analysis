@@ -1787,6 +1787,23 @@ def main():
         ck.check(any("TRIANGULAR" in w and "square" in w
                      for w in rr.resolve_dxfs(_lf, {("D50 P100", "square")})[2]),
                  "#25D a filename claiming TRIANGULAR over a square drawing IS warned about")
+        # index_dxf_dir also takes a LIST of individual files and/or folders (row-mode multi-select),
+        # so the exact drawings a row uses can be named instead of a whole folder.
+        _pf, _pfprob = rr.index_dxf_dir([_dxfdir / "072326 D50 P100 TRIANGULAR.dxf",
+                                         _dxfdir / "D100_P150_1cm2.dxf"])
+        ck.check(not _pfprob and {f.name for f in _pf}
+                 == {"072326 D50 P100 TRIANGULAR.dxf", "D100_P150_1cm2.dxf"},
+                 "#25D a list of individual .dxf files indexes exactly those drawings")
+        _mixf, _ = rr.index_dxf_dir([_dxfdir / "D50_P100_1cm2.dxf", _dxfdir])
+        ck.check(len(_mixf) == len(_facts) == 8,
+                 f"#25D a file also reachable through a listed folder is deduped, not doubled "
+                 f"(got {len(_mixf)})")
+        (_scratch / "notes.txt").write_text("not a drawing\n", encoding="utf-8")
+        _bf, _bfprob = rr.index_dxf_dir([_dxfdir / "D50_P100_1cm2.dxf", _scratch / "notes.txt",
+                                         _scratch / "missing.dxf"])
+        ck.check(len(_bf) == 1 and any("not a .dxf" in p for p in _bfprob)
+                 and any("not found" in p for p in _bfprob),
+                 "#25D a non-.dxf file and a missing path are reported; valid drawings still indexed")
 
         # ---- E. plan composition ----
         _rnames = [f"072230_PFLMTIM_D{d}_{c}{r}_{s}.vk4"
