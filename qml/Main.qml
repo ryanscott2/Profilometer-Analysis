@@ -624,6 +624,20 @@ ApplicationWindow {
                                 font.weight: Font.DemiBold; font.letterSpacing: 0.6
                             }
                             Item { Layout.fillWidth: true }
+                            Button {
+                                // Toggle: pick every candidate, or clear back to "all results".
+                                text: (poolList.count > 0
+                                       && root.calibrationPicks.length >= poolList.count)
+                                      ? "Clear" : "Select all"
+                                font.family: theme.face; font.pixelSize: 11
+                                onClicked: {
+                                    if (poolList.count > 0
+                                        && root.calibrationPicks.length >= poolList.count)
+                                        root.calibrationPicks = []
+                                    else
+                                        root.calibrationPicks = bridge.calibrationCandidates()
+                                }
+                            }
                             Label {
                                 text: root.calibrationPicks.length === 0
                                       ? "all results" : root.calibrationPicks.length + " picked"
