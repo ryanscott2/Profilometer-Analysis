@@ -19,8 +19,9 @@ VK4 filenames carry a compact ``_{col}{row}_`` token before the snapshot label::
     072230_PFLMTIM_D50_11_Center.vk4     -> col 1, row 1, snapshot 'Center'
     072230_PFLMTIM_D50_13_TopLeft.vk4    -> col 1, row 3, snapshot 'TopLeft'
 
-FIRST digit is the column, SECOND is the row. An explicit ``C{col}R{row}`` token is also accepted
-so the scheme survives a wafer wider than nine columns.
+FIRST digit is the column, SECOND is the row. An explicit ``C{col}R{row}`` token -- or its row-first
+spelling ``R{row}C{col}`` (e.g. ``081326_PFLMTIM_R2C1_Center.vk4`` -> col 1, row 2) -- is also
+accepted, so the scheme survives a wafer wider than nine columns and reads either labelling habit.
 
 ``csv/wafer_map.csv`` declares, per (row, col): the laser dose, the pin geometry and the lattice.
 Geometry is declared PER LINE and never inferred -- on this wafer the column->geometry pairing
@@ -169,6 +170,7 @@ def parse_skip(text):
 # ------------------------------------------------------------ VK4 filename grammar #
 _RASTER_RE = re.compile(r"_Y\d+_X\d+$", re.IGNORECASE)      # mirrors run_sample._RASTER_RE
 _CR_EXPLICIT = re.compile(r"^C(\d+)R(\d+)$", re.IGNORECASE)
+_RC_EXPLICIT = re.compile(r"^R(\d+)C(\d+)$", re.IGNORECASE)  # same token, row-first spelling
 _CR_COMPACT = re.compile(r"^(\d)(\d)$")
 _D_TOKEN = re.compile(r"^D(\d+)$", re.IGNORECASE)
 
@@ -182,7 +184,8 @@ def parse_sample_id(stem):
     A candidate token must sit at index > 0 (so a leading date is never one) and must NOT be the
     last token (the last token is always the snapshot label -- ``'..._D50_11'`` is genuinely
     ambiguous, since run_sample's own ``_label_from_name`` would call that ``11`` the label).
-    An explicit ``C{col}R{row}`` token wins outright. Zero candidates, or more than one, -> None.
+    An explicit ``C{col}R{row}`` token -- or its row-first spelling ``R{row}C{col}`` -- wins
+    outright. Zero candidates, or more than one, -> None.
     """
     stem = Path(str(stem)).stem if str(stem).lower().endswith(".vk4") else str(stem)
     if _RASTER_RE.search(stem):
@@ -195,6 +198,10 @@ def parse_sample_id(stem):
         m = _CR_EXPLICIT.match(tok)
         if m:
             explicit.append((i, int(m.group(1)), int(m.group(2))))
+            continue
+        m = _RC_EXPLICIT.match(tok)                          # row-first spelling: R{row}C{col}
+        if m:
+            explicit.append((i, int(m.group(2)), int(m.group(1))))
             continue
         m = _CR_COMPACT.match(tok)
         if m:
@@ -244,7 +251,8 @@ def group_snapshots(names, row):
             continue
         parsed = parse_sample_id(stem)
         if parsed is None:
-            unparsed.append((name, "no unambiguous _{col}{row}_ (or C{col}R{row}) token"))
+            unparsed.append((name, "no unambiguous _{col}{row}_ (or C{col}R{row} / R{row}C{col}) "
+                                   "token"))
             continue
         col, r, label = parsed
         if r != int(row):

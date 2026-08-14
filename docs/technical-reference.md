@@ -120,7 +120,9 @@ FIRST digit is the wafer column, the SECOND is the wafer row:
 072230_PFLMTIM_D50_13_TopLeft.vk4     -> col 1, row 3, snapshot 'TopLeft'
 ```
 
-An explicit `C{col}R{row}` token also works, for a wafer wider than nine columns. A stem with no
+An explicit `C{col}R{row}` token — or its row-first spelling `R{row}C{col}` (e.g.
+`081326_PFLMTIM_R2C1_Center.vk4` → col 1, row 2) — also works, for a wafer wider than nine columns
+and either labelling habit. A stem with no
 unambiguous token is never guessed at — it is listed as unparsed and blocks the run until it is
 renamed or `--allow-unparsed` is given.
 

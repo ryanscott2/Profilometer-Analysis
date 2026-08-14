@@ -703,8 +703,9 @@ def build_parser():
     ap = argparse.ArgumentParser(
         prog="run_row.py",
         description="Analyze every sample of one wafer row, then roll them up.")
-    ap.add_argument("--row", type=int, required=True, help="wafer row number (the SECOND digit of "
-                                                           "the _{col}{row}_ token in the VK4 names)")
+    ap.add_argument("--row", type=int, required=True,
+                    help="wafer row number (the ROW of the VK4 names' _{col}{row}_ / C{col}R{row} / "
+                         "R{row}C{col} token)")
     ap.add_argument("--map", default="", help=f"wafer map CSV (default: search the VK4 folder, its "
                                               f"parent, then csv/{wm.DEFAULT_MAP_NAME})")
     ap.add_argument("--vk4", nargs="+", default=None,

@@ -1644,6 +1644,13 @@ def main():
                  "#25A no snapshot label / two candidates -> refuse, never guess")
         ck.check(wm.parse_sample_id("072230_PFLMTIM_D50_C10R2_Center") == (10, 2, "Center"),
                  "#25A explicit C{col}R{row} escape hatch survives a >9-column wafer")
+        ck.check(wm.parse_sample_id("081326_PFLMTIM_R2C1_Center") == (1, 2, "Center")
+                 and wm.parse_sample_id("081326_PFLMTIM_R2C10_Center") == (10, 2, "Center")
+                 and wm.parse_sample_id("081326_PFLMTIM_r2c1_Center") == (1, 2, "Center"),
+                 "#25A row-first R{row}C{col} spelling parses to the same (col, row), any case, "
+                 ">9 columns")
+        ck.check(wm.parse_sample_id("081326_X_R2C1_C1R2_Center") is None,
+                 "#25A two explicit C/R tokens (either spelling) are ambiguous -> refuse")
 
         # ---- B. grouping (pure, name-only) ----
         _names = [f"072230_PFLMTIM_D{d}_{c}{r}_{s}.vk4"
@@ -1668,6 +1675,13 @@ def main():
         _, _, _bad = wm.group_snapshots(["notes.vk4", "foo_Y1_X1.vk4", "a_XX_Center.vk4"], 1)
         ck.check(len(_bad) == 3 and all(r for _n, r in _bad),
                  "#25B untokened names / raster tiles land in 'unparsed' WITH a reason")
+        _rc = [f"081326_PFLMTIM_R2C{c}_Center.vk4" for c in range(1, 7)]
+        _rcby, _rcother, _rcunp = wm.group_snapshots(_rc, 2)
+        ck.check(sorted(_rcby) == [1, 2, 3, 4, 5, 6]
+                 and all(v == [(f"081326_PFLMTIM_R2C{c}_Center.vk4", "Center")]
+                         for c, v in _rcby.items())
+                 and not _rcother and not _rcunp,
+                 "#25B row-first R{row}C{col} names group into one sample per column, none unparsed")
 
         # ---- C. dose + wafer map ----
         ck.check(wm.parse_dose("S400_P25") == wm.parse_dose("P25_S400") == (25, 400.0, "P25_S400"),
