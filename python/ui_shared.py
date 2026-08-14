@@ -36,11 +36,13 @@ ROW_FIGURES_DIR = "row_figures"  # keep in sync with run_row.ROW_FIGURES_DIR
 CAL_OUT_NAME = "etch depth"
 MEAS_REL = Path("legacy") / "measurements.csv"
 
-# Prefilled band definitions (one band per line: min_Ø, max_Ø, pitch in µm). Matches the provided
-# 4x4 single-cell DXF: Ø 50–67.5 µm @100 µm pitch and Ø 100–125 µm @150 µm pitch. Editable; blank
-# (or comments only) tells calibrate_depth.py to fall back to the measurements' own 'band' column.
-DEFAULT_BAND_DEFS = ("50, 67.5, 100\n"
-                     "100, 125, 150\n")
+# Prefilled band definitions (one band per line: min_Ø, max_Ø, pitch in µm) — tight tolerance bands
+# around the three pin families on the test wafers: Ø ~50 µm @100 µm pitch, Ø ~100 µm @150 µm pitch
+# and Ø ~300 µm @350 µm pitch. Editable; blank (or comments only) tells calibrate_depth.py to fall
+# back to the measurements' own 'band' column.
+DEFAULT_BAND_DEFS = ("47.5, 52.5, 100\n"
+                     "95, 105, 150\n"
+                     "290, 310, 350\n")
 
 
 def _sample_name_collision(name, existing_names):

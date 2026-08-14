@@ -591,7 +591,7 @@ ApplicationWindow {
                             TextField {
                                 id: targetsField
                                 Layout.fillWidth: true
-                                text: "5"
+                                text: "55"
                                 placeholderText: "e.g. 5 or 3,5,8"
                                 font.family: theme.face
                                 font.pixelSize: 12

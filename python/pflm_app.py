@@ -276,12 +276,28 @@ class Bridge(QObject):
 
     @Slot(result=list)
     def calibrationCandidates(self) -> list:
-        """Result folders carrying the legacy measurements CSV the pool is built from."""
+        """Result entries the pool is built from, each carrying a legacy measurements CSV.
+
+        Mirrors calibrate_depth.discover_samples (keep in sync): a top-level result folder that
+        directly holds legacy/measurements.csv is one entry; a wafer-row CONTAINER (which has none
+        at the top) contributes its per-column samples one level deeper, named '<container>/<sample>'
+        -- exactly the names discover_samples pools and that --include/--exclude and cell filters
+        match on. Without this descent, row samples were pooled by an 'all results' run but could
+        never be individually picked."""
         root = ui_shared.DEF_OUT
         if not root.is_dir():
             return []
-        return sorted(entry.name for entry in root.iterdir()
-                      if entry.is_dir() and (entry / ui_shared.MEAS_REL).is_file())
+        out = []
+        for sub in sorted(p for p in root.iterdir()
+                          if p.is_dir() and not p.name.startswith(".")):
+            if (sub / ui_shared.MEAS_REL).is_file():
+                out.append(sub.name)
+            else:                                    # a wafer-row container -> one level deeper
+                out += [f"{sub.name}/{c.name}"
+                        for c in sorted(p for p in sub.iterdir()
+                                        if p.is_dir() and not p.name.startswith("."))
+                        if (c / ui_shared.MEAS_REL).is_file()]
+        return out
 
     @Slot(str, result=str)
     def validateCellSpec(self, spec: str) -> str:
