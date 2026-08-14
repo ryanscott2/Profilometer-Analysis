@@ -663,12 +663,21 @@ ApplicationWindow {
                                         font.family: theme.face
                                         font.pixelSize: 12
                                         Layout.fillWidth: true
+                                        // Bind to the pick set, not per-delegate state: the ListView
+                                        // recycles delegates while scrolling, so an unbound checkbox
+                                        // carries a stale checked state onto the reused row.
+                                        checked: root.calibrationPicks.indexOf(poolRow.modelData) >= 0
                                         onToggled: {
                                             var picks = root.calibrationPicks.slice()
                                             var at = picks.indexOf(poolRow.modelData)
                                             if (checked && at < 0) picks.push(poolRow.modelData)
                                             else if (!checked && at >= 0) picks.splice(at, 1)
                                             root.calibrationPicks = picks
+                                            // The click set `checked` imperatively, detaching the
+                                            // binding above; re-assert so recycling stays correct.
+                                            checked = Qt.binding(function() {
+                                                return root.calibrationPicks.indexOf(poolRow.modelData) >= 0
+                                            })
                                         }
                                     }
                                     TextField {
@@ -677,6 +686,11 @@ ApplicationWindow {
                                         placeholderText: "all cells"
                                         font.family: theme.mono
                                         font.pixelSize: 11
+                                        // Bind to the per-sample spec map for the same reason the
+                                        // checkbox does: recycled delegates must show THIS row's
+                                        // committed spec, not the one left over from a scrolled-away row.
+                                        text: root.cellSpecs[poolRow.modelData] !== undefined
+                                              ? root.cellSpecs[poolRow.modelData] : ""
                                         // Red while invalid, so a bad spec is visible before the run.
                                         color: bridge.validateCellSpec(text) === ""
                                                ? theme.textPrimary : theme.danger
@@ -684,8 +698,14 @@ ApplicationWindow {
                                             var problem = bridge.validateCellSpec(text)
                                             cellProblem.text = problem === "" ? ""
                                                 : poolRow.modelData + ": " + problem
-                                            if (problem === "")
+                                            if (problem === "") {
                                                 root.setCellSpec(poolRow.modelData, text.trim())
+                                                // Typing detached the binding above; re-assert it.
+                                                text = Qt.binding(function() {
+                                                    return root.cellSpecs[poolRow.modelData] !== undefined
+                                                           ? root.cellSpecs[poolRow.modelData] : ""
+                                                })
+                                            }
                                         }
                                     }
                                 }
