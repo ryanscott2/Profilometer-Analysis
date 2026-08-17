@@ -338,7 +338,8 @@ each sample's `legacy/measurements.csv`.
 python python/calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,65] \
                           [--results Results] [--out "results/etch depth"] \
                           [--bands band_defs.csv] [--cell-filters cells.json] \
-                          [--max-debris X] [--drop-shallow] [--allow-legacy-qc]
+                          [--max-debris X] [--drop-shallow] [--allow-legacy-qc] \
+                          [--speed 400] [--max-passes 50]
 ```
 
 - **Discovers** the samples (folders under `results/` with a `legacy/measurements.csv`), injects a
@@ -390,6 +391,13 @@ python python/calibrate_depth.py [--include A B] [--exclude C] [--targets 45,55,
   deliberately no model surface and no fitted contour: a colour field over the whole rectangle is a
   picture of depths nobody measured, and most of it would be extrapolation. Everything on that
   figure is a measurement; the fitted models and their caveats stay in `depth_calibration.txt`.
+- **Fixed-speed slice (opt-in)** — `--speed S` additionally writes `depth_vs_passes_s<S>.png`: etch
+  depth vs passes at that one scan speed, one series per pin band (labelled `Ø <nominal> µm, pitch
+  <p> µm`) with a per-band linear `depth ~ passes` trend fitted to the shown points and the target
+  depth(s) as a horizontal line. Holding speed constant collapses the passes×speed surface to a 1-D
+  slice you can read a target crossing straight off. `--max-passes N` clips both that figure's passes
+  axis **and** its trend fit at N passes (e.g. 50); omit it to show every passes value measured at
+  that speed. Emitted only when `--speed` is given, so default runs are byte-for-byte unchanged.
 
 **From the UI:** the *Depth calibration* panel (right column) lists the discovered samples
 (multi-select; none selected = all) in a two-column table — the sample name and an inline **cells**

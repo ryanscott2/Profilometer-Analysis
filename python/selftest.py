@@ -998,6 +998,38 @@ def main():
         ck.check(_family_keys == {(1, 150.0), (1, 350.0)},
                  "calibration: same local band number at different pitches remains separate")
 
+        # Fixed-speed depth-vs-passes figure (the folded-in --speed feature): the pin label reads
+        # 'Ø <nominal> µm, pitch <p> µm', the slice keeps only the requested speed, and a speed with
+        # no measured cell-band median writes nothing rather than an empty axes.
+        _bm_pins = {1: (47.5, 52.5, 100.0)}
+        _g_pins1 = pd.DataFrame({"speed": [400., 400., 400., 400., 800.],
+                                 "passes": [10, 20, 40, 80, 20],
+                                 "depth_um": [12., 25., 50., 95., 30.],
+                                 "drawn_diameter_um": [50.] * 5, "nominal_pitch_um": [100.] * 5})
+        _g_pins2 = pd.DataFrame({"speed": [400., 800., 800.],
+                                 "passes": [15, 30, 40],
+                                 "depth_um": [20., 55., 60.],
+                                 "drawn_diameter_um": [95., 100., 105.], "nominal_pitch_um": [150.] * 3})
+        ck.check(cd._fmt_band_pins(1, _g_pins1, _bm_pins) == "Ø 50 µm, pitch 100 µm",
+                 "calibration: _fmt_band_pins labels a user band by its midpoint Ø and its pitch")
+        ck.check(cd._fmt_band_pins(2, _g_pins2, None) == "Ø 95–105 µm, pitch 150 µm",
+                 "calibration: _fmt_band_pins falls back to the drawn Ø range present when no band defined")
+        _pb_pins = {1: {"g": _g_pins1, "label_pins": cd._fmt_band_pins(1, _g_pins1, _bm_pins)},
+                    2: {"g": _g_pins2, "label_pins": cd._fmt_band_pins(2, _g_pins2, None)}}
+        _tdf = Path(tempfile.mkdtemp())
+        try:
+            # band 1 has 3 passes ≤ 50 at 400 mm/s (P80 clipped) -> a trend; band 2 has a single
+            # 400 mm/s point -> scatter only, no trend, must not raise.
+            cd.fig_depth_vs_passes(_tdf, _pb_pins, [55.0], 400.0, max_passes=50)
+            ck.check((_tdf / "depth_vs_passes_s400.png").is_file(),
+                     "calibration: --speed writes depth_vs_passes_s<speed>.png (mixed single/multi-point bands)")
+            _seen = {p.name for p in _tdf.iterdir()}
+            cd.fig_depth_vs_passes(_tdf, _pb_pins, [55.0], 999.0)
+            ck.check({p.name for p in _tdf.iterdir()} == _seen,
+                     "calibration: --speed writes nothing when no cell-band median has that speed")
+        finally:
+            shutil.rmtree(_tdf, ignore_errors=True)
+
         # The passes×speed FAMILY is preferred over the dose forms even when a dose form has the
         # lower AICc -- depth does not collapse to dose = passes/speed. Within that family the
         # interaction TERM is kept only when it is itself supported: adj-R² scores the whole fit,

@@ -21,9 +21,10 @@ Usage:
     python python/calibrate_depth.py --include A,B --targets 45,55,65
     python python/calibrate_depth.py --results results --out results/_depth_calibration --exclude bad_run
     python python/calibrate_depth.py --cell-filters cells.json        # keep/drop cell_ids per sample
+    python python/calibrate_depth.py --speed 400 --max-passes 50      # + depth-vs-passes slice at 400 mm/s
 
 Deliverables (under --out):  depth_calibration.txt, depth_vs_passes_speed_3d.png, depth_vs_dose.png,
-depth_parity.png, depth_heatmap.png.
+depth_parity.png, depth_heatmap.png  (+ depth_vs_passes_s<speed>.png when --speed is given).
 """
 from __future__ import annotations
 
@@ -718,11 +719,14 @@ def _predict(R, dose=None, passes=None, speed=None):
 def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude=None,
                     targets=(DEF_TARGET_UM,), max_debris=DEF_MAX_DEBRIS, drop_shallow=False,
                     alpha=0.05, band_defs_path=None, cell_filters=None,
-                    allow_legacy_qc=False):
+                    allow_legacy_qc=False, speed=None, max_passes=None):
     """Full calibration: discover -> pool -> gate -> (optionally re-bin into user bands) -> per-band
     fits + pooled MixedLM -> write depth_calibration.txt + the three figures. When ``band_defs_path``
     names a band-definitions file, rows are re-binned by drawn Ø into those bands; otherwise the
-    measurements ``band`` column is used. Returns the per-band result dict (for tests)."""
+    measurements ``band`` column is used. When ``speed`` is given, additionally writes
+    depth_vs_passes_s<speed>.png -- a fixed-speed depth-vs-passes scatter with a per-band linear
+    trend (``max_passes`` optionally clips that figure's passes axis and its trend fit). Returns the
+    per-band result dict (for tests)."""
     results_dir = Path(results_dir)
     out_dir = Path(out_dir) if out_dir else results_dir / OUT_NAME
     targets = list(dict.fromkeys(float(t) for t in targets))   # de-dupe, preserve order
@@ -776,7 +780,8 @@ def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude
         mixed = fit_mixedlm(g, alpha=alpha)
         per_band[b] = dict(g=g, sat=sat, logd=logd, inter=inter, addit=addit, rec_key=rec_key,
                            rec_why=rec_why, mixed=mixed, label=_fmt_band(b, g, band_meta),
-                           label_short=_fmt_band_short(b, g, band_meta))
+                           label_short=_fmt_band_short(b, g, band_meta),
+                           label_pins=_fmt_band_pins(b, g, band_meta))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     write_report(out_dir, samples, gate_rep, units, per_band, targets, alpha,
@@ -789,6 +794,11 @@ def calibrate_depth(results_dir=DEF_RESULTS, out_dir=None, include=None, exclude
             fn(out_dir, per_band, targets)
         except Exception as e:                           # pragma: no cover - defensive
             print(f"WARNING: {fn.__name__} failed ({e}); other outputs are unaffected.")
+    if speed is not None:                                # opt-in fixed-speed depth-vs-passes slice
+        try:
+            fig_depth_vs_passes(out_dir, per_band, targets, speed, max_passes=max_passes)
+        except Exception as e:                           # pragma: no cover - defensive
+            print(f"WARNING: fig_depth_vs_passes failed ({e}); other outputs are unaffected.")
     print(f"\nWrote depth calibration -> {out_dir}")
     return per_band
 
@@ -843,6 +853,23 @@ def _fmt_band_short(b, g, band_meta=None):
         pitch = (g["nominal_pitch_um"].dropna().iloc[0]
                  if g["nominal_pitch_um"].notna().any() else float("nan"))
     return f"Ø {dlbl} µm pins, {pitch:g} µm pitch"
+
+
+def _fmt_band_pins(b, g, band_meta=None):
+    """Legend form for the fixed-speed figure: ``Ø 50 µm, pitch 100 µm``.
+
+    Same nominal rule as :func:`_fmt_band_short` (user-band midpoint, else the drawn-Ø range present),
+    only re-ordered to lead with diameter and read as a plain 'diameter, pitch' pair."""
+    source_band = b[0] if isinstance(b, tuple) else b
+    if band_meta and source_band in band_meta:
+        dmin, dmax, pitch = band_meta[source_band]
+        dlbl = f"{0.5 * (dmin + dmax):g}"
+    else:
+        ds = sorted(g["drawn_diameter_um"].dropna().unique())
+        dlbl = f"{ds[0]:g}–{ds[-1]:g}" if ds else "?"
+        pitch = (g["nominal_pitch_um"].dropna().iloc[0]
+                 if g["nominal_pitch_um"].notna().any() else float("nan"))
+    return f"Ø {dlbl} µm, pitch {pitch:g} µm"
 
 
 def _short_band(b):
@@ -1205,6 +1232,59 @@ def fig_heatmap(out_dir, per_band, targets):
     print(f"Wrote {p}  ({n_on} cell-band median(s) inside the target window)")
 
 
+def fig_depth_vs_passes(out_dir, per_band, targets, speed, max_passes=None):
+    """Depth vs passes at ONE scan speed, one series per pin band, each with a linear trend.
+
+    A fixed-speed companion to the passes×speed views (fig_depth_3d / fig_heatmap): holding speed
+    constant collapses the surface to a 1-D slice you can read a target crossing straight off.
+    Points are the cell-band medians measured at ``speed``; the line is an OLS depth~passes fit to the
+    points shown (so ``max_passes`` bounds the fit as well as the axis). Bands keep the same colour
+    order as every other figure. Emitted only when the driver is given a ``speed``."""
+    cmap = plt.get_cmap("tab10")
+    series = []
+    for i, (b, R) in enumerate(per_band.items()):
+        g = R["g"]
+        sub = g[np.isclose(g["speed"].to_numpy(float), float(speed))]
+        if max_passes is not None:
+            sub = sub[sub["passes"] <= float(max_passes)]
+        x = sub["passes"].to_numpy(float); y = sub["depth_um"].to_numpy(float)
+        fin = np.isfinite(x) & np.isfinite(y)
+        if fin.any():
+            series.append((cmap(i % 10), R["label_pins"], x[fin], y[fin]))
+    if not series:
+        print(f"No cell-band medians at speed {speed:g} mm/s -> skipping depth-vs-passes figure.")
+        return
+    levels = sorted({float(t) for t in targets})
+    fig, ax = plt.subplots(figsize=(9.5, 6.2))
+    for t in levels:                                     # target line(s) first -> lead the legend
+        ax.axhline(t, color="crimson", ls="--", lw=1.3, zorder=1,
+                   label=("Target depth" if len(levels) == 1 else f"target {t:g} µm"))
+    all_x = []
+    for color, label, x, y in series:
+        all_x.append(x)
+        ax.scatter(x, y, s=58, color=color, alpha=0.80, edgecolors="white",
+                   linewidths=0.6, zorder=3, label=label)
+        if np.unique(x).size >= 2:                       # per-band OLS depth ~ passes (shown points)
+            slope, intercept = np.polyfit(x, y, 1)
+            xx = np.linspace(float(x.min()), float(x.max()), 50)
+            ax.plot(xx, slope * xx + intercept, "-", color=color, lw=2.0, zorder=2)
+    allx = np.concatenate(all_x)
+    if max_passes is not None:                           # clip to the requested passes window
+        ax.set_xlim(float(allx.min()) - 1.0, float(max_passes) + 1.0)
+    else:
+        ax.margins(x=0.05)
+    ax.set_xlabel("Passes", fontsize=fs.LABEL)
+    ax.set_ylabel("Measured depth (µm)", fontsize=fs.LABEL)
+    ax.set_title("Etch depth vs Passes", fontsize=fs.TITLE)
+    ax.tick_params(labelsize=fs.TICK)
+    ax.grid(alpha=0.3, zorder=0)
+    ax.legend(fontsize=fs.LEGEND_SM, framealpha=0.9, loc="upper left")
+    fig.tight_layout()
+    p = out_dir / f"depth_vs_passes_s{speed:g}.png"
+    fig.savefig(p, dpi=170, bbox_inches="tight"); plt.close(fig)
+    print(f"Wrote {p}  ({len(series)} band series at {speed:g} mm/s)")
+
+
 # ========================================================================= CLI == #
 def _csv_list(s):
     return [x.strip() for x in str(s).split(",") if x.strip()]
@@ -1227,6 +1307,12 @@ def main(argv=None):
     ap.add_argument("--exclude", nargs="*", default=None, help="sample folder names to exclude")
     ap.add_argument("--targets", type=lambda s: [float(x) for x in _csv_list(s)], default=[DEF_TARGET_UM],
                     help="target depth(s) in µm, comma-separated (default 55)")
+    ap.add_argument("--speed", type=float, default=None,
+                    help="also write depth_vs_passes_s<speed>.png: a depth-vs-passes scatter with a "
+                    "per-band linear trend at this one scan speed (mm/s). Omit to skip that figure.")
+    ap.add_argument("--max-passes", type=float, default=None,
+                    help="clip the --speed figure's passes axis AND its trend fit at this many "
+                    "passes (e.g. 50); omit to show every passes value measured at that speed.")
     ap.add_argument("--max-debris", type=float, default=DEF_MAX_DEBRIS,
                     help="drop rows with debris_fraction above this (default: off -- no debris gate)")
     ap.add_argument("--drop-shallow", action="store_true", help="also drop 'shallow' (<3 µm) rows")
@@ -1250,7 +1336,8 @@ def main(argv=None):
     calibrate_depth(results_dir=args.results, out_dir=args.out, include=args.include,
                     exclude=args.exclude, targets=args.targets, max_debris=args.max_debris,
                     drop_shallow=args.drop_shallow, alpha=args.alpha, band_defs_path=args.bands,
-                    cell_filters=cell_filters, allow_legacy_qc=args.allow_legacy_qc)
+                    cell_filters=cell_filters, allow_legacy_qc=args.allow_legacy_qc,
+                    speed=args.speed, max_passes=args.max_passes)
 
 
 if __name__ == "__main__":
