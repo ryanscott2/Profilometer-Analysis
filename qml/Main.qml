@@ -84,7 +84,8 @@ ApplicationWindow {
                           root.currentRow(), mapField.text)
         else
             bridge.runCalibration(targetsField.text, root.calibrationPicks,
-                                  bandsArea.text, legacyQcBox.checked, root.cellSpecs)
+                                  bandsArea.text, legacyQcBox.checked, root.cellSpecs,
+                                  speedField.text, maxPassesField.text)
     }
 
     Component.onCompleted: bandsArea.text = bridge.defaultBands()
@@ -600,6 +601,48 @@ ApplicationWindow {
                                 text: "um"; color: theme.textTertiary
                                 font.family: theme.face; font.pixelSize: 12
                             }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+                            Label {
+                                text: "Speed"; color: theme.textSecond
+                                font.family: theme.face; font.pixelSize: 13
+                            }
+                            TextField {
+                                id: speedField
+                                Layout.fillWidth: true
+                                placeholderText: "off - e.g. 400"
+                                font.family: theme.face
+                                font.pixelSize: 12
+                            }
+                            Label {
+                                text: "mm/s"; color: theme.textTertiary
+                                font.family: theme.face; font.pixelSize: 12
+                            }
+                        }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+                            Label {
+                                text: "Max passes"; color: theme.textSecond
+                                font.family: theme.face; font.pixelSize: 13
+                            }
+                            TextField {
+                                id: maxPassesField
+                                Layout.fillWidth: true
+                                placeholderText: "all"
+                                font.family: theme.face
+                                font.pixelSize: 12
+                            }
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: "Speed adds a depth-vs-passes figure at that one scan speed "
+                                  + "(blank = skip); max passes clips its axis and trend."
+                            color: theme.textTertiary
+                            font.family: theme.face; font.pixelSize: 11
+                            wrapMode: Text.WordWrap
                         }
                         CheckBox { id: legacyQcBox; text: "Allow legacy QC rows" }
                     }

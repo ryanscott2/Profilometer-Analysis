@@ -319,9 +319,10 @@ class Bridge(QObject):
             return str(exc)
         return ""
 
-    @Slot(str, list, str, bool, "QVariantMap")
+    @Slot(str, list, str, bool, "QVariantMap", str, str)
     def runCalibration(self, targets: str, include: list, bands_text: str,
-                       allow_legacy_qc: bool, cell_filters) -> None:
+                       allow_legacy_qc: bool, cell_filters, speed: str = "",
+                       max_passes: str = "") -> None:
         if self._process is not None and self._process.state() != QProcess.NotRunning:
             return
         try:
@@ -332,11 +333,35 @@ class Bridge(QObject):
         if not values:
             self._set_status("Give at least one target depth.")
             return
+        # Optional fixed-speed depth-vs-passes slice. Both fields blank -> no --speed passed -> the
+        # figure is not produced (the CLI default), so an ordinary calibration is unchanged.
+        speed_val = str(speed).strip()
+        if speed_val:
+            try:
+                sp = float(speed_val)
+                if not sp > 0:
+                    raise ValueError
+            except ValueError:
+                self._set_status(f"Scan speed must be a positive number, got '{speed}'.")
+                return
+        max_passes_val = str(max_passes).strip()
+        if max_passes_val:
+            try:
+                mp = float(max_passes_val)
+                if not mp > 0:
+                    raise ValueError
+            except ValueError:
+                self._set_status(f"Max passes must be a positive number, got '{max_passes}'.")
+                return
 
         out_dir = ui_shared.DEF_OUT / ui_shared.CAL_OUT_NAME
         arguments = ["-u", str(HERE / ui_shared.CAL_SCRIPT),
                      "--results", str(ui_shared.DEF_OUT), "--out", str(out_dir),
                      "--targets", ",".join(f"{v:g}" for v in values)]
+        if speed_val:
+            arguments += ["--speed", f"{sp:g}"]
+            if max_passes_val:                           # --max-passes only affects the --speed figure
+                arguments += ["--max-passes", f"{mp:g}"]
         if allow_legacy_qc:
             arguments.append("--allow-legacy-qc")
         # A strict subset restricts the pool; all or none pools everything.
