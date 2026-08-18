@@ -1547,6 +1547,14 @@ def main():
             import matplotlib.image as _mpimg
             _w3 = _mpimg.imread(_td3 / "a.png").shape[1]
             ck.check(_w3 >= 2500, f"#23F 3D height map is written at presentation size ({_w3} px wide)")
+            from run_sample import save_pin_profile, _pin_row_slice
+            _a1sq, _a2sq = _pin_row_slice(_marr)
+            ck.check(abs(_a1sq[1]) < 1e-6 and abs(_a2sq[0]) < 1e-6,
+                     "#23F square lattice: z-profile slices along the axis-aligned pin row (a1)")
+            ck.check(bool(save_pin_profile(_corner, _tp[0], _mcell, _marr, _td3 / "prof.png",
+                                           param_label="Passes: 35\nSpeed: 400 mm/s"))
+                     and (_td3 / "prof.png").is_file(),
+                     "#23F z-profile companion renders to a file")
         finally:
             shutil.rmtree(_td3, ignore_errors=True)
     except Exception as e:                                   # pragma: no cover
@@ -1587,6 +1595,11 @@ def main():
                      and max(abs(s - _pitch) for s in _steps) <= 1e-3
                      and abs(_arr.pitch_um - _pitch) <= 1e-6,
                      f"#24 {_name}: oblique (triangular) primitive basis, NN pitch {_pitch:g} um")
+            from run_sample import _pin_row_slice
+            _a1t, _a2t = _pin_row_slice(_arr)
+            ck.check(np.allclose(_a1t, _lv[0]) and np.allclose(_a2t, _lv[1]),
+                     f"#24 {_name}: z-profile slices along the fitted NN row a1 (the oblique pin "
+                     f"row, not an image axis)")
 
             _scale = 10.0
             _org = (60.0, 60.0)
@@ -1606,6 +1619,16 @@ def main():
                              abs(_fp[0].origin_row - _org[1])) <= 1.5
                          and abs(_fp[0].rotation_deg - _ang) <= 0.05,
                          f"#24 {_name}: absolute origin + {_ang:g} deg rotation recovered")
+            if _fp and _dia == 50.0:                     # end-to-end z-profile on a real oblique lattice
+                import tempfile as _tf, shutil as _sh
+                from run_sample import save_pin_profile as _spp
+                _tdp = Path(_tf.mkdtemp())
+                try:
+                    ck.check(bool(_spp(_full, _fp[0], _cell, _arr, _tdp / "tri_profile.png"))
+                             and (_tdp / "tri_profile.png").is_file(),
+                             f"#24 {_name}: z-profile renders along the oblique NN row")
+                finally:
+                    _sh.rmtree(_tdp, ignore_errors=True)
 
             # (B) deep-interior FOV crop -> phase-only lock (position not absolute), yet the visible
             # pins still yield accurate diameter/depth via the aligned oblique lattice.

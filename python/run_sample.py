@@ -1268,24 +1268,120 @@ def save_3d_pin_map(scan, placement, template, array, path, *, res_um=2.0, block
     return True
 
 
+def _pin_row_slice(array):
+    """Primitive lattice vectors ``(a1, a2)`` (design µm) for the z-profile slice.
+
+    ``a1`` is the nearest-neighbour pin-row direction the profile is taken along: horizontal for a
+    square lattice (``[[px,0],[0,py]]``), the close-packed row for a triangular/hex one. Reads the
+    array's fitted ``lattice_vectors`` (always populated by dxf_geometry), falling back to the
+    axis-aligned pitch basis for any array that carries none."""
+    lv = getattr(array, "lattice_vectors", None)
+    if lv is not None:
+        lv = np.asarray(lv, float)
+    if lv is None or lv.shape != (2, 2) or not np.isfinite(lv).all() or not np.hypot(*lv[0]) > 0:
+        px = array.pitch_x_um if np.isfinite(array.pitch_x_um) and array.pitch_x_um > 0 else 1.0
+        py = array.pitch_y_um if np.isfinite(array.pitch_y_um) and array.pitch_y_um > 0 else 1.0
+        return np.array([px, 0.0]), np.array([0.0, py])
+    return lv[0].copy(), lv[1].copy()
+
+
+def save_pin_profile(scan, placement, template, array, path, *, res_um=2.0, block=5, param_label=""):
+    """Render the z-profile line-plot companion to :func:`save_3d_pin_map` -- a height cut taken
+    along the nearest-neighbour pin row (primitive ``a1``) through the centre pin of ``array``.
+
+    Uses the SAME design-oriented, floor-referenced height field and centre ``block``x``block`` as
+    the 3D map, then slices along ``a1`` so the cut runs through adjacent pin centres for a square OR
+    a hex/triangular lattice (see :func:`_pin_row_slice`). Each pin the row crosses is marked. Height
+    is interpolated bilinearly along the line. Returns True if written, False when too little of the
+    block is in frame (the same gate as the 3D map). Presentation-styled to sit beside that map."""
+    box = _center_block_box(scan, placement, array, block=block)
+    if box is None:
+        return False
+    valid = scan.height_raw != 0
+    z, ext = _resample_cell(scan.height_um, placement, template, valid, res_um=res_um, box=box)
+    if not np.isfinite(z).any():
+        return False
+    z = z - np.nanpercentile(z, 20)                      # local trench floor -> 0 (as the 3D map)
+    zf = np.nan_to_num(z, nan=0.0)
+    x0, x1, y0, y1 = ext
+    ny, nx = z.shape
+
+    a1, a2 = _pin_row_slice(array)
+    u = a1 / float(np.hypot(*a1))                        # unit slice direction
+
+    # Centre pin: the in-box pin nearest the box centre (the block is built around a pin centre).
+    allc = array.centers_um
+    inbox = ((allc[:, 0] >= x0) & (allc[:, 0] <= x1)
+             & (allc[:, 1] >= y0) & (allc[:, 1] <= y1))
+    pins = allc[inbox]
+    ctr = np.array([0.5 * (x0 + x1), 0.5 * (y0 + y1)])
+    centre = (pins[int(np.argmin(np.hypot(pins[:, 0] - ctr[0], pins[:, 1] - ctr[1])))]
+              if len(pins) else ctr)
+
+    # Sample the height field along centre + t*u, keeping the part inside the resampled grid.
+    L = 0.5 * float(np.hypot(x1 - x0, y1 - y0)) + float(max(array.pitch_x_um, array.pitch_y_um))
+    t = np.linspace(-L, L, 900)
+    fi = (centre[0] + t * u[0] - x0) / res_um - 0.5      # fractional col/row (cell-centre convention)
+    fj = (centre[1] + t * u[1] - y0) / res_um - 0.5
+    keep = (fi >= 0) & (fi <= nx - 1) & (fj >= 0) & (fj <= ny - 1)
+    t, fi, fj = t[keep], fi[keep], fj[keep]
+    if t.size < 8:
+        return False
+    from scipy.ndimage import map_coordinates
+    h = map_coordinates(zf, np.vstack([fj, fi]), order=1, mode="nearest")
+
+    # Pins the a1-row crosses: those with ~zero a2-index off the centre pin (j ~ 0), for tick marks.
+    try:
+        ij = np.linalg.solve(np.column_stack([a1, a2]), (pins - centre).T).T
+        row_t = np.sort((pins[np.abs(ij[:, 1]) < 0.25] - centre) @ u)
+    except np.linalg.LinAlgError:                        # pragma: no cover - a1||a2 never happens
+        row_t = np.array([0.0])
+
+    fig, ax = plt.subplots(figsize=(9.2, 4.4))
+    ax.axhline(0, color="0.6", lw=1.0, zorder=1)         # trench-floor reference
+    for rt in np.atleast_1d(row_t):                      # a mark at each pin centre the row crosses
+        ax.axvline(float(rt), color="crimson", ls=":", lw=1.0, alpha=0.7, zorder=2)
+    ax.plot(t, h, "-", color="#1f77b4", lw=2.0, zorder=3)
+    ax.set_xlabel("Distance (µm)", fontsize=fs.LABEL)
+    ax.set_ylabel("Height (µm)", fontsize=fs.LABEL)
+    ax.set_title(f"Z profile — Ø {array.diameter_um:g}, pitch {array.pitch_um:g}",
+                 fontsize=fs.HEADLINE)
+    ax.tick_params(labelsize=fs.TICK)
+    ax.grid(alpha=0.3, zorder=0)
+    ax.margins(x=0.02)
+    ax.set_ylim(bottom=min(0.0, float(np.nanmin(h))))
+    if param_label:                                      # laser-parameter info box, matching the map
+        ax.text(0.02, 0.97, param_label, transform=ax.transAxes, fontsize=fs.OVERLAY,
+                va="top", ha="left",
+                bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="0.5", alpha=0.9))
+    fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=200, bbox_inches="tight"); plt.close(fig)
+    return True
+
+
 def write_3d_pin_maps(figures_dir, items, template, *, res_um=2.0):
     """Write a 3D centre-5x5 height map per array for each item into ``figures_dir/3D height map/``.
 
     ``items`` : list of ``(subdir, scan, placement, param_label)`` -- ``subdir`` is a per-cell /
     per-snapshot folder name (e.g. ``cell_x2_y1`` or ``Center``), or ``None`` to write straight into
     the root (single cell); ``param_label`` is the laser-parameter string shown in a top-left info
-    box (``""`` to omit). One PNG per array, named ``array{id}_D{d}_P{p}.png``. Every map is
-    presentation-styled (see :func:`save_3d_pin_map`), so any of them can go straight on a slide."""
+    box (``""`` to omit). Per array: the 3D map ``array{id}_D{d}_P{p}.png`` and its z-profile
+    companion ``array{id}_D{d}_P{p}_profile.png`` (a height cut along the nearest-neighbour pin row;
+    see :func:`save_pin_profile`). Both are presentation-styled, so either can go straight on a
+    slide. Returns the number of 3D maps written."""
     root = Path(figures_dir) / "3D height map"
-    n = 0
+    n = p = 0
     for sub, scan, placement, param_label in items:
         d = root / sub if sub else root
         for a in template.arrays:
-            fname = f"array{a.array_id:02d}_D{a.diameter_um:g}_P{a.pitch_um:g}.png"
-            if save_3d_pin_map(scan, placement, template, a, d / fname, res_um=res_um,
+            stem = f"array{a.array_id:02d}_D{a.diameter_um:g}_P{a.pitch_um:g}"
+            if save_3d_pin_map(scan, placement, template, a, d / f"{stem}.png", res_um=res_um,
                                param_label=param_label):
                 n += 1
-    print(f"Wrote {n} 3D centre-5×5 height maps -> {root}")
+            if save_pin_profile(scan, placement, template, a, d / f"{stem}_profile.png",
+                                res_um=res_um, param_label=param_label):
+                p += 1
+    print(f"Wrote {n} 3D centre-5×5 height maps + {p} z-profiles -> {root}")
     return n
 
 
