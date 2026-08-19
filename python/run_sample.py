@@ -1318,9 +1318,22 @@ def save_pin_profile(scan, placement, template, array, path, *, res_um=2.0, bloc
     centre = (pins[int(np.argmin(np.hypot(pins[:, 0] - ctr[0], pins[:, 1] - ctr[1])))]
               if len(pins) else ctr)
 
-    # Sample the height field along centre + t*u, keeping the part inside the resampled grid.
-    L = 0.5 * float(np.hypot(x1 - x0, y1 - y0)) + float(max(array.pitch_x_um, array.pitch_y_um))
-    t = np.linspace(-L, L, 900)
+    # Pins the a1-row crosses: those with ~zero a2-index off the centre pin (j ~ 0).
+    try:
+        ij = np.linalg.solve(np.column_stack([a1, a2]), (pins - centre).T).T
+        row_t = np.sort((pins[np.abs(ij[:, 1]) < 0.25] - centre) @ u)
+    except np.linalg.LinAlgError:                        # pragma: no cover - a1||a2 never happens
+        row_t = np.array([0.0])
+
+    # Show just TWO adjacent pins so the equal-aspect panel keeps a sensible shape: the centre pin
+    # and its nearest in-frame neighbour along a1, plus ~0.6 pitch of trench on each side.
+    nn = float(np.hypot(*a1))                            # nearest-neighbour spacing along the row
+    has_pos = bool(np.any((row_t > 0.5 * nn) & (row_t < 1.5 * nn)))
+    has_neg = bool(np.any((row_t < -0.5 * nn) & (row_t > -1.5 * nn)))
+    lo, hi = (-0.6 * nn, 1.6 * nn) if (has_pos or not has_neg) else (-1.6 * nn, 0.6 * nn)
+
+    # Sample the height field along centre + t*u across that window (inside the resampled grid).
+    t = np.linspace(lo, hi, 400)
     fi = (centre[0] + t * u[0] - x0) / res_um - 0.5      # fractional col/row (cell-centre convention)
     fj = (centre[1] + t * u[1] - y0) / res_um - 0.5
     keep = (fi >= 0) & (fi <= nx - 1) & (fj >= 0) & (fj <= ny - 1)
@@ -1330,30 +1343,21 @@ def save_pin_profile(scan, placement, template, array, path, *, res_um=2.0, bloc
     from scipy.ndimage import map_coordinates
     h = map_coordinates(zf, np.vstack([fj, fi]), order=1, mode="nearest")
 
-    # Pins the a1-row crosses: those with ~zero a2-index off the centre pin (j ~ 0), for tick marks.
-    try:
-        ij = np.linalg.solve(np.column_stack([a1, a2]), (pins - centre).T).T
-        row_t = np.sort((pins[np.abs(ij[:, 1]) < 0.25] - centre) @ u)
-    except np.linalg.LinAlgError:                        # pragma: no cover - a1||a2 never happens
-        row_t = np.array([0.0])
-
-    fig, ax = plt.subplots(figsize=(9.2, 4.4))
+    # X and Y are the SAME physical scale (set_aspect 'equal') so the trace shows true pin
+    # proportions; with only two pins the panel stays a sensible shape.
+    fig, ax = plt.subplots(figsize=(8.0, 4.2))
     ax.axhline(0, color="0.6", lw=1.0, zorder=1)         # trench-floor reference
-    for rt in np.atleast_1d(row_t):                      # a mark at each pin centre the row crosses
+    for rt in row_t[(row_t >= lo) & (row_t <= hi)]:      # mark the two pin centres shown
         ax.axvline(float(rt), color="crimson", ls=":", lw=1.0, alpha=0.7, zorder=2)
     ax.plot(t, h, "-", color="#1f77b4", lw=2.0, zorder=3)
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(min(0.0, float(np.nanmin(h))), float(np.nanmax(h)) * 1.12 + 1.0)
+    ax.set_aspect("equal", adjustable="box")             # 1 µm on X == 1 µm on Y (true proportions)
     ax.set_xlabel("Distance (µm)", fontsize=fs.LABEL)
     ax.set_ylabel("Height (µm)", fontsize=fs.LABEL)
-    ax.set_title(f"Z profile — Ø {array.diameter_um:g}, pitch {array.pitch_um:g}",
-                 fontsize=fs.HEADLINE)
+    ax.set_title(f"Z profile — Ø {array.diameter_um:g}, pitch {array.pitch_um:g}", fontsize=fs.HEADLINE)
     ax.tick_params(labelsize=fs.TICK)
     ax.grid(alpha=0.3, zorder=0)
-    ax.margins(x=0.02)
-    ax.set_ylim(bottom=min(0.0, float(np.nanmin(h))))
-    if param_label:                                      # laser-parameter info box, matching the map
-        ax.text(0.02, 0.97, param_label, transform=ax.transAxes, fontsize=fs.OVERLAY,
-                va="top", ha="left",
-                bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="0.5", alpha=0.9))
     fig.tight_layout(); Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=200, bbox_inches="tight"); plt.close(fig)
     return True
